@@ -35,6 +35,7 @@ from hft_crypto.data.poll import KrakenClient, run_poll
 from hft_crypto.data.retention import build_plan, evaluate_watermarks, execute_plan
 from hft_crypto.data.zones import DataRoot, DataRootError, resolve_data_root
 from hft_crypto.reports.report import write_report
+from hft_crypto.synthetic import DEFAULT_SEED, run_synthetic
 from hft_crypto.timeutil import parse_date, parse_duration, parse_iso, utcnow
 
 
@@ -69,6 +70,31 @@ def _context(args: argparse.Namespace, config: PipelineConfig, policy: Retention
     )
 
 
+def _refuse_synthetic(root: DataRoot) -> None:
+    """Real jobs never run on a root of generated data, so the two can never mix."""
+    if root.is_synthetic:
+        raise ConfigError("this DATA_ROOT holds SYNTHETIC data, so a real job is refused here")
+
+
+def _cmd_synthetic_run(args: argparse.Namespace, config: PipelineConfig, policy: RetentionPolicy) -> int:
+    value = args.data_root or os.environ.get("DATA_ROOT", "").strip()
+    if not value:
+        raise DataRootError("DATA_ROOT is not set. Set the environment variable or pass --data-root.")
+    data_root = Path(value)
+    live_root = Path(args.live_root) if args.live_root else data_root.with_name(f"{data_root.name}-live")
+    summary = run_synthetic(
+        data_root,
+        live_root,
+        Path(args.out_dir),
+        base_config=config,
+        policy=policy,
+        days=args.days,
+        seed=args.seed,
+    )
+    _print_json(summary)
+    return 0
+
+
 def _cmd_init(args: argparse.Namespace, config: PipelineConfig, policy: RetentionPolicy) -> int:
     ctx = _context(args, config, policy)
     ctx.catalog.close()
@@ -80,15 +106,20 @@ def _selected_datasets(args: argparse.Namespace, config: PipelineConfig) -> tupl
     if args.datasets:
         return tuple(item.strip() for item in args.datasets.split(",") if item.strip())
     if args.light:
-        chosen = [spec.id for spec in config.datasets if spec.light]
+        chosen = [spec.id for spec in config.datasets if spec.light and config.dataset_enabled(spec)]
         if args.include_book:
-            chosen.extend(spec.id for spec in config.datasets if spec.kind == "orderbook")
+            chosen.extend(
+                spec.id
+                for spec in config.datasets
+                if spec.kind == "orderbook" and config.dataset_enabled(spec)
+            )
         return tuple(chosen)
     return None
 
 
 def _cmd_ingest(args: argparse.Namespace, config: PipelineConfig, policy: RetentionPolicy) -> int:
     ctx = _context(args, config, policy)
+    _refuse_synthetic(ctx.root)
     options = IngestOptions(
         dataset_ids=_selected_datasets(args, config),
         symbols=tuple(args.symbols.split(",")) if args.symbols else None,
@@ -98,7 +129,8 @@ def _cmd_ingest(args: argparse.Namespace, config: PipelineConfig, policy: Retent
         delete_raw=args.delete_raw_after_curated,
         include_book=args.include_book,
     )
-    summary = run_ingest(ctx, HttpFetcher(config.fetch), options)
+    fetcher = HttpFetcher(config.fetch, allowed_hosts=config.enabled_hosts())
+    summary = run_ingest(ctx, fetcher, options)
     ctx.catalog.close()
     _print_json(asdict(summary))
     return 0
@@ -170,7 +202,8 @@ def _read_cache_usage(path: str | None) -> dict[str, Any] | None:
 
 def _cmd_poll(args: argparse.Namespace, config: PipelineConfig, policy: RetentionPolicy) -> int:
     ctx = _context(args, config, policy)
-    client = KrakenClient(HttpFetcher(config.fetch), config.poll)
+    _refuse_synthetic(ctx.root)
+    client = KrakenClient(HttpFetcher(config.fetch, allowed_hosts=config.enabled_hosts()), config.poll)
     record = run_poll(
         ctx,
         client,
@@ -325,6 +358,16 @@ def _build_parser() -> argparse.ArgumentParser:
     report.add_argument("--actions-cache-json", help="GitHub's cache usage response, saved to a file")
     report.add_argument("--published", action="store_true", help="mark this run as published")
     report.set_defaults(func=_cmd_report)
+
+    synthetic = commands.add_parser(
+        "synthetic-run",
+        help="run everything once on generated data, with no network. Output is labelled SYNTHETIC",
+    )
+    synthetic.add_argument("--out-dir", required=True, help="where to write the labelled output")
+    synthetic.add_argument("--live-root", help="data directory for the poll. Defaults to DATA_ROOT-live")
+    synthetic.add_argument("--days", type=int, default=30, help="how many generated days")
+    synthetic.add_argument("--seed", type=int, default=DEFAULT_SEED, help="same seed, same output")
+    synthetic.set_defaults(func=_cmd_synthetic_run)
     return parser
 
 

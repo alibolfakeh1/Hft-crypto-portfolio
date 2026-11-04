@@ -18,12 +18,29 @@ default_quota_gb = 8.0
 # What survives between runs through the Actions cache. raw and quarantine stay on the runner.
 persisted_zones = ["curated", "features", "catalog"]
 
-[sources]
-binance_base = "https://data.binance.vision/data/futures/um"
-bybit_trades_base = "https://public.bybit.com/trading"
-bybit_book_base = "https://quote-saver.bycsi.com/orderbook/linear"
-# Bybit moved from ob500 to ob200 at a date we do not hard-code. Every depth is tried, in this order.
-bybit_book_depths = [200, 500]
+# Nothing is downloaded from a source unless it is enabled here, and every source starts disabled. With none
+# enabled, the network client refuses every host, and each job reports "no approved source configured".
+# A source is enabled only once it has been named as approved. See docs/03_DATA_SOURCES.md.
+[sources.binance]
+# Adapter kept and tested on generated files only. Decision D-17 rules this source out for research and results,
+# so enabling it is an error. Changing that needs a new decision and this flag removed on purpose.
+enabled = false
+prohibited = true
+archive_base = "https://data.binance.vision/data/futures/um"
+terms_note = "Binance Vision Dataset Terms (2026-08-26): CC BY-NC-SA 4.0, non-commercial. Not used, by decision D-17."
+
+[sources.bybit]
+enabled = false
+trades_base = "https://public.bybit.com/trading"
+book_base = "https://quote-saver.bycsi.com/orderbook/linear"
+# The book file name changed depth at a date we do not hard-code. Every depth is tried, in this order.
+book_depths = [200, 500]
+terms_note = "Terms under review in docs/03_DATA_SOURCES.md. Not approved, so not downloaded."
+
+[sources.kraken]
+enabled = false
+trades_url = "https://api.kraken.com/0/public/Trades"
+terms_note = "Terms under review in docs/03_DATA_SOURCES.md. Not approved, so not downloaded."
 
 [fetch]
 timeout_s = 60.0
@@ -45,10 +62,10 @@ max_book_days_per_run = 1
 # It is treated as knowable one second after its stamp.
 book_depth_allowance_s = 1.0
 
-# Official candles are a reconciliation check on our bars. See docs/08_DATA_CENTER.md section 4.
-# aggTrades gives an aggregate trade one timestamp, but official candles count each of its fills in its own
-# minute, so volume stamped just before a boundary can appear after it. A daily difference must be covered by
-# trades this close to midnight, or it is an error. The widest window measured was 96 ms, over 8 symbol-days.
+# Official candles are a reconciliation check, for a venue that publishes them. An aggregate trade file gives
+# each aggregate one timestamp, but official candles count each fill in its own minute, so volume stamped just
+# before a boundary can appear after it. A daily difference must be covered by trades this close to midnight, or
+# it is an error. These values are placeholders: repeat the checks on the approved source and set them from that.
 [reconcile.BTCUSDT]
 daily_total_abs = 0.000001
 boundary_window_ms = 250.0
@@ -64,6 +81,7 @@ bar_price_abs = 1.5
 [[datasets]]
 id = "binance.klines"
 venue = "binance"
+adapter = "binance_klines"
 kind = "klines"
 curated = "candles_official"
 tier = "T0"
@@ -73,11 +91,11 @@ overdue_hours = 36.0
 light = true
 opt_in = false
 priority = 0
-terms_note = "Binance public archive. Terms not yet reviewed (UNVERIFIED). Raw data is never republished."
 
 [[datasets]]
 id = "binance.fundingRate"
 venue = "binance"
+adapter = "binance_funding"
 kind = "fundingRate"
 curated = "funding"
 tier = "T0"
@@ -87,11 +105,11 @@ overdue_hours = 72.0
 light = true
 opt_in = false
 priority = 1
-terms_note = "Binance public archive. Terms not yet reviewed (UNVERIFIED). Raw data is never republished."
 
 [[datasets]]
 id = "binance.bookDepth"
 venue = "binance"
+adapter = "binance_book_depth"
 kind = "bookDepth"
 curated = "book_depth"
 tier = "T2"
@@ -101,11 +119,11 @@ overdue_hours = 36.0
 light = true
 opt_in = false
 priority = 2
-terms_note = "Binance public archive. Terms not yet reviewed (UNVERIFIED). Raw data is never republished."
 
 [[datasets]]
 id = "binance.aggTrades"
 venue = "binance"
+adapter = "binance_agg_trades"
 kind = "aggTrades"
 curated = "trades"
 tier = "T1"
@@ -115,11 +133,11 @@ overdue_hours = 36.0
 light = true
 opt_in = false
 priority = 3
-terms_note = "Binance public archive. Terms not yet reviewed (UNVERIFIED). Raw data is never republished."
 
 [[datasets]]
 id = "bybit.trades"
 venue = "bybit"
+adapter = "bybit_trades"
 kind = "trades"
 curated = "trades"
 tier = "T1"
@@ -129,11 +147,11 @@ overdue_hours = 36.0
 light = false
 opt_in = false
 priority = 4
-terms_note = "Bybit public archive. Terms not yet reviewed (UNVERIFIED). Raw data is never republished."
 
 [[datasets]]
 id = "bybit.orderbook"
 venue = "bybit"
+adapter = "bybit_book"
 kind = "orderbook"
 curated = "book_replay"
 tier = "T2"
@@ -143,13 +161,11 @@ overdue_hours = 36.0
 light = false
 opt_in = true
 priority = 5
-terms_note = "Bybit public archive. Terms not yet reviewed (UNVERIFIED). Only replay statistics are kept."
 
 # ---- Hourly poll of closed trades. Own DATA_ROOT and own cache, so it stays small and fast. ---------------
 
 [poll]
 venue = "kraken"
-base_url = "https://api.kraken.com/0/public/Trades"
 # The cursor starts here whenever the poll state is empty, so a lost cache rebuilds through catch-up.
 start_date = "2026-10-25"
 page_size = 1000
@@ -160,7 +176,6 @@ default_time_budget_s = 120.0
 # Consecutive missed hourly slots that count as a state change worth a commit.
 missed_slots_alert = 6
 default_quota_gb = 1.0
-terms_note = "Kraken public REST. Terms not yet reviewed (UNVERIFIED). Raw data is never republished."
 
 [[poll.pairs]]
 symbol = "BTCUSD"
@@ -172,8 +187,8 @@ symbol = "ETHUSD"
 pair = "ETHUSD"
 archive_symbol = "ETHUSDT"
 
-# Kraken spot against Binance perpetual is a sanity check between two different markets, not a reconciliation
-# of the same data. A wide median difference means something is wrong with one side.
+# Polled bars against the benchmark venue's bars. If those are different markets, this is a sanity check and not
+# a reconciliation of the same data. A wide median difference means something is wrong with one side.
 [poll.cross_venue]
 median_abs_close_diff_bps_warn = 30.0
 min_return_corr_warn = 0.5
@@ -183,5 +198,6 @@ min_return_corr_warn = 0.5
 stale_after_hours = 60.0
 # Equity marks and max drawdown use this timeframe. Volatility and Sharpe use daily close-to-close returns.
 equity_timeframe_minutes = 60
-benchmark_venue = "binance"
+# Empty until a source is approved. The report then shows no benchmarks and says why.
+benchmark_venue = ""
 benchmark_symbols = ["BTCUSDT", "ETHUSDT"]

@@ -1,0 +1,637 @@
+"""Historical ingest with catch-up.
+
+Each run asks the catalog what is missing and processes it, newest first, so a missed run repairs itself and
+a long backfill continues across runs. Every step is idempotent. A file that is not published yet stays
+pending and is not an error until it is overdue. A file that fails a check goes to quarantine and is
+downloaded again by a later run.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import shutil
+import time
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+import polars as pl
+
+from hft_crypto.config import NO_APPROVED_SOURCE, ConfigError, DatasetSpec, quota_bytes
+from hft_crypto.data.atomic import (
+    atomic_write_json,
+    atomic_write_parquet,
+    sha256_file,
+    sweep_temp_files,
+    temp_path_for,
+)
+from hft_crypto.data.book_replay import replay_zip
+from hft_crypto.data.context import JobContext, write_heartbeat
+from hft_crypto.data.derive import (
+    OFFICIAL,
+    STATE_DONE,
+    STATE_FAILED,
+    STATE_PENDING,
+    STATE_PROVISIONAL,
+    TRADES,
+    derive_dataset_id,
+    derive_day,
+    derive_task_key,
+    needs_derive,
+)
+from hft_crypto.data.fetch import Fetcher, FetchError, NotPublishedError
+from hft_crypto.data.guard import PathGuardError
+from hft_crypto.data.health import measure_zones
+from hft_crypto.data.parsers import (
+    CuratedResult,
+    ValidationError,
+    parse_agg_trades,
+    parse_book_depth,
+    parse_bybit_trades,
+    parse_checksum_sidecar,
+    parse_funding,
+    parse_klines,
+)
+from hft_crypto.data.retention import LEVEL_CRITICAL, evaluate_watermarks
+from hft_crypto.data.retention import delete_raw_if_allowed as protocol_delete
+from hft_crypto.data.sources import (
+    ArchiveFile,
+    archive_candidates,
+    expected_partitions,
+)
+from hft_crypto.data.zones import ZONE_DIRS
+from hft_crypto.timeutil import iso, month_key, next_month
+from hft_crypto.versioning import code_version
+
+STATE_OVERDUE = "overdue"
+RAW_RULE = "raw-archive-after-curated"
+_SIDECAR_LIMIT = 4096
+
+
+@dataclass(frozen=True)
+class Task:
+    spec: DatasetSpec
+    symbol: str
+    partition: dt.date
+
+    @property
+    def partition_key(self) -> str:
+        if self.spec.granularity == "month":
+            return month_key(self.partition)
+        return self.partition.isoformat()
+
+    @property
+    def key(self) -> str:
+        return f"archive:{self.spec.id}:{self.symbol}:{self.partition_key}"
+
+    def partition_end(self) -> dt.datetime:
+        """The moment the data of this partition is complete."""
+        last = (
+            next_month(self.partition)
+            if self.spec.granularity == "month"
+            else self.partition + dt.timedelta(days=1)
+        )
+        return dt.datetime(last.year, last.month, last.day, tzinfo=dt.UTC)
+
+
+@dataclass
+class IngestOptions:
+    dataset_ids: tuple[str, ...] | None = None
+    symbols: tuple[str, ...] | None = None
+    start: dt.date | None = None
+    end: dt.date | None = None
+    time_budget_s: float | None = None
+    delete_raw: bool = False
+    include_book: bool = False
+
+
+@dataclass
+class IngestSummary:
+    run_id: str
+    status: str = "ok"
+    source_state: str = ""
+    planned: int = 0
+    done: int = 0
+    pending: int = 0
+    overdue: int = 0
+    failed: int = 0
+    skipped_retry_wait: int = 0
+    held_by_watermark: int = 0
+    book_days_left: int = 0
+    not_started_time_budget: int = 0
+    bars_built: int = 0
+    bars_provisional: int = 0
+    bars_failed: int = 0
+    raw_deleted_files: int = 0
+    raw_deleted_bytes: int = 0
+    raw_kept_after_curated: int = 0
+    catalog_marked_absent: int = 0
+    catalog_rebuild_needed: int = 0
+    temp_files_swept: int = 0
+    downloaded_bytes: int = 0
+    seconds: float = 0.0
+    errors: list[str] = field(default_factory=list)
+
+
+class SourceDisabledError(ConfigError):
+    """A job asked for a dataset whose source is not enabled in configuration."""
+
+
+def check_requested_sources(ctx: JobContext, options: IngestOptions) -> None:
+    """Naming a disabled source is an error. It must never quietly fall back to something else."""
+    for dataset_id in options.dataset_ids or ():
+        spec = ctx.config.dataset(dataset_id)
+        if not ctx.config.dataset_enabled(spec):
+            raise SourceDisabledError(
+                f"dataset {dataset_id} needs source {spec.venue}, which is disabled in configuration"
+            )
+
+
+def curated_path(ctx: JobContext, spec: DatasetSpec, symbol: str, partition: dt.date) -> Path:
+    if spec.granularity == "month":
+        return ctx.root.curated_month_part(spec.curated, spec.venue, symbol, partition)
+    return ctx.root.curated_part(spec.curated, spec.venue, symbol, partition)
+
+
+def sync_catalog_with_disk(ctx: JobContext) -> tuple[int, int]:
+    """Make the catalog match the disk after a lost cache or a disposed runner.
+
+    Raw files vanish with each runner, and that is expected. A curated file that vanished means its work must
+    be redone, so its task reopens.
+    """
+    now = ctx.now_iso()
+    absent = 0
+    reopened = 0
+    for record in ctx.catalog.files(status="present"):
+        try:
+            present = ctx.root.guard.check(record.rel_path).is_file()
+        except PathGuardError:
+            present = False
+        if present:
+            continue
+        ctx.catalog.set_file_status(record.rel_path, "absent", now)
+        absent += 1
+        if not record.rel_path.startswith("curated/") or record.partition_key is None:
+            continue
+        reopened += _reopen_task_for(ctx, record.rel_path, record.kind, record.partition_key)
+    return absent, reopened
+
+
+def _reopen_task_for(ctx: JobContext, rel_path: str, kind: str, partition_key: str) -> int:
+    """Set the task that produced a lost curated file back to pending."""
+    fields = {part.split("=")[0]: part.split("=", 1)[1] for part in rel_path.split("/") if "=" in part}
+    venue = fields.get("venue")
+    symbol = fields.get("symbol")
+    if venue is None or symbol is None:
+        return 0
+    now = ctx.now_iso()
+    if kind.startswith("bars_"):
+        key = derive_task_key(venue, symbol, dt.date.fromisoformat(partition_key))
+        ctx.catalog.set_task(
+            key,
+            dataset_id=derive_dataset_id(venue),
+            symbol=symbol,
+            partition_key=partition_key,
+            state=STATE_PENDING,
+            now=now,
+        )
+        return 1
+    for spec in ctx.config.datasets:
+        if spec.venue == venue and spec.curated == kind:
+            ctx.catalog.set_task(
+                f"archive:{spec.id}:{symbol}:{partition_key}",
+                dataset_id=spec.id,
+                symbol=symbol,
+                partition_key=partition_key,
+                state=STATE_PENDING,
+                now=now,
+                attempts=0,
+            )
+            return 1
+    return 0
+
+
+def plan_tasks(ctx: JobContext, options: IngestOptions) -> list[Task]:
+    """Everything still open, newest first. On the same date, lighter datasets go first."""
+    now = ctx.now()
+    tasks: list[Task] = []
+    for spec in ctx.config.datasets:
+        if not ctx.config.dataset_enabled(spec):
+            continue
+        if options.dataset_ids is not None:
+            if spec.id not in options.dataset_ids:
+                continue
+        elif spec.opt_in and not options.include_book:
+            continue
+        symbols = options.symbols if options.symbols is not None else ctx.config.symbols
+        for symbol in symbols:
+            states = ctx.catalog.task_states(spec.id, symbol)
+            for partition in expected_partitions(spec, now, options.start, options.end):
+                task = Task(spec, symbol, partition)
+                if states.get(task.partition_key) != STATE_DONE:
+                    tasks.append(task)
+    tasks.sort(key=lambda t: (-t.partition.toordinal(), t.spec.priority, t.symbol))
+    return tasks
+
+
+def _retry_at(ctx: JobContext, attempts: int) -> str:
+    minutes = ctx.config.retry_base_minutes * (2 ** max(0, attempts - 1))
+    capped = min(minutes, ctx.config.retry_max_hours * 60.0)
+    return iso(ctx.now() + dt.timedelta(minutes=capped))
+
+
+def _set_failed(ctx: JobContext, task: Task, message: str) -> None:
+    current = ctx.catalog.get_task(task.key)
+    attempts = (current.attempts if current else 0) + 1
+    ctx.catalog.set_task(
+        task.key,
+        dataset_id=task.spec.id,
+        symbol=task.symbol,
+        partition_key=task.partition_key,
+        state=STATE_FAILED,
+        now=ctx.now_iso(),
+        attempts=attempts,
+        last_error=message[:500],
+        next_retry_at=_retry_at(ctx, attempts),
+    )
+
+
+def _quarantine_file(ctx: JobContext, path: Path, rel_name: str) -> None:
+    target = ctx.root.quarantine_path(rel_name, ctx.now().strftime("%Y%m%dT%H%M%SZ"))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(path), str(target))
+
+
+def _fetch_raw(
+    ctx: JobContext, fetcher: Fetcher, task: Task, summary: IngestSummary
+) -> tuple[Path, ArchiveFile, dict[str, Any]]:
+    """Download into a temporary name, verify any checksum, then rename into the raw zone."""
+    limits = ctx.config.fetch
+    last_missing: NotPublishedError | None = None
+    for candidate in archive_candidates(ctx.config, task.spec, task.symbol, task.partition):
+        final = ctx.root.raw_archive_path(
+            task.spec.venue, task.spec.kind, task.symbol, task.partition, candidate.filename
+        )
+        record = ctx.catalog.get_file(ctx.relative(final))
+        if (
+            final.is_file()
+            and record is not None
+            and record.status == "present"
+            and record.sha256 == sha256_file(final)
+        ):
+            return final, candidate, {"reused": True}
+        final.parent.mkdir(parents=True, exist_ok=True)
+        temporary = temp_path_for(final)
+        try:
+            summary.downloaded_bytes += fetcher.download(candidate.url, temporary, limits.max_download_bytes)
+        except NotPublishedError as exc:
+            temporary.unlink(missing_ok=True)
+            last_missing = exc
+            continue
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+        digest = sha256_file(temporary)
+        checks: dict[str, Any] = {"sha256": digest, "checksum_source": "none"}
+        if candidate.checksum_url is not None:
+            try:
+                sidecar = fetcher.get_bytes(candidate.checksum_url, _SIDECAR_LIMIT)
+            except NotPublishedError:
+                sidecar = None
+            if sidecar is not None:
+                try:
+                    expected = parse_checksum_sidecar(
+                        sidecar.decode("utf-8", errors="replace"), candidate.filename
+                    )
+                    if digest != expected:
+                        raise ValidationError("SHA-256 does not match the checksum sidecar")
+                except ValidationError:
+                    _quarantine_file(ctx, temporary, ctx.relative(final))
+                    raise
+                checks["checksum_source"] = "sidecar"
+        temporary.replace(final)
+        return final, candidate, checks
+    raise last_missing if last_missing is not None else NotPublishedError(task.key)
+
+
+def _parse(ctx: JobContext, task: Task, raw: Path) -> CuratedResult:
+    limit = ctx.config.fetch.max_uncompressed_bytes
+    kind = task.spec.kind
+    if kind == "aggTrades":
+        return parse_agg_trades(raw, task.symbol, task.partition, limit, task.spec.venue)
+    if kind == "trades":
+        return parse_bybit_trades(raw, task.symbol, task.partition, limit, task.spec.venue)
+    if kind == "klines":
+        return parse_klines(raw, task.symbol, task.partition, limit, task.spec.venue)
+    if kind == "bookDepth":
+        return parse_book_depth(
+            raw, task.symbol, task.partition, limit, ctx.config.book_depth_allowance_s, task.spec.venue
+        )
+    if kind == "fundingRate":
+        return parse_funding(raw, task.symbol, task.partition, limit, task.spec.venue)
+    raise ValueError(f"no parser for {kind}")
+
+
+def _book_result(raw: Path, task: Task) -> CuratedResult:
+    """Book files yield replay statistics only. Book features are not defined yet."""
+    replay = replay_zip(raw)
+    detail = replay.to_dict()
+    if not replay.ok:
+        raise ValidationError(f"book replay failed: {detail}")
+    row = {k: v for k, v in detail.items() if k not in ("break_examples",)}
+    frame = pl.DataFrame([{"venue": task.spec.venue, "symbol": task.symbol, **row}])
+    return CuratedResult(frame, detail)
+
+
+def run_archive_task(ctx: JobContext, fetcher: Fetcher, task: Task, summary: IngestSummary) -> str:
+    """Process one partition from download to curated. Return the state it ended in."""
+    now_iso = ctx.now_iso()
+    spec = task.spec
+    try:
+        raw, source, raw_checks = _fetch_raw(ctx, fetcher, task, summary)
+    except NotPublishedError:
+        overdue_at = task.partition_end() + dt.timedelta(hours=spec.overdue_hours)
+        state = STATE_OVERDUE if ctx.now() > overdue_at else STATE_PENDING
+        ctx.catalog.set_task(
+            task.key,
+            dataset_id=spec.id,
+            symbol=task.symbol,
+            partition_key=task.partition_key,
+            state=state,
+            now=now_iso,
+            last_error=None if state == STATE_PENDING else "not published yet, past its overdue time",
+        )
+        return state
+    except ValidationError as exc:
+        _set_failed(ctx, task, f"validation: {exc}")
+        summary.errors.append(f"{task.key}: {exc}")
+        return STATE_FAILED
+    except FetchError as exc:
+        _set_failed(ctx, task, f"download: {exc}")
+        summary.errors.append(f"{task.key}: {exc}")
+        return STATE_FAILED
+
+    raw_rel = ctx.relative(raw)
+    partition_text = task.partition.isoformat()
+    date_end = (
+        (next_month(task.partition) - dt.timedelta(days=1)).isoformat()
+        if spec.granularity == "month"
+        else partition_text
+    )
+    if not raw_checks.get("reused"):
+        ctx.register_output(
+            raw,
+            dataset_id=f"raw.{spec.venue}.{spec.kind}.{task.symbol}",
+            kind=spec.kind,
+            zone="raw/archive",
+            partition_key=task.partition_key,
+            date_start=partition_text,
+            date_end=date_end,
+            rows=None,
+            check_status="pass",
+            check_detail=raw_checks,
+            source_url=source.url,
+            tier=spec.tier,
+            venue=spec.venue,
+            symbol=task.symbol,
+            terms_note=ctx.config.source(spec.venue).terms_note,
+        )
+    try:
+        result = _book_result(raw, task) if spec.kind == "orderbook" else _parse(ctx, task, raw)
+    except ValidationError as exc:
+        _quarantine_file(ctx, raw, raw_rel)
+        ctx.catalog.set_file_status(raw_rel, "quarantined", now_iso)
+        _set_failed(ctx, task, f"validation: {exc}")
+        summary.errors.append(f"{task.key}: {exc}")
+        return STATE_FAILED
+
+    target = curated_path(ctx, spec, task.symbol, task.partition)
+    atomic_write_parquet(target, result.frame, guard=ctx.root.guard)
+    ctx.register_output(
+        target,
+        dataset_id=f"curated.{spec.curated}.{spec.venue}.{task.symbol}",
+        kind=spec.curated,
+        zone="curated",
+        partition_key=task.partition_key,
+        date_start=partition_text,
+        date_end=date_end,
+        rows=result.frame.height,
+        check_status="pass",
+        check_detail={**result.checks, "warnings": list(result.warnings)},
+        parents=[raw_rel],
+        tier=spec.tier,
+        venue=spec.venue,
+        symbol=task.symbol,
+        terms_note=ctx.config.source(spec.venue).terms_note,
+    )
+    ctx.catalog.set_task(
+        task.key,
+        dataset_id=spec.id,
+        symbol=task.symbol,
+        partition_key=task.partition_key,
+        state=STATE_DONE,
+        now=now_iso,
+        attempts=0,
+    )
+    return STATE_DONE
+
+
+def _run_derive(ctx: JobContext, venue: str, symbol: str, day: dt.date, summary: IngestSummary) -> None:
+    key = derive_task_key(venue, symbol, day)
+    outcome = derive_day(ctx, venue, symbol, day)
+    if outcome.state == STATE_FAILED:
+        summary.bars_failed += 1
+        message = f"{key}: {outcome.reason}"
+        summary.errors.append(message)
+        current = ctx.catalog.get_task(key)
+        attempts = (current.attempts if current else 0) + 1
+        retry_at = _retry_at(ctx, attempts)
+        ctx.catalog.set_task(
+            key,
+            dataset_id=derive_dataset_id(venue),
+            symbol=symbol,
+            partition_key=day.isoformat(),
+            state=STATE_FAILED,
+            now=ctx.now_iso(),
+            attempts=attempts,
+            last_error=str(outcome.reason)[:500],
+            next_retry_at=retry_at,
+        )
+        # A daily total that disagrees may mean a bad delivery, so both sides are fetched again later.
+        for spec in ctx.config.datasets:
+            if spec.venue == venue and spec.curated in (TRADES, OFFICIAL):
+                ctx.catalog.set_task(
+                    f"archive:{spec.id}:{symbol}:{day.isoformat()}",
+                    dataset_id=spec.id,
+                    symbol=symbol,
+                    partition_key=day.isoformat(),
+                    state=STATE_FAILED,
+                    now=ctx.now_iso(),
+                    attempts=attempts,
+                    last_error="reconciliation failed",
+                    next_retry_at=retry_at,
+                )
+        return
+    summary.bars_built += 1
+    if outcome.state == STATE_PROVISIONAL:
+        summary.bars_provisional += 1
+    ctx.catalog.set_task(
+        key,
+        dataset_id=derive_dataset_id(venue),
+        symbol=symbol,
+        partition_key=day.isoformat(),
+        state=outcome.state,
+        now=ctx.now_iso(),
+        attempts=0,
+    )
+
+
+def _delete_raw_for(ctx: JobContext, task: Task, summary: IngestSummary) -> None:
+    """Raw data is transient: it goes as soon as the protocol says its derived data passes."""
+    prefix = (
+        f"raw/archive/{task.spec.venue}/{task.spec.kind}/{task.symbol}/date={task.partition.isoformat()}/"
+    )
+    for record in ctx.catalog.files(status="present", prefix=prefix):
+        deleted, _reason = protocol_delete(ctx, record.rel_path, RAW_RULE)
+        if deleted:
+            summary.raw_deleted_files += 1
+            summary.raw_deleted_bytes += record.size_bytes
+        else:
+            summary.raw_kept_after_curated += 1
+
+
+def _bar_targets(ctx: JobContext, options: IngestOptions) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    symbols = options.symbols if options.symbols is not None else ctx.config.symbols
+    for spec in ctx.config.datasets:
+        if spec.curated != TRADES or not ctx.config.dataset_enabled(spec):
+            continue
+        if options.dataset_ids is not None and spec.id not in options.dataset_ids:
+            continue
+        pairs.extend((spec.venue, symbol) for symbol in symbols)
+    return pairs
+
+
+def _sweep_open_bars(ctx: JobContext, options: IngestOptions, summary: IngestSummary) -> None:
+    """Rebuild any day whose inputs have changed since it was built, whichever run fetched them."""
+    for venue, symbol in _bar_targets(ctx, options):
+        for part in ctx.root.curated_parts(TRADES, venue, symbol):
+            day = dt.date.fromisoformat(part.stem.removeprefix("part-"))
+            if needs_derive(ctx, venue, symbol, day):
+                _run_derive(ctx, venue, symbol, day, summary)
+
+
+def _persisted(summary: IngestSummary) -> dict[str, Any]:
+    """The summary as stored. Wall-clock time stays out of it, so the same inputs give identical files."""
+    values = asdict(summary)
+    del values["seconds"]
+    return values
+
+
+def _finish_status(summary: IngestSummary) -> str:
+    if summary.not_started_time_budget or summary.held_by_watermark:
+        return "partial"
+    if summary.failed or summary.bars_failed:
+        return "partial"
+    return "ok"
+
+
+def run_ingest(
+    ctx: JobContext,
+    fetcher: Fetcher,
+    options: IngestOptions,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+) -> IngestSummary:
+    """Run catch-up until the work is done or the time budget ends. Stopping early is never a failure."""
+    check_requested_sources(ctx, options)
+    summary = IngestSummary(run_id=ctx.run_id)
+    started = clock()
+    deadline = None if options.time_budget_s is None else started + options.time_budget_s
+    ctx.catalog.start_run(
+        ctx.run_id,
+        "ingest",
+        now=ctx.now_iso(),
+        code_version=code_version(),
+        config_hash=ctx.config.config_hash,
+    )
+    summary.temp_files_swept = len(sweep_temp_files(ctx.root.guard, ZONE_DIRS))
+    summary.catalog_marked_absent, summary.catalog_rebuild_needed = sync_catalog_with_disk(ctx)
+
+    if not ctx.config.enabled_sources():
+        # Not a failure and not a reason to try anything else. The report says so plainly.
+        summary.source_state = NO_APPROVED_SOURCE
+        summary.status = "no_approved_source"
+        write_heartbeat(
+            ctx.root, "ingest", now=ctx.now(), detail={"status": summary.status, "run_id": ctx.run_id}
+        )
+        ctx.catalog.finish_run(
+            ctx.run_id, now=ctx.now_iso(), status=summary.status, summary=_persisted(summary)
+        )
+        return summary
+
+    tasks = plan_tasks(ctx, options)
+    summary.planned = len(tasks)
+    quota = quota_bytes(ctx.config.default_quota_gb)
+    routine_since = ctx.now().date() - dt.timedelta(days=ctx.config.routine_window_days)
+    books_done = 0
+    for index, task in enumerate(tasks):
+        if deadline is not None and clock() >= deadline:
+            summary.not_started_time_budget = len(tasks) - index
+            break
+        if task.spec.kind == "orderbook" and books_done >= ctx.config.max_book_days_per_run:
+            summary.book_days_left += 1
+            continue
+        state_row = ctx.catalog.get_task(task.key)
+        if (
+            state_row is not None
+            and state_row.state == STATE_FAILED
+            and state_row.next_retry_at is not None
+            and state_row.next_retry_at > ctx.now_iso()
+        ):
+            summary.skipped_retry_wait += 1
+            continue
+        used = sum(measure_zones(ctx.root).values())
+        storage = evaluate_watermarks(used, quota, ctx.policy.watermarks)
+        # A backfill stops first. At the critical level only essential work runs, and ingest is not essential.
+        if storage.level == LEVEL_CRITICAL or (storage.stop_backfill and task.partition < routine_since):
+            summary.held_by_watermark += 1
+            continue
+        state = run_archive_task(ctx, fetcher, task, summary)
+        if state == STATE_DONE:
+            summary.done += 1
+            if task.spec.kind == "orderbook":
+                books_done += 1
+            if task.spec.curated == TRADES:
+                for day in (task.partition, task.partition - dt.timedelta(days=1)):
+                    if needs_derive(ctx, task.spec.venue, task.symbol, day):
+                        _run_derive(ctx, task.spec.venue, task.symbol, day, summary)
+            elif task.spec.curated == OFFICIAL and needs_derive(
+                ctx, task.spec.venue, task.symbol, task.partition
+            ):
+                _run_derive(ctx, task.spec.venue, task.symbol, task.partition, summary)
+            if options.delete_raw:
+                _delete_raw_for(ctx, task, summary)
+        elif state == STATE_PENDING:
+            summary.pending += 1
+        elif state == STATE_OVERDUE:
+            summary.overdue += 1
+        else:
+            summary.failed += 1
+
+    _sweep_open_bars(ctx, options, summary)
+    summary.seconds = round(clock() - started, 3)
+    summary.status = _finish_status(summary)
+    summary.source_state = ctx.config.source_state()
+    write_heartbeat(
+        ctx.root,
+        "ingest",
+        now=ctx.now(),
+        detail={"status": summary.status, "done": summary.done, "run_id": ctx.run_id},
+    )
+    ctx.catalog.finish_run(ctx.run_id, now=ctx.now_iso(), status=summary.status, summary=_persisted(summary))
+    atomic_write_json(
+        ctx.root.guard.check("catalog/last_ingest.json"), _persisted(summary), guard=ctx.root.guard
+    )
+    return summary

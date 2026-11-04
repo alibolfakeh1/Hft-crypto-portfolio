@@ -94,7 +94,7 @@ def parse_duration(text: str) -> float:
 
 
 def decimal_seconds_to_us(text: str) -> int:
-    """Convert a decimal seconds string such as 1793664000.7566 to microseconds, flooring.
+    """Convert a decimal seconds string such as 1700000000.1234 to microseconds, flooring.
 
     Done on the digits, because a binary float cannot hold this many significant digits exactly and a
     rounding error near a minute boundary would move a trade into the wrong bar.

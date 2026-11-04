@@ -46,7 +46,7 @@ trades = ["trades:pass", "bars_1m:pass,warn,provisional"]
 orderbook = ["book_replay:pass"]
 
 # Bars and other flow data stay. This limits the trades behind them, which take most of the cache. Without it
-# the quota fills in about ten months and the pipeline stops at the critical watermark. Not reviewed, so it only
+# the quota eventually fills and the pipeline stops at the critical watermark. Not reviewed, so it only
 # shows up in the dry run. The raw files are already gone, so this relies on the public archive being able to
 # rebuild the data, which is a judgement call for data-steward. See docs/05_DATA_LIFECYCLE.md section 1.
 [[rules]]

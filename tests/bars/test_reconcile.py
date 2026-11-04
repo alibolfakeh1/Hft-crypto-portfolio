@@ -1,10 +1,10 @@
-"""Reconciliation against official candles, on the mechanism measured in real files."""
+"""Reconciliation against official candles, on generated files with invented values."""
 
 from __future__ import annotations
 
 import polars as pl
-from helpers import DAY, MINUTE, trades_frame, us
 
+from helpers import DAY, MINUTE, trades_frame, us
 from hft_crypto.bars.core import UTC_TIME, build_bars_1m
 from hft_crypto.bars.reconcile import (
     compare_emitted_with_rebuild,
@@ -64,16 +64,15 @@ def test_identical_day_passes() -> None:
 
 
 def test_volume_straddling_midnight_is_explained_and_passes() -> None:
-    # Measured on ETHUSDT 2026-11-03: an aggregate of 9.759 stamped 25 ms before midnight, 9.724 of it
-    # counted in the next day's official candles.
+    # An aggregate of 5.0 stamped 25 ms before midnight, 4.5 of it counted in the next day's candles.
     stamp = DAY_END - 25_000
-    file = trades([(DAY_START + 30_000_000, 1.0), (stamp, 9.759)])
-    official = official_from([(0, 1.0, 1.0), (1439, 0.035, 0.035)])
+    file = trades([(DAY_START + 30_000_000, 1.0), (stamp, 5.0)])
+    official = official_from([(0, 1.0, 1.0), (1439, 0.5, 0.5)])
     result = check(file, official)
     assert result.status == "pass"
-    assert result.volume_diff == 9.724
-    assert result.taker_buy_diff == 9.724
-    assert result.volume_explainable_up == 9.759
+    assert result.volume_diff == 4.5
+    assert result.taker_buy_diff == 4.5
+    assert result.volume_explainable_up == 5.0
     assert result.largest_window_needed_ms == 25.0
 
 
@@ -97,23 +96,32 @@ def test_extra_volume_far_from_midnight_is_an_error() -> None:
 
 
 def test_carry_from_the_previous_day_is_explained_by_its_tail() -> None:
-    # Measured on BTCUSDT: 2026-11-01 was +0.010 and 2026-11-02 was -0.010, cancelling exactly.
+    # 0.25 of an aggregate stamped before midnight is counted in this day's first official minute.
     file = trades([(DAY_START + 30_000_000, 1.0)])
-    official = official_from([(0, 1.01, 1.01)])
-    tail = trades([(DAY_START - 40_000, 0.137)])
+    official = official_from([(0, 1.25, 1.25)])
+    tail = trades([(DAY_START - 40_000, 0.75)])
     result = check(file, official, tail)
     assert result.status == "pass"
-    assert result.volume_diff == -0.01
-    assert result.implied_carry_in == 0.01
-    assert result.volume_explainable_down == 0.137
+    assert result.volume_diff == -0.25
+    assert result.implied_carry_in == 0.25
+    assert result.volume_explainable_down == 0.75
     assert result.needs_previous_day is False
 
 
 def test_carry_with_no_previous_file_stays_open_instead_of_failing() -> None:
     file = trades([(DAY_START + 30_000_000, 1.0)])
-    result = check(file, official_from([(0, 1.01, 1.01)]), None)
+    result = check(file, official_from([(0, 1.25, 1.25)]), None)
     assert result.status == "pass"
     assert result.needs_previous_day is True
+
+
+def test_a_deficit_that_first_appears_later_in_the_day_fails_even_with_no_previous_file() -> None:
+    """A carry across midnight is there from the first minute. This one starts at minute 700."""
+    file = trades([(DAY_START + 30_000_000, 1.0)])
+    result = check(file, official_from([(0, 1.0, 1.0), (700, 5.0, 5.0)]), None)
+    assert result.status == "fail"
+    assert result.needs_previous_day is False
+    assert any("later in the day" in reason for reason in result.reasons)
 
 
 def test_carry_larger_than_the_previous_tail_is_an_error() -> None:
@@ -206,11 +214,12 @@ def test_rebuild_finds_a_late_trade() -> None:
 
 
 def test_cross_venue_hand_computed() -> None:
-    closes_a = [100.0 + i * 0.1 for i in range(60)]
-    closes_b = [value * 1.001 for value in closes_a]  # a constant 10 bps away
+    values = [100.0 + i * 0.1 for i in range(60)]
+    closes_a: list[float | None] = list(values)
+    closes_b: list[float | None] = [value * 1.001 for value in values]  # a constant 10 bps away
     result = cross_venue_check(
-        _bars([1.0] * 60, closes_a),  # type: ignore[arg-type]
-        _bars([1.0] * 60, closes_b),  # type: ignore[arg-type]
+        _bars([1.0] * 60, closes_a),
+        _bars([1.0] * 60, closes_b),
         median_bps_warn=30.0,
         min_corr_warn=0.5,
     )
@@ -220,17 +229,18 @@ def test_cross_venue_hand_computed() -> None:
 
 
 def test_cross_venue_warns_on_a_wide_basis_and_on_too_few_bars() -> None:
-    closes = [100.0 + i * 0.1 for i in range(60)]
+    values = [100.0 + i * 0.1 for i in range(60)]
+    closes: list[float | None] = list(values)
     wide = cross_venue_check(
-        _bars([1.0] * 60, closes),  # type: ignore[arg-type]
-        _bars([1.0] * 60, [c * 1.01 for c in closes]),  # type: ignore[arg-type]
+        _bars([1.0] * 60, closes),
+        _bars([1.0] * 60, [c * 1.01 for c in values]),
         median_bps_warn=30.0,
         min_corr_warn=0.5,
     )
     assert wide["status"] == "warn"
     few = cross_venue_check(
-        _bars([1.0] * 5, [1.0] * 5),  # type: ignore[arg-type]
-        _bars([1.0] * 5, [1.0] * 5),  # type: ignore[arg-type]
+        _bars([1.0] * 5, [1.0] * 5),
+        _bars([1.0] * 5, [1.0] * 5),
         median_bps_warn=30.0,
         min_corr_warn=0.5,
     )

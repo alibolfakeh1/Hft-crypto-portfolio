@@ -6,8 +6,8 @@ import random
 
 import polars as pl
 import pytest
-from helpers import MINUTE, trades_frame, us
 
+from helpers import MINUTE, trades_frame, us
 from hft_crypto.bars.core import UTC_TIME, aggregate_bars, build_bars_1m, visible_bars
 
 START = us("2026-03-01T00:00:00")

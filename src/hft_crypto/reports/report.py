@@ -18,7 +18,7 @@ import numpy as np
 import polars as pl
 
 from hft_crypto.bars.core import visible_bars
-from hft_crypto.config import PipelineConfig
+from hft_crypto.config import ConfigError, PipelineConfig
 from hft_crypto.data.atomic import atomic_write_bytes, canonical_json_bytes, read_parquet
 from hft_crypto.data.context import JobContext
 from hft_crypto.data.derive import timeframe_dataset
@@ -31,6 +31,7 @@ from hft_crypto.timeutil import iso, parse_iso, to_us
 from hft_crypto.versioning import code_version
 
 BENCHMARK_LABEL = "BENCHMARK, not a strategy result"
+SYNTHETIC_LABEL = "SYNTHETIC: generated test data. Not market data and not a strategy result"
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,8 @@ def build_benchmark(
 ) -> tuple[Benchmark | None, list[str]]:
     """Buy and hold from the first traded price of the first whole day."""
     venue = config.report.benchmark_venue
+    if venue is None:
+        return None, []
     equity_dataset = timeframe_dataset(config.report.equity_timeframe_minutes)
     daily_all, daily_parts = _read_all(root, timeframe_dataset(1440), venue, symbol)
     equity_all, equity_parts = _read_all(root, equity_dataset, venue, symbol)
@@ -257,8 +260,12 @@ def build_status(
     newest = max((parse_iso(b.end) for b in benchmarks), default=None)
     age_hours = None if newest is None else round((now - newest).total_seconds() / 3600.0, 2)
     stale = newest is None or (age_hours or 0.0) > ctx.config.report.stale_after_hours
+    synthetic = ctx.root.is_synthetic
+    label = SYNTHETIC_LABEL if synthetic else BENCHMARK_LABEL
     return {
-        "label": BENCHMARK_LABEL,
+        "label": label,
+        "data_kind": "SYNTHETIC" if synthetic else "MARKET" if benchmarks else "NONE",
+        "source_state": health["source_state"],
         "disclaimer": "Not investment advice. This project sends no orders. No strategy has been tested.",
         "generated_at": iso(now),
         "run_id": run_id,
@@ -271,7 +278,7 @@ def build_status(
         "partial_coverage": health["partial_coverage"],
         "benchmarks": {
             b.symbol: {
-                "label": BENCHMARK_LABEL,
+                "label": label,
                 "venue": ctx.config.report.benchmark_venue,
                 "start": b.start,
                 "end": b.end,
@@ -297,6 +304,8 @@ def write_report(
     published: bool = False,
 ) -> dict[str, Any]:
     """Write the run folder and, when asked, a copy for publishing outside DATA_ROOT."""
+    if published and ctx.root.is_synthetic:
+        raise ConfigError("SYNTHETIC output cannot be marked as published")
     now = ctx.now()
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
     run_id = f"report-{stamp}-{ctx.run_id[:8]}"

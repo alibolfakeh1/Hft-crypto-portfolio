@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import os
 import tomllib
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -18,12 +19,30 @@ class ConfigError(ValueError):
 
 
 Granularity = Literal["day", "month"]
+NO_APPROVED_SOURCE = "no approved source configured"
+
+
+@dataclass(frozen=True)
+class SourceSpec:
+    """One place data may come from. Nothing is downloaded from it unless it is enabled."""
+
+    name: str
+    enabled: bool
+    prohibited: bool
+    urls: dict[str, str]
+    terms_note: str
+
+    def hosts(self) -> frozenset[str]:
+        return frozenset(
+            host for host in (urllib.parse.urlsplit(url).hostname for url in self.urls.values()) if host
+        )
 
 
 @dataclass(frozen=True)
 class DatasetSpec:
     id: str
     venue: str
+    adapter: str
     kind: str
     curated: str
     tier: str
@@ -33,7 +52,6 @@ class DatasetSpec:
     light: bool
     opt_in: bool
     priority: int
-    terms_note: str
 
 
 @dataclass(frozen=True)
@@ -61,7 +79,6 @@ class PollConfig:
     default_time_budget_s: float
     missed_slots_alert: int
     default_quota_gb: float
-    terms_note: str
     pairs: tuple[PollPair, ...]
     median_abs_close_diff_bps_warn: float
     min_return_corr_warn: float
@@ -80,7 +97,7 @@ class FetchConfig:
 class ReportConfig:
     stale_after_hours: float
     equity_timeframe_minutes: int
-    benchmark_venue: str
+    benchmark_venue: str | None
     benchmark_symbols: tuple[str, ...]
 
 
@@ -90,9 +107,7 @@ class PipelineConfig:
     timeframes_minutes: tuple[int, ...]
     default_quota_gb: float
     persisted_zones: tuple[str, ...]
-    binance_base: str
-    bybit_trades_base: str
-    bybit_book_base: str
+    sources: dict[str, SourceSpec]
     bybit_book_depths: tuple[int, ...]
     fetch: FetchConfig
     routine_window_days: int
@@ -105,6 +120,33 @@ class PipelineConfig:
     poll: PollConfig
     report: ReportConfig
     config_hash: str = field(default="")
+
+    def source(self, name: str) -> SourceSpec:
+        try:
+            return self.sources[name]
+        except KeyError as exc:
+            raise ConfigError(f"unknown source: {name}") from exc
+
+    def enabled_sources(self) -> tuple[str, ...]:
+        return tuple(sorted(name for name, source in self.sources.items() if source.enabled))
+
+    def enabled_hosts(self) -> frozenset[str]:
+        """The only hosts the network client may contact. Empty until a source is approved."""
+        hosts: set[str] = set()
+        for source in self.sources.values():
+            if source.enabled:
+                hosts |= source.hosts()
+        return frozenset(hosts)
+
+    def source_state(self) -> str:
+        enabled = self.enabled_sources()
+        return ", ".join(enabled) if enabled else NO_APPROVED_SOURCE
+
+    def dataset_enabled(self, spec: DatasetSpec) -> bool:
+        return self.source(spec.venue).enabled
+
+    def has_official_candles(self, venue: str) -> bool:
+        return any(spec.venue == venue and spec.curated == "candles_official" for spec in self.datasets)
 
     def dataset(self, dataset_id: str) -> DatasetSpec:
         for spec in self.datasets:
@@ -196,6 +238,7 @@ def _dataset(raw: dict[str, Any]) -> DatasetSpec:
     return DatasetSpec(
         id=raw["id"],
         venue=raw["venue"],
+        adapter=raw["adapter"],
         kind=raw["kind"],
         curated=raw["curated"],
         tier=raw["tier"],
@@ -205,14 +248,23 @@ def _dataset(raw: dict[str, Any]) -> DatasetSpec:
         light=bool(raw["light"]),
         opt_in=bool(raw["opt_in"]),
         priority=int(raw["priority"]),
-        terms_note=raw["terms_note"],
     )
+
+
+def _source(name: str, raw: dict[str, Any]) -> SourceSpec:
+    enabled = bool(raw["enabled"])
+    prohibited = bool(raw.get("prohibited", False))
+    if enabled and prohibited:
+        raise ConfigError(f"source {name} is prohibited by a recorded decision and cannot be enabled")
+    urls = {key: str(value) for key, value in raw.items() if key.endswith(("_base", "_url"))}
+    return SourceSpec(name, enabled, prohibited, urls, str(raw["terms_note"]))
 
 
 def load_pipeline_config(config_dir: str | Path | None = None) -> PipelineConfig:
     raw = _read_toml(find_config_dir(config_dir) / "pipeline.toml")
     try:
         poll = raw["poll"]
+        sources = {name: _source(name, values) for name, values in raw["sources"].items()}
         timeframes = tuple(int(v) for v in raw["bars"]["timeframes_minutes"])
         for minutes in timeframes:
             if minutes < 2 or 1440 % minutes != 0:
@@ -222,10 +274,8 @@ def load_pipeline_config(config_dir: str | Path | None = None) -> PipelineConfig
             timeframes_minutes=timeframes,
             default_quota_gb=float(raw["storage"]["default_quota_gb"]),
             persisted_zones=tuple(raw["storage"]["persisted_zones"]),
-            binance_base=raw["sources"]["binance_base"],
-            bybit_trades_base=raw["sources"]["bybit_trades_base"],
-            bybit_book_base=raw["sources"]["bybit_book_base"],
-            bybit_book_depths=tuple(int(v) for v in raw["sources"]["bybit_book_depths"]),
+            sources=sources,
+            bybit_book_depths=tuple(int(v) for v in raw["sources"]["bybit"]["book_depths"]),
             fetch=FetchConfig(
                 timeout_s=float(raw["fetch"]["timeout_s"]),
                 attempts=int(raw["fetch"]["attempts"]),
@@ -249,7 +299,7 @@ def load_pipeline_config(config_dir: str | Path | None = None) -> PipelineConfig
             datasets=tuple(_dataset(item) for item in raw["datasets"]),
             poll=PollConfig(
                 venue=poll["venue"],
-                base_url=poll["base_url"],
+                base_url=sources[poll["venue"]].urls["trades_url"],
                 start_date=parse_date(poll["start_date"]),
                 page_size=int(poll["page_size"]),
                 min_interval_s=float(poll["min_interval_s"]),
@@ -257,7 +307,6 @@ def load_pipeline_config(config_dir: str | Path | None = None) -> PipelineConfig
                 default_time_budget_s=float(poll["default_time_budget_s"]),
                 missed_slots_alert=int(poll["missed_slots_alert"]),
                 default_quota_gb=float(poll["default_quota_gb"]),
-                terms_note=poll["terms_note"],
                 pairs=tuple(PollPair(p["symbol"], p["pair"], p["archive_symbol"]) for p in poll["pairs"]),
                 median_abs_close_diff_bps_warn=float(poll["cross_venue"]["median_abs_close_diff_bps_warn"]),
                 min_return_corr_warn=float(poll["cross_venue"]["min_return_corr_warn"]),
@@ -265,7 +314,7 @@ def load_pipeline_config(config_dir: str | Path | None = None) -> PipelineConfig
             report=ReportConfig(
                 stale_after_hours=float(raw["report"]["stale_after_hours"]),
                 equity_timeframe_minutes=int(raw["report"]["equity_timeframe_minutes"]),
-                benchmark_venue=raw["report"]["benchmark_venue"],
+                benchmark_venue=raw["report"]["benchmark_venue"] or None,
                 benchmark_symbols=tuple(raw["report"]["benchmark_symbols"]),
             ),
             config_hash=stable_hash(raw),

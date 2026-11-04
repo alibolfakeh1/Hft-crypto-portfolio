@@ -14,13 +14,14 @@ import math
 from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any
 
+from hft_crypto.config import NO_APPROVED_SOURCE
 from hft_crypto.timeutil import from_us, parse_iso
 
 if TYPE_CHECKING:
     from hft_crypto.reports.report import Benchmark
 
-_LABEL = "BENCHMARK, not a strategy result"
 _LABEL_FA = "معیار مقایسه، نه نتیجهٔ یک استراتژی"
+_SYNTHETIC_FA = "داده‌های ساختگی برای آزمایش. این داده‌ها واقعی نیستند و نتیجهٔ بازار یا استراتژی نیستند"
 
 _CSS = """
 :root {
@@ -177,7 +178,7 @@ def _path(points: Sequence[tuple[float, float]]) -> str:
     return "M" + " L".join(f"{x:.1f},{y:.1f}" for x, y in points)
 
 
-def render_chart(benchmarks: Sequence[Benchmark]) -> tuple[str, str]:
+def render_chart(benchmarks: Sequence[Benchmark], *, synthetic: bool = False) -> tuple[str, str]:
     """Return the SVG and the JSON behind its tooltip."""
     series = [b for b in benchmarks if b.points]
     if not series:
@@ -222,7 +223,7 @@ def render_chart(benchmarks: Sequence[Benchmark]) -> tuple[str, str]:
         parts.append(
             f'<line x1="{left}" x2="{right}" y1="{y:.1f}" y2="{y:.1f}" stroke="var(--grid)" stroke-width="1"/>'
         )
-        parts.append(f'<text x="{left - 8}" y="{y + 4:.1f}" text-anchor="end">{tick * 100:g}%</text>')
+        parts.append(f'<text x="{left - 8}" y="{y + 4:.1f}" text-anchor="end">{tick * 100 + 0.0:g}%</text>')
     for tick in _time_ticks(tmin, tmax):
         x = sx(tick)
         parts.append(
@@ -230,6 +231,11 @@ def render_chart(benchmarks: Sequence[Benchmark]) -> tuple[str, str]:
         )
         label = from_us(tick).strftime("%b %d")
         parts.append(f'<text x="{x:.1f}" y="{bottom_b + 18}" text-anchor="middle">{label}</text>')
+    if synthetic:
+        parts.append(
+            f'<text x="{(left + right) / 2}" y="{(top_a + bottom_a) / 2}" text-anchor="middle" '
+            'style="font-size:64px;font-weight:700;opacity:0.18">SYNTHETIC</text>'
+        )
     parts.append(f'<text x="{left}" y="{top_a - 4}">Equity, start = 100</text>')
     parts.append(f'<text x="{left}" y="{top_b - 6}">Underwater drawdown</text>')
     parts.append(
@@ -277,10 +283,21 @@ def render_chart(benchmarks: Sequence[Benchmark]) -> tuple[str, str]:
 
 def _notices(status: dict[str, Any]) -> str:
     items: list[str] = []
-    if status["data_as_of"] is None:
+    if status["data_kind"] == "SYNTHETIC":
         items.append(
-            '<div class="notice critical">No benchmark data yet. Coverage below shows the rebuild.</div>'
+            '<div class="notice critical"><strong>SYNTHETIC.</strong> Every number on this page comes from '
+            "generated test data on a made-up calendar. None of it is market data or a result of any kind.</div>"
         )
+    if status["data_as_of"] is None:
+        if status["source_state"] == NO_APPROVED_SOURCE:
+            items.append(
+                f'<div class="notice critical">{_e(NO_APPROVED_SOURCE.capitalize())}. '
+                "No market data is being collected, so there are no benchmarks yet.</div>"
+            )
+        else:
+            items.append(
+                '<div class="notice critical">No benchmark data yet. Coverage below shows the rebuild.</div>'
+            )
     elif status["stale"]:
         items.append(
             f'<div class="notice critical">STALE: the newest bar is {_e(status["data_age_hours"])} '
@@ -292,13 +309,15 @@ def _notices(status: dict[str, Any]) -> str:
             "Statistics use only the newest unbroken run of days.</div>"
         )
     for alert in status["health"]["alerts"]:
+        if NO_APPROVED_SOURCE in alert.lower():
+            continue
         kind = "critical" if alert.startswith("URGENT") else ""
         items.append(f'<div class="notice {kind}">{_e(alert)}</div>')
     return "".join(items)
 
 
 def _benchmark_section(status: dict[str, Any], benchmarks: Sequence[Benchmark]) -> str:
-    chart, _ = render_chart(benchmarks)
+    chart, _ = render_chart(benchmarks, synthetic=status["data_kind"] == "SYNTHETIC")
     legend = "".join(
         f'<span><span class="key" style="background:var(--series-{i % 2 + 1})"></span>{_e(b.symbol)}</span>'
         for i, b in enumerate(benchmarks)
@@ -555,33 +574,39 @@ def _age_text(status: dict[str, Any]) -> str:
 
 def render_site(status: dict[str, Any], benchmarks: Sequence[Benchmark]) -> str:
     """Render the whole page. Every value passes through an escape, or is built from numbers."""
-    _, payload = render_chart(benchmarks)
+    synthetic = status["data_kind"] == "SYNTHETIC"
+    _, payload = render_chart(benchmarks, synthetic=synthetic)
+    label = status["label"]
+    title = "SYNTHETIC test output" if synthetic else "HFT Crypto Status"
+    heading = "SYNTHETIC test output, not market data" if synthetic else "Data status and benchmarks"
+    tag = "SYNTHETIC: " if synthetic else ""
+    note_fa = _SYNTHETIC_FA if synthetic else _LABEL_FA
     return f"""<!doctype html>
 <html lang="en" dir="ltr">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>HFT Crypto Status</title>
+<title>{_e(title)}</title>
 <meta name="description" content="Data coverage and buy and hold benchmarks. Not a strategy result.">
 <style>{_CSS}</style>
 </head>
 <body>
 <main>
-<h1>Data status and benchmarks</h1>
-<div class="label">{_e(_LABEL)}</div>
-<p class="fa" lang="fa" dir="rtl">{_e(_LABEL_FA)}. این صفحه توصیهٔ سرمایه‌گذاری نیست و هیچ سفارش واقعی ارسال نمی‌شود.</p>
+<h1>{_e(heading)}</h1>
+<div class="label">{_e(label)}</div>
+<p class="fa" lang="fa" dir="rtl">{_e(note_fa)}. این صفحه توصیهٔ سرمایه‌گذاری نیست و هیچ سفارش واقعی ارسال نمی‌شود.</p>
 <p>{_e(_age_text(status))} Generated {_e(status["generated_at"])}.</p>
-<p>No strategy has been tested. Nothing here is investment advice, and this project sends no orders.</p>
+<p>No strategy has been tested. This is not investment advice, and this project sends no orders.</p>
 {_notices(status)}
-<h2>BTC and ETH buy and hold</h2>
+<h2>{tag}Buy and hold</h2>
 {_benchmark_section(status, benchmarks)}
-<h2>Data coverage</h2>
+<h2>{tag}Data coverage</h2>
 <section>{_coverage_section(status)}</section>
-<h2>Reconciliation</h2>
+<h2>{tag}Reconciliation</h2>
 <section>{_reconciliation_section(status)}</section>
-<h2>Hourly poll: how late is the schedule?</h2>
+<h2>{tag}Hourly poll: how late is the schedule?</h2>
 <section>{_poll_section(status)}</section>
-<h2>Storage</h2>
+<h2>{tag}Storage</h2>
 <section>{_storage_section(status)}</section>
 <footer>
 <p>Code {_e(status["code_version"])}. Config {_e(status["config_hash"][:12])}. Run {_e(status["run_id"])}.</p>

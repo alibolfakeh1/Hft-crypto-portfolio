@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import polars as pl
 import pytest
-from helpers import DAY, MINUTE, trades_frame, us
 
+from helpers import DAY, MINUTE, trades_frame, us
 from hft_crypto.bars.core import (
     TimingContractError,
     aggregate_bars,

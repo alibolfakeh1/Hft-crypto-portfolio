@@ -8,6 +8,9 @@ secrets/
 
 # Market data and generated results never go in git
 data/
+# The code packages named data are not market data, and must stay visible to git.
+!src/hft_crypto/data/
+!tests/data/
 results/
 *.parquet
 *.feather

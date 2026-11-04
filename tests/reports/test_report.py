@@ -10,8 +10,16 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from helpers import FakeFetcher, base_config, klines_csv, agg_trades_csv, make_context, publish_binance_day
 
+from helpers import (
+    FakeFetcher,
+    agg_trades_csv,
+    base_config,
+    klines_csv,
+    make_context,
+    publish_binance_day,
+    with_sources_enabled,
+)
 from hft_crypto.config import PipelineConfig
 from hft_crypto.data.context import JobContext
 from hft_crypto.data.ingest import IngestOptions, run_ingest
@@ -29,11 +37,14 @@ PRICES = {
 
 def config() -> PipelineConfig:
     base = base_config()
-    return replace(
-        base,
-        symbols=SYMBOLS,
-        datasets=tuple(replace(spec, start=FIRST) for spec in base.datasets),
-        timeframes_minutes=(60, 1440),
+    return with_sources_enabled(
+        replace(
+            base,
+            symbols=SYMBOLS,
+            datasets=tuple(replace(spec, start=FIRST) for spec in base.datasets),
+            timeframes_minutes=(60, 1440),
+            report=replace(base.report, benchmark_venue="binance"),
+        )
     )
 
 
@@ -107,6 +118,8 @@ def test_page_is_self_contained_and_persian_friendly(tmp_path: Path) -> None:
     assert "<svg" in html
     assert "Equity, start = 100" in html
     assert "Underwater drawdown" in html
+    assert ">0%</text>" in html
+    assert ">-0%</text>" not in html
     assert len(list((tmp_path / "out" / "site").iterdir())) == 1
 
 
@@ -120,6 +133,7 @@ def test_no_raw_market_data_or_local_paths_leave(tmp_path: Path) -> None:
         assert str(tmp_path) not in blob
         assert str(tmp_path).replace("\\", "\\\\") not in blob
         assert "taker_buy" not in blob
+
     # BTC's final price of 99 is not a published value. Equity normalised to 100 happens to reach
     # 99.0, so the check is that no field called a price exists and no bars are listed.
     def keys(value: Any) -> set[str]:
@@ -176,7 +190,9 @@ def test_a_lost_cache_shows_partial_coverage(tmp_path: Path) -> None:
     for symbol in SYMBOLS:
         publish_day(fetcher, symbol, FIRST + dt.timedelta(days=2), 99.0)
     ctx = make_context(tmp_path / "r", now=dt.datetime(2026, 3, 4, 10, tzinfo=dt.UTC), config=config())
-    run_ingest(ctx, fetcher, IngestOptions(dataset_ids=("binance.klines", "binance.aggTrades"), symbols=SYMBOLS))
+    run_ingest(
+        ctx, fetcher, IngestOptions(dataset_ids=("binance.klines", "binance.aggTrades"), symbols=SYMBOLS)
+    )
     status = report(ctx, tmp_path / "out")
     assert status["partial_coverage"] is True
     html = (tmp_path / "out" / "site" / "index.html").read_text(encoding="utf-8")
@@ -191,12 +207,27 @@ def test_a_hole_in_history_is_not_bridged_by_a_multi_day_return(tmp_path: Path) 
         publish_day(fetcher, symbol, FIRST, 100.0)
         publish_day(fetcher, symbol, FIRST + dt.timedelta(days=2), 120.0)
     ctx = make_context(tmp_path / "r", now=dt.datetime(2026, 3, 4, 10, tzinfo=dt.UTC), config=config())
-    run_ingest(ctx, fetcher, IngestOptions(dataset_ids=("binance.klines", "binance.aggTrades"), symbols=SYMBOLS))
+    run_ingest(
+        ctx, fetcher, IngestOptions(dataset_ids=("binance.klines", "binance.aggTrades"), symbols=SYMBOLS)
+    )
     status = report(ctx, tmp_path / "out")
     btc = status["benchmarks"]["BTCUSDT"]
     assert btc["days"] == 1.0
     assert btc["total_return"] == pytest.approx(0.0)
     assert btc["missing_days_before_start"] is True
+
+
+def test_with_no_approved_source_the_page_says_exactly_that(tmp_path: Path) -> None:
+    ctx = make_context(tmp_path / "r", now=dt.datetime(2026, 3, 4, 10, tzinfo=dt.UTC))
+    status = report(ctx, tmp_path / "out")
+    assert status["source_state"] == "no approved source configured"
+    assert status["data_kind"] == "NONE"
+    assert status["benchmarks"] == {}
+    assert status["partial_coverage"] is False
+    html = (tmp_path / "out" / "site" / "index.html").read_text(encoding="utf-8")
+    assert "No approved source configured" in html
+    assert html.count("No approved source configured") == 1
+    assert "SYNTHETIC" not in html
 
 
 def test_empty_data_center_still_gives_a_page(tmp_path: Path) -> None:
@@ -246,7 +277,9 @@ def test_values_are_escaped_in_the_page(tmp_path: Path) -> None:
 
 
 def test_poll_summary_measures_how_late_the_schedule_is() -> None:
-    def run(run_id: str, start: str, delay: float | None, missed: int | None, status: str = "ok") -> dict[str, Any]:
+    def run(
+        run_id: str, start: str, delay: float | None, missed: int | None, status: str = "ok"
+    ) -> dict[str, Any]:
         return {
             "run_id": run_id,
             "job_started_at": start,
@@ -256,7 +289,14 @@ def test_poll_summary_measures_how_late_the_schedule_is() -> None:
             "status": status,
             "caught_up": True,
             "gaps": [],
-            "symbols": {"BTCUSD": {"last_bar_close": "2026-03-01T03:20:00Z", "data_age_s": 200.0, "caught_up": True, "late_trades": 1}},
+            "symbols": {
+                "BTCUSD": {
+                    "last_bar_close": "2026-03-01T03:20:00Z",
+                    "data_age_s": 200.0,
+                    "caught_up": True,
+                    "late_trades": 1,
+                }
+            },
         }
 
     now = dt.datetime(2026, 3, 1, 5, 0, tzinfo=dt.UTC)

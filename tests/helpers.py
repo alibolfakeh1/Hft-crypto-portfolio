@@ -9,7 +9,7 @@ import io
 import json
 import zipfile
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -78,8 +78,11 @@ def klines_csv(rows: Iterable[tuple[int, float, float, float, float, float, floa
         "open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,"
         "taker_buy_quote_volume,ignore"
     ]
-    for stamp, o, h, l, c, v, b in rows:
-        lines.append(f"{stamp},{o},{h},{l},{c},{v},{stamp + 59_999},{v * c},1,{b},{b * c},0")
+    for stamp, open_, high, low, close, volume, buy in rows:
+        lines.append(
+            f"{stamp},{open_},{high},{low},{close},{volume},{stamp + 59_999},{volume * close},1,"
+            f"{buy},{buy * close},0"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -135,7 +138,11 @@ BINANCE = "https://data.binance.vision/data/futures/um"
 
 
 def publish_binance_day(
-    fetcher: FakeFetcher, symbol: str, day: dt.date, trades_csv: str | None = None, candles_csv: str | None = None
+    fetcher: FakeFetcher,
+    symbol: str,
+    day: dt.date,
+    trades_csv: str | None = None,
+    candles_csv: str | None = None,
 ) -> None:
     default_trades, default_candles = make_day_files(day)
     trades_name = f"{symbol}-aggTrades-{day.isoformat()}"
@@ -161,7 +168,13 @@ def book_lines(messages: Iterable[dict[str, Any]]) -> bytes:
 
 
 def book_message(
-    kind: str, update_id: int, bids: list[list[str]], asks: list[list[str]], *, ts: int = 1000, seq: int | None = None
+    kind: str,
+    update_id: int,
+    bids: list[list[str]],
+    asks: list[list[str]],
+    *,
+    ts: int = 1000,
+    seq: int | None = None,
 ) -> dict[str, Any]:
     return {
         "topic": "orderbook.200.BTCUSDT",
@@ -180,6 +193,16 @@ def book_message(
 
 def base_config() -> PipelineConfig:
     return load_pipeline_config(REPO_ROOT / "configs")
+
+
+def with_sources_enabled(config: PipelineConfig) -> PipelineConfig:
+    """Every source switched on, for tests of the adapters. These only ever see generated files."""
+    return replace(
+        config,
+        sources={
+            name: replace(source, enabled=True, prohibited=False) for name, source in config.sources.items()
+        },
+    )
 
 
 def base_policy() -> RetentionPolicy:

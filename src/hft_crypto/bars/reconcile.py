@@ -72,10 +72,10 @@ def reconcile_official(
 ) -> OfficialReconciliation:
     """Compare one day.
 
-    Measured on real files: aggTrades gives an aggregate trade one timestamp, while its fills can run on for
-    a little under 100 ms, and official candles count each fill in its own minute. So volume stamped just before
-    boundary can appear in the official minute after it. It only moves that way, never the other. Across
-    midnight this also moves volume between official days, and the two days' differences cancel exactly.
+    An aggregate trade file gives each aggregate one timestamp, while its fills can run on for a moment, and
+    official candles count each fill in its own minute. So volume stamped just before a boundary can appear in
+    the official minute after it. It only moves that way, never the other. Across midnight this also moves
+    volume between official days, and the two days' differences cancel.
 
     That gives a rule with no arbitrary size. A day's difference must be covered by trades near its two
     midnights: positive by the end of this file, negative by the end of the previous one. Anything else is an
@@ -189,7 +189,16 @@ def reconcile_official(
                     f"daily {name} is {diff / _QTY_SCALE:+.8f} below official, not explained by midnight"
                 )
     if implied_carry > eps:
-        if down_allowed is None:
+        # A carry across midnight is in the official candles from the first minute. A deficit that first
+        # appears later in the day is lost or invented volume, and no previous file could explain it.
+        if adjusted.size and int(adjusted[0]) > int(explainable[0]) + eps:
+            status = STATUS_FAIL
+            needs_previous = False
+            reasons.append(
+                f"deficit of {implied_carry / _QTY_SCALE:.8f} appears later in the day, "
+                "not explained by midnight"
+            )
+        elif down_allowed is None:
             needs_previous = True
         elif implied_carry > down_allowed + eps:
             status = STATUS_FAIL
