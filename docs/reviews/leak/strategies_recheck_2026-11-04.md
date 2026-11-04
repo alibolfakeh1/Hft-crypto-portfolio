@@ -201,3 +201,83 @@ pairs in 1,827 `C-BAD` runs and 0 in 2,049 `C-LATE` runs, and at 1h or 4h the se
 - The prototype is not the production engine, and its walk, as-of state and collar only test whether the text can be implemented causally. S01 to S10 rule sets were not built as full `CYCLE` engines.
 - Whether exchange-side stops and targets would behave as item 13 assumes, on a venue not yet chosen.
 - `GATE_SPEC.md`, `src/`, `tests/` and layer 5 are out of scope.
+
+## Second recheck
+
+Date: 2026-11-04. Scope: only the lines changed in commit `d9de028`, with the section "After the re-audit" in `CHANGES_2026-11-04.md` as the map. No other text was re-audited.
+
+### Verdicts
+
+**Overall: `PASS WITH CONDITIONS`.** The edit does most of what was asked. C-1 and C-6 are met in full. Two problems remain, and both are in the new completeness check and the zero-trade minute. One makes the new hole rules unreachable, and
+one lets a backtest read past the run. Both are short text fixes, and both must be made before `decide` and `settle` are coded (C-11).
+
+| Document | Verdict | Open conditions |
+|---|---|---|
+| `00_INDEX.md` | `PASS WITH CONDITIONS` | C-3, C-4, C-5, C-7, C-10 as restated, C-11 |
+| `S01` to `S10` | `PASS`, each | None of their own. Each inherits the index's conditions. S07 and S08 keep their `PLACEHOLDER` paragraphs under C-10, which now applies to every `CYCLE` strategy |
+
+### Condition status
+
+| ID | Status | Note | When it must be met |
+|---|---|---|---|
+| C-1 | **Met** | See step 3b below | Done |
+| C-2 | **Partly met** | The named clock, the check, the logged skew and N-06 are done. The check's place and its evidence window are not right yet: N-17 | Carried into C-11 |
+| C-3 | Open, not due | `RT` and stop slippage. Other owner | Before the first run |
+| C-4 | Open, not due | Measure `A`. Other owner | Before the first `CYCLE` run |
+| C-5 | Open, not due | Record the frozen commit. Other owner | Before the first run |
+| C-6 | **Met** | S03 targets, S07 anchor count and S09 shift are all defined, and 0 can no longer be drawn. One line suggested in section "Notes" | Done |
+| C-7 | Open, not due | Fold plan. Other owner | Before the first `V0` run |
+| C-8 | **Met in text, but unreachable** | The deadline and `C-GAP` reports are sound. N-16 means a hole can pass as zero-volume minutes, so they would rarely fire | Reachable once C-11 is met |
+| C-9 | **Met, with two exceptions** | N-07, N-08, N-09, N-10, N-11 and N-14 are done as proposed. N-13's zero-trade rule needs N-16. N-12's list needs N-19 | Carried into C-11 |
+| C-10 | **Restated below** | The placeholder is a correct way to hold it. Its scope was too narrow | Before the first `CYCLE` run of any strategy |
+| C-11 | **New** | Fix N-16 and N-17 before coding. Make N-18 and N-19 in the same edit | Before `decide` and `settle` are coded |
+
+### The four partly fixed findings
+
+| ID | Status | Reason |
+|---|---|---|
+| L-12 | **Fixed** | C15, S03, S07 and S09 now define everything N-04 listed |
+| L-16 | **Fixed** | Step 5 charges funding, and a missing rate is an open liability. N-18 is a separate conflict with the new check |
+| L-19 | **Partly fixed** | The text is complete, but N-16 stops it firing whenever trades resume before the run |
+| L-30 | **Fixed** | Seeds are declared. The trade source values are a deliberate placeholder, tracked as C-10 |
+
+### The author's choices
+
+| Choice | Ruling | Reason |
+|---|---|---|
+| Flow as step 3b in `decide` | **Accepted** | It reads at or before `t_cut`, follows the model updates of step 3 so its candidate passes through C8 from the latest stop, is committed at step 4, and `settle` only executes it. Between closes it uses the last closed `T_d` bar's values. Numbering it 3b is harmless. One gap in wording only: 3b names exits, scale-outs and tightening, and not the entry gate. `decide` is the only place the gate can sit, as `settle` cannot change a decision, so this is safe. Say so in 3b |
+| `t_poll` from the runner's UTC clock, at the start of the attempt that delivered the data | **Accepted** | A later attempt reads later data, so it is causal. A fast clock is caught, because no record yet exists after `t_cut` and the source's server time falls short of `t_cut + A`. A slow clock only makes the cut-off earlier. `A` now covers both publication lag and skew, and both are logged |
+| When the check fails, move back one minute, check once more, then `DATA_GAP` | **Accepted** | It adds no tunable value and is fail-closed, and an older `t_cut` reads less data. The backtest must reproduce it through a defined evidence window: N-17 |
+| Hole deadline of 24 hours after the `GAP_CLOSE` run | **Accepted** | The trade is already closed by then, so it changes reporting and not the trade list. Set with no result, and frozen as a counted constant. Late bars after the deadline should still resolve touches by an appended event, as the existing rule says |
+| `C-GAP` bars arriving 3 hours after the hole ends, and a never-arrive case | **Accepted** | Stress reports only, never used for selection. Hole times do not depend on price. 3 hours does let `GAP_CLOSE` fire first, even after one dropped run |
+| N-12 extension: register state events use the last defined `ATR`, position or not | **Accepted, with one addition** | It is causal, truncation-invariant and logged, as the value comes from before the gap. Without it, variants could read different registers, which is the right thing to prevent. It is a stale parameter and not a filled bar, and setups still fail. The list is short: N-19 |
+| S04 overlap among entry zones only | **Accepted** | Causal, deterministic and stated before any result. A zone that qualifies as both keeps both roles, and that can be left as it stands |
+
+### C-10: the author is right
+
+Under C2, live bars for both tiers come from the polled trades. So the fetch model in backtest item 3 applies to **every `CYCLE` strategy**, and not only S07 and S08. The omission favours the strategy: without page size and rate limit, a backtest assumes every fetch succeeds. A dropped
+run puts two hours of trades into one fetch, and fetches are largest in busy hours, when stops matter most. `IDEAL` and `IDEAL-1M` read the archive and do not need these values.
+
+**C-10 restated.** Declare page size, rate limit, retention and fetch offset for the trade feed of the chosen source, and re-base `D_run` for tier `T0` on that same fetch (N-20). This applies to every `CYCLE` run of any strategy, including selection under `C-LATE`, the S01 and S06 control
+runs, and `CYCLE` placebos. Due before the first `CYCLE` run of any strategy. `data-steward` supplies the values and `strategy-architect` records them. The C17 constants row should say "no `CYCLE` run may start", in place of naming S07 and S08.
+
+### New findings
+
+| ID | Location | Leak class | Scenario with times | Severity | Fix |
+|---|---|---|---|---|---|
+| N-16 | `00_INDEX` C2 "A minute with no trades", C17 completeness check and gaps, `C-GAP`. S07, S08 section 14 | Gap hides a stop | Long, stop 66,900. A fetch loses the trades from 13:10 to 14:40, or `C-GAP` hides them. The 15:21 run has records stamped after its `t_cut` of 15:20, so the check passes. C2 then reads every empty minute as complete, a zero-volume bar with no price, "not a gap". No `DATA_GAP`, no `GAP_CLOSE`, no deadline. A stop touched at 13:25 is hidden, and the 1h bars are silently partial, while a backtest on a complete archive has them all. The check speaks only to the end of the data, and not to a hole inside it. Fail-open, and it favours the record. This came in with the fix for N-13, whose wording I proposed loosely | `MEDIUM` | C2: a minute with no trades is a zero-volume bar only when the response that delivered the data proves continuity across that minute, by a trade id or sequence number with no skip, or by overlapping pages. Otherwise it is a gap. The check at `t_cut` is not that proof. A source with no sequence therefore treats every empty minute as a gap, which costs little on a liquid perpetual. Apply the same test to the archive at G1. State that a fill uses the first 1m bar that has a price |
+| N-17 | `00_INDEX` C17 completeness check, step 1, `decide` signature, backtest items 1 and 3 | Backtest reads past the run | A run starts at 14:21:10.5, so `t_cut` is 14:21:00. The next trade is stamped 14:21:40. Live, no such record exists yet, so `t_cut` moves back to 14:20:00. A backtest reading the archive finds that record, passes, and uses a bar the run did not have, with a cut-off chosen by a later record. On synthetic trade times, the live check fails first time in 1.7 percent of runs at one trade per 5 s and in 33 percent at one per 30 s, against 0 for a whole-archive check. "Reads the modelled fetch" does not define what the model may see. Also, `decide` receives data truncated at `t_cut`, so it cannot hold a record stamped after `t_cut`, and step 1 cannot run the check as written. Separately, the server-time branch proves the clock and not the feed: in the N-02 scenario, a feed lagging 20 s passes on a server time of 14:21:15. That branch was in my own proposed wording, and it was too loose | `MEDIUM` | Run the check in a fetch stage before `decide`, which then receives `t_cut` and truncated data. In a backtest, evidence is a record stamped in `(t_cut, t_poll - A]`, or the modelled server time if the source gives one. That window is slightly stricter than live. Live, a server time counts only if it comes in the response that delivered the last page. Log and report the share of runs that passed on server time alone, as the residual risk is bounded only by the measured `A` (C-4) |
+| N-18 | `00_INDEX` C17 completeness check, step 2, C10 | Rule conflict | The check covers "each source", and funding is a source with a record every few hours. At 14:21, its latest record is stamped 08:00, so there is no record after `t_cut`. Without a server time it fails twice and logs `DATA_GAP` for the symbol at every run. C10 says a missing rate is only a liability. A developer would have to relax the rule ad hoc | `LOW` | Apply the check to sources that feed bars and windows. Funding follows C10 alone, and any other sparse source declares its own rule |
+| N-19 | `00_INDEX` C3, C4. S05 section 3 | Exit-side state left out of the extension | The list names `broken_at` and `consumed_at`. S05's flip `dead_at` also uses `ATR`, so a close below `bottom - 0.25 * ATR` during the re-seed never kills the flip, and a setup can come from it after the re-seed. C4's amplitude test also uses `ATR` at the confirmation bar, and its handling during a re-seed is not stated | `LOW` | Name every `ATR`-based state event, including `dead_at`. State that the amplitude test uses the same last defined `ATR`, or that a swing confirmed then is ignored. Either is causal, and the text must pick one |
+| N-20 | `00_INDEX` C17 constants, `D_run` | Backtest fills earlier than live | `D_run` is 60 s for tier `T0` and 180 s for tier `T1`. Both tiers now fetch the same trades, so the split has lost its basis. A `T0` run taking 150 s fills a minute or two later than simulated, in the top-of-hour burst C6 warns about, until `C-MEASURED` exists | `LOW` | Re-base `D_run` for `T0` on the same fetch under C-10. Before the first run this is not a counted change |
+
+### Notes
+
+- **S03 placebo.** A placebo long can be open while `state` is `DOWN`, where a close below `SL` is `BOS_DOWN` and not `CHoCH_DOWN`, so 7.8 would not fire. Say that a placebo's 7.8 exit fires on either event. The stop sits close by, so the effect is small.
+- **Step 5** lists entries, close-based exits and time exits. Flow's own bullet covers its exits, and adding "flow exits and scale-outs" there would remove any doubt.
+- **Checked and clean in this edit:** N-07, N-08, N-09, N-10, N-11, N-14, the C14 exception, the C15 side-share sentence, held state as of `t_cut`, and S07 and S08's removal of the touch sentence. Stops, targets and results in the worked examples do not change, and the timeline's new sentence is consistent.
+- **Probes.** The evidence-window figures come from synthetic trade times and say nothing about any venue. The other points in this section come from reading the text. I did not rerun the earlier probes, as the collar, as-of reads, walks and `effective_from` did not change.
+
+### Re-audit needed
+
+Only the lines that answer C-11, and the C-10 row when it is restated.
