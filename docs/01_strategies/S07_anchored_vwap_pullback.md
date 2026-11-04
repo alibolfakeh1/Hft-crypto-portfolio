@@ -308,7 +308,7 @@ the example in 7.12, with `A = 63,800`, `sigma = 520`, `C_k = 64,010`, `S0 = 63,
 - A band target between runs stays at the last value set, however far the true band has moved. It does not float between runs.
 - Two closes below `A0` are read at the run that processes the second. The exit fills after that run.
 - 1m bars are built from the same trades, so missing trades are a hole in 1m bars, and the gap rules in C17 apply. The run computes no partial VWAP. A minute
-  with no trades that the completeness check shows is complete is not missing, and adds nothing to the totals.
+  with no trades is not missing only when it has the proof of continuity in [C2](00_INDEX.md#c2-bars-and-calendar), and then it adds nothing to the totals.
 - Stops only tighten: the `P_dec` clamp in C17 can reduce a candidate, and the ratchet then keeps the old stop.
 
 **Backtest reproduction.** `CYCLE` under [C17](00_INDEX.md#c17-hourly-live-cycle), with `C-LATE` for selection, and running VWAP totals rebuilt in the same

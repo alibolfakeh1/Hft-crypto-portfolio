@@ -275,7 +275,7 @@ Total: 8 configurations. Amplitude `a` and all stop and target constants are fro
 | Ranges | Should fail by whipsaw | Chop count high, many `CHoCH` exits near `-1R` or less |
 | V-shaped reversals | Should fail: no higher low exists until well after the turn | Trade starts late in a move that is ending |
 | Squeeze tops | Partly handled by the climax rule | Compare exits on climax tighten against the counterfactual without it |
-| Any regime | Should beat random entries, drawn over bars that pass the non-signal filters c, d, e and f with the block's real long and short share, with the stop from the list as of that bar. No swing was just broken at such a bar, so `SH` and `Leg` do not exist, and the placebo's targets are `T1 = C_k + 1.5 * (C_k - S0)`, the fallback in 7.3, and `T2 = C_k + 3.0 * (C_k - S0)`. They are recomputed as usual if a real `BOS_UP` then occurs | [Placebo](00_INDEX.md#c15-placebo-control) |
+| Any regime | Should beat random entries, drawn over bars that pass the non-signal filters c, d, e and f with the block's real long and short share, with the stop from the list as of that bar. No swing was just broken at such a bar, so `SH` and `Leg` do not exist, and the placebo's targets are `T1 = C_k + 1.5 * (C_k - S0)`, the fallback in 7.3, and `T2 = C_k + 3.0 * (C_k - S0)`. They are recomputed as usual if a real `BOS_UP` then occurs. A placebo long may be open while `state` is `DOWN`, so its 7.8 exit fires on either `CHoCH_DOWN` or `BOS_DOWN` | [Placebo](00_INDEX.md#c15-placebo-control) |
 
 ## 11. Flow hooks
 

@@ -67,7 +67,8 @@ X      = highest high from k_b until the retest, updated at each close
 may occur on that bar or on the next 2 bars.
 
 **Flip death.** Any close below `bottom - 0.25 * ATR`, any close below `mid` during the retest, or the end of the window.
-This is logged as `dead_at`. Flips are a register under [C4](00_INDEX.md#c4-swing-pivots-and-registers), read as of a time, and a
+This is logged as `dead_at`, and during a re-seed its `ATR` is the last defined value, under
+[C3](00_INDEX.md#c3-indicators). Flips are a register under [C4](00_INDEX.md#c4-swing-pivots-and-registers), read as of a time, and a
 dead flip stays in it.
 
 **Stage A and Stage B.** A trade is in Stage A from entry until `T1` fills or `C_b > X`, whichever comes first, and in Stage B

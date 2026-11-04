@@ -146,9 +146,13 @@ as venue-independent without that retest.
   the trades come from the archive. On the live path they come from the hourly poll of the same venue, and the same code
   builds the bars. This trade feed is the one candle source of a tier `T0` strategy. Official venue bars are only a
   reconciliation check at gate G1.
-- **A minute with no trades.** When the [completeness check](#c17-hourly-live-cycle) shows the minute is complete, it is a
-  bar with zero volume and no price. It can touch nothing and adds nothing to a `T_d` bar's high, low or volume, and `P_dec`
-  or a `T_d` close uses the last trade before it. It is not a gap. Without that evidence, the minute is a gap.
+- **A minute with no trades.** It is a bar with zero volume and no price only when the response that delivered the data
+  proves continuity across that minute, by a trade id or sequence number with no skip, or by overlapping pages. Such a bar
+  can touch nothing and adds nothing to a `T_d` bar's high, low or volume. `P_dec` or a `T_d` close uses the last trade before
+  it, and a fill uses the first 1m bar that has a price. **Otherwise the minute is a gap**, so a hole cannot pass as zero-volume
+  minutes and hide a stop touched inside it. The [completeness check](#c17-hourly-live-cycle) speaks only to the end of the data
+  and is not this proof. A source with no sequence therefore treats every empty minute as a gap, which costs little on a liquid
+  perpetual. The same test applies to the archive at gate G1.
 - **Levels and the bar that built them.** A bar is evaluated against the level set in force at its open. A new
   UTC day or week set first acts on the bar that opens at the roll, so the bar that closes at the roll is never
   tested against a level built from itself. Rules that update an open trade at the close of that roll bar are
@@ -185,10 +189,11 @@ of its last input bar.
   gap, and it is then re-seeded with the mean of those 14 `TR`.
 - Any condition using an undefined value fails, so no setup is created. At a close where an open position's stop or
   target update needs an undefined value, that update is not computed and the stop holds.
-- **Exit rules do not fail open.** An open position's invalidation and exit rules, and the register state events they read
-  (`broken_at`, `consumed_at`), use the last defined `ATR` of that timeframe, frozen and logged, until the re-seed. Setups
-  still fail. Register events follow this whether or not a position is open, so a register never depends on a position.
-  This fills no bar.
+- **Exit rules do not fail open.** An open position's invalidation and exit rules, and every `ATR`-based register state event
+  (`broken_at`, `consumed_at`, `dead_at`), use the last defined `ATR` of that timeframe, frozen and logged, until the re-seed. The
+  amplitude test in [C4](#c4-swing-pivots-and-registers) uses the same value. Before the first seed no such value exists, so a swing
+  confirmed then is ignored. Setups still fail. Register events follow this whether or not a position is open, so a register never
+  depends on a position. This fills no bar.
 - Filling a missing value to avoid any of this is forbidden.
 
 ### C4. Swing pivots and registers
@@ -214,8 +219,8 @@ else:
     else: ignore X
 ```
 
-`ATR` here is on the list's own timeframe, valued at the confirmation bar. A replacement never changes a stop
-that has already moved.
+`ATR` here is on the list's own timeframe, valued at the confirmation bar. During a re-seed it is the last defined value,
+under [C3](#c3-indicators). A replacement never changes a stop that has already moved.
 
 **Registers are event-sourced.** This applies to every list of objects in this folder: swing lists, zones, flips,
 liquidity pools and anchors.
@@ -245,8 +250,8 @@ A setup is created at the close of the trigger bar `k`, from closed bars only. I
 
 - **Decision price.** `P_D` is `C_k` in `IDEAL` and `IDEAL-1M`, and `P_dec` in `CYCLE`.
 - **Fill reference.** A decision at `t_k` fills no earlier than `t_k + latency`. The fill reference `F` is `O_(k+1)`
-  in `IDEAL`, labelled zero latency. In the other modes it is the open of the first 1m bar named in the mode table.
-  A long pays `F * (1 + slip)`, a short receives `F * (1 - slip)`.
+  in `IDEAL`, labelled zero latency. In the other modes it is the open of the first 1m bar named in the mode table, or of
+  the first after it that has a price. A long pays `F * (1 + slip)`, a short receives `F * (1 - slip)`.
 - **Collar.** The entry is sent as a marketable limit, immediate or cancel, with its limit fixed at the decision: a
   long at `P_D + 0.5 * ATR_k`, a short at `P_D - 0.5 * ATR_k`. If `F` is beyond the collar there is no fill, logged
   `ENTRY_COLLAR`. The test is on `F`, before slippage. Nothing else cancels an order already sent.
@@ -471,11 +476,19 @@ by all strategies and variants on that symbol. A candle-only strategy needs only
 steps 1 to 4 use only bars with close time at or before `t_cut` and trades with time at or before `t_cut`, and `P_dec` is the close of the last
 such bar. This is identical live and in backtests.
 
-**Completeness check.** The gap check finds missing bars but not a partial one, so for each source the run must also hold evidence that its data
-is complete through `t_cut`: a record stamped after `t_cut`, or a source server time at or after `t_cut + A`. If any source lacks this, `t_cut` moves
-back one minute and the check repeats once. If it still fails, the run logs `DATA_GAP` for that symbol. Each run logs `t_poll` for each source, and the
-skew, meaning the runner's clock minus the source's server time where the source gives one. In a backtest, the check reads the modelled fetch under
-backtest item 3.
+**Completeness check.** It runs in the `fetch` stage, before `decide`, for each source that feeds bars or windows. The gap check finds missing bars but not a
+partial one, so the run must also hold evidence that the source's data is complete through `t_cut`:
+
+| Where | Evidence |
+|---|---|
+| Live | A record stamped after `t_cut`, or a source server time at or after `t_cut + A` that came in the response delivering the last page |
+| Backtest | A record stamped in `(t_cut, t_poll - A]`, or the modelled server time if the source gives one. The window is slightly stricter than live, so a record from after the run cannot pass |
+
+If any source lacks this, `t_cut` moves back one minute and the check repeats once. If it still fails, the run logs `DATA_GAP` for that symbol. Each run logs
+`t_poll` for each source, the skew, meaning the runner's clock minus the source's server time where the source gives one, and whether the check passed on server
+time alone. Reports show the share of runs that did, because a server time proves the clock and not the feed, so that risk is bounded only by the measured `A`.
+
+Funding does not take this check, because it has a record only every few hours. It follows [C10](#c10-accounting) alone. Any other sparse source declares its own rule.
 
 **What a run sees.** Closed 1-minute bars since the last processed minute, trades, and funding settlement times and rates, all up to `t_cut`, plus the
 committed state from the previous run. It sees no book, so no book feature can gate a live entry or exit.
@@ -489,19 +502,23 @@ committed state from the previous run. It sees no book, so no book feature can g
 | Nominal start | Minute 7 of each hour | Avoids the top of the hour |
 | `latency` | 500 ms | Time from commit to the first possible fill or update |
 | `A` | 10 s, `UNVERIFIED` | Time for a closed bar or a trade to become readable. To be measured later from a GitHub runner |
-| `D_run` | 60 s for tier `T0`, 180 s for tier `T1` | Declared run duration, used in backtests in place of a real commit time |
-| Fetch offset | 0 s for the symbol's trade feed. Other sources are declared in `GATE_SPEC.md` | In backtests, `t_poll[source] = run_start + its offset` |
+| `D_run` | 60 s for tier `T0`, 180 s for tier `T1` | Declared run duration, used in backtests in place of a real commit time. Both tiers now fetch the same trades, so the `T0` value has lost its basis. C-10 re-bases it on that same fetch. Before the first run, that is not a counted change |
+| Fetch offset | 0 s for the symbol's trade feed, until C-10 declares it. Other sources are declared in `GATE_SPEC.md` | In backtests, `t_poll[source] = run_start + its offset` |
 | Fill wait | 2 minutes | Longest wait in step 5 |
 | Hole deadline | 24 hours after the run that logged `GAP_CLOSE` | See "Gaps in 1m bars" below |
-| Trade source values for `V0` | **`PLACEHOLDER`, re-audit condition C-10.** Page size, rate limit, retention and any other fetch offset wait for the source decision under `D-01` and `D-17` | No S07 or S08 `CYCLE` run may start until these are filled. Live `T0` bars come from the same trade feed, so the other strategies' fetch model needs them too |
+| Trade feed values | **`PLACEHOLDER`, re-audit condition C-10.** Page size, rate limit, retention and fetch offset for the trade feed of the chosen source, and `D_run` for tier `T0` re-based on that same fetch. They wait for the source decision under `D-01` and `D-17`. `data-steward` supplies them and `strategy-architect` records them here | **No `CYCLE` run may start until these are filled**, for any strategy, including selection under `C-LATE`, the S01 and S06 control runs, and `CYCLE` placebos. `IDEAL` and `IDEAL-1M` read the archive and do not need them |
 
-**Order of work in one run**, for each symbol and strategy. The run function has two separate parts:
+**Order of work in one run**, for each symbol and strategy. A run has a `fetch` stage, and then two separate parts:
 
 ```text
-decide(bars and trades at or before t_cut):
- 1. Set t_cut by the run clock and the completeness check. Load state as of t_cut: positions, the stored history of
-    stops and targets, the last processed minute. A fill dated after t_cut by the last settle is still pending here.
-    P_dec = close of the last 1m bar with close time <= t_cut. Check for gaps, below.
+fetch:
+ 0. Fetch each source and record its t_poll. Set t_cut by the run clock and the completeness check. Mark each empty
+    minute by its proof of continuity under C2. Pass t_cut and the data truncated at t_cut to decide.
+
+decide(t_cut, bars and trades at or before t_cut):
+ 1. Load state as of t_cut: positions, the stored history of stops and targets, the last processed minute. A fill
+    dated after t_cut by the last settle is still pending here. P_dec = close of the last 1m bar with close time
+    <= t_cut. Check for gaps, below.
  2. Walk each open position through the new 1m bars, in time order, with C7's logic on the 1m bar. For each 1m bar,
     the stop and targets are those in force for it, read from the stored history (effective_from <= its open_time).
     Resolve first any entry fill or exit left pending by the last run, walking every 1m bar before the fill bar.
@@ -517,13 +534,14 @@ decide(bars and trades at or before t_cut):
        compute stop and target updates, carrying each through C8 into the next
        run setup detection and the late-entry checks
     Fills from the walk stand. The rules for close b apply to whatever quantity remains.
- 3b. Flow, for flow variants only, at every run. It reads only bars and trades at or before t_cut, with position state
-    as of t_cut, and may exit, scale out or tighten. It never computes a model update.
+ 3b. Flow, for flow variants only, at every run: the entry gate, and flow exits, scale-outs and tightening. The gate sits
+    here because decide is the only place a decision can change. It reads only bars and trades at or before t_cut, with
+    position state as of t_cut. It never computes a model update.
  4. Commit all decisions to the ledger, including those of step 3b. t_dec = the commit time.
 
 settle(the committed decisions, data up to t_dec + latency + fill wait):
- 5. Entries, close-based exits and time exits fill at the open of the first 1m bar with open_time >= t_dec + latency,
-    entries under the C6 collar, exits less slip. For a pending exit, first walk every 1m bar before the fill bar
+ 5. Entries, close-based exits, time exits, and flow exits and scale-outs fill at the open of the first 1m bar with
+    open_time >= t_dec + latency that has a price, entries under the C6 collar, exits less slip. For a pending exit, first walk every 1m bar before the fill bar
     under the stop in force, charging funding as step 2 does. A touch there stands, and the pending exit is cancelled
     and logged as superseded. Otherwise it fills, and funding up to the fill is charged by the C10 boundary rule. If the
     fill bar does not exist within the fill wait, the next run's step 2 resolves it.
@@ -564,14 +582,15 @@ run that dies after its commit loses nothing, and the next run derives it.
 | `knowable_time` | When the input became knowable, usually a bar close. For an event that depends on a fill, the fill's time |
 | `event_time` | Close time of the 1m bar in which a touch or fill happened, or `t_dec` for a decision |
 | `detection_time` | `run_start` of the run that found it |
-| `t_poll`, skew | For each source: the clock reading in the run clock, and the runner's clock minus the source's server time where given |
+| `t_poll`, skew | For each source: the clock reading in the run clock, the runner's clock minus the source's server time where given, and whether the completeness check passed on server time alone |
 | `t_cut`, `t_dec` | The run's data cut-off and commit time |
 | `effective_from` | Open time of the first 1m bar on which a new stop or target acts |
 | `lateness` | `detection_time - knowable_time` |
 
 **Gaps in 1m bars.**
 
-- If any 1m bar between the last processed minute and `t_cut` is missing, log `DATA_GAP`. Resolve nothing past the gap, and take no new
+- If any 1m bar between the last processed minute and `t_cut` is missing, log `DATA_GAP`. An empty minute with no proof of continuity under
+  [C2](#c2-bars-and-calendar) counts as missing, even when trades have resumed before the run. Resolve nothing past the gap, and take no new
   decisions for this symbol in this run. Never fill or assume.
 - If the gap is still open at the next run, decide to close each open position. It fills through step 5, at the first available 1m open
   after that run's `t_dec + latency`, logged `GAP_CLOSE`. A fill any earlier would come before its own decision.
@@ -611,12 +630,13 @@ The entry then goes out under the [C6](#c6-entry-fill-r-and-size) collar, around
 
 **Backtest reproduction.** Every live-eligible strategy reports `IDEAL`, `IDEAL-1M` and `CYCLE`. `CYCLE` must:
 
-1. Call the same `decide` and `settle` as live, one simulated run at a time. `decide` receives a dataset truncated at `t_cut`. `settle` receives
-   the committed decisions, and data up to `t_dec + latency + fill wait`.
+1. Call the same `decide` and `settle` as live, one simulated run at a time, after a modelled `fetch` that sees the archive only through the evidence
+   window above. `decide` receives `t_cut` and a dataset truncated at it. `settle` receives the committed decisions, and data up to
+   `t_dec + latency + fill wait`.
 2. Use the run clock above, with `t_dec = run_start + D_run`, for all of steps 1 to 4 and their tests.
 3. **Model each run's fetch.** A run that would exceed its time budget or a source's rate limit must behave in the backtest as it would live, by logging
    the same gap and taking the same fail-closed path, even though an archive would have the data. Per-source page size, rate limit and retention for flow
-   sources are in `GATE_SPEC.md`. For `V0` they are the placeholder in the constants table.
+   sources are in `GATE_SPEC.md`. For the trade feed they are the placeholder in the constants table, which holds back every `CYCLE` run.
 4. Build `T_d` bars from 1m bars, and check them against the venue's own bars at gate G1. Include funding in the walk, as live does.
 5. Draw run times from a declared, seeded scenario:
 
@@ -625,7 +645,7 @@ The entry then goes out under the [C6](#c6-entry-fill-r-and-size) collar, around
 | `C-FAST` | 2 minutes, fixed | None | None | Upper bound for comparison |
 | `C-LATE` | Uniform, 2 to 45 minutes | 5 percent | None | **Parameter selection** and the headline `CYCLE` result, until measured data replaces it |
 | `C-BAD` | Uniform, 2 to 60 minutes | 15 percent | None | Stress report |
-| `C-GAP` | As `C-LATE` | As `C-LATE` | One 90-minute hole in 1m bars per 30 days, at random times. Two reports: hidden bars arrive 3 hours after the hole ends, and hidden bars never arrive | Data-gap stress report. Real gap logs replace it at G8 |
+| `C-GAP` | As `C-LATE` | As `C-LATE` | One 90-minute hole in 1m bars per 30 days, at random times. A hole removes the trades and the proof of continuity across them, so its minutes are gaps under C2. Two reports: hidden bars arrive 3 hours after the hole ends, and hidden bars never arrive | Data-gap stress report. Real gap logs replace it at G8 |
 | `C-MEASURED` | Empirical, from real run logs, once at least 30 days exist | Empirical | Empirical | Replaces `C-LATE` as a new, visibly labelled configuration. It also replaces `D_run` and fetch offsets with values from real logs |
 
 These delay and outage values are my assumptions and are not GitHub figures. The seed count and the seed list are declared in configuration before the
@@ -640,11 +660,12 @@ live results.
 
 **Required tests when code exists.** On every register and engine: truncation invariance, future perturbation, the shift test and the timestamp
 audit. Also that `decide` gives identical output with data after `t_cut` removed, with held state as of `t_cut` and a later-dated fill treated as still
-pending, and that each stop and target acting on a 1m bar in a walk has `effective_from` at or before that bar.
+pending, that a backtest's `fetch` gives the same `t_cut` with data after `t_poll - A` removed, that a hole in trades is a gap and never zero-volume minutes, and
+that each stop and target acting on a 1m bar in a walk has `effective_from` at or before that bar.
 
 **Worked timeline.** A 1h setup bar closes at 13:00. The last good run was the 12:07 one. The 13:07 run is dropped. The next run starts at 14:21:05, and a
-candle-only strategy's one fetch begins at that moment. So `t_cut = floor_1m(14:20:55) = 14:20:00`. The fetch holds a record stamped after 14:20:00, so the
-completeness check passes, and `P_dec` is the close of the 1m bar closing 14:20. It
+candle-only strategy's one fetch begins at that moment. So `t_cut = floor_1m(14:20:55) = 14:20:00`. The `fetch` stage holds a record stamped after 14:20:00, which in
+a backtest must lie in `(14:20:00, 14:20:55]`, so the completeness check passes, and `P_dec` is the close of the 1m bar closing 14:20. It
 walks 1m bars from about 12:06 onward using the stops in force from the stored history, then processes the 13:00 and 14:00 closes in order, each with position
 state as of its close. The setup has age 80 minutes and `lateness` 81 minutes. With `D_run` of 60 s, `t_dec` is 14:22:05, so the first 1m bar with
 `open_time >= 14:22:05.5` opens at 14:23. If the checks pass, the fill is that open. A position's stop update computed from the 13:00 close has `effective_from`
@@ -813,6 +834,7 @@ listing page, and any claim from that source is limited accordingly.
 5. **Proof of freezing.** The auditor notes that nothing shows the frozen constants were set without sight of outcomes. A hash of these documents committed before
    the first run would make that checkable. `project-manager` to decide.
 6. **Venue.** Under `D-01` and `D-17`, the research source and venue are undecided. Funding schedules, bar labels and tick sizes must be read from the chosen source.
-7. **Trade source values for `V0`.** A marked placeholder in [C17](#c17-hourly-live-cycle), re-audit condition C-10. It waits for the source decision.
+7. **Trade feed values.** A marked placeholder in [C17](#c17-hourly-live-cycle), re-audit condition C-10 as restated. It waits for the source decision, and no `CYCLE` run of any
+   strategy may start until it is filled.
 
 Conditions C-3, C-4, C-5 and C-7 of the re-audit have other owners and are not settled here. Questions 4 and 5 above are the same matters as C-7 and C-5.
