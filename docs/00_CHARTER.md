@@ -49,8 +49,16 @@ Every strategy runs in the variants below, so the value of each decision can be 
 
 `V0` is the baseline. `V0S` exists only to show whether dynamic management adds anything.
 
-Vetoed setups stay in the record with their counterfactual result, so the gate can be judged on
-what it rejected as well as on what it accepted.
+Two refinements come from [the gate specification](02_features/GATE_SPEC.md):
+
+- **`VE` has two forms.** `VE.F` only filters, with `ENTER` or `VETO` at the first look. `VE.T` also allows `WAIT`.
+  They are separate because filtering survives the hourly cycle and timing mostly does not.
+- **Each variant has two kinds.** `.L` is live-eligible: it uses only inputs available on the hourly cycle, and runs
+  on the same cycle in backtests. `.R` is research-only and may use data a live run would not have. The difference
+  between them is a simulated estimate of what running only on GitHub costs.
+
+Vetoed, expired and skipped setups stay in the record with their counterfactual result, so the gate
+can be judged on what it rejected as well as on what it accepted.
 
 ## 3. Timing contract
 
@@ -162,12 +170,15 @@ Hard rules, for every strategy:
 2. **Targets may move either way,** but only by the documented rule. Moving a target never moves the
    stop backward.
 3. **Flow can only reduce risk.** Flow features may exit early, scale out or tighten a stop. They may
-   never widen a stop or extend a time stop.
+   never widen a stop, extend a time stop or extend a target.
 4. **Position size comes from the initial stop.** `R` is the initial stop distance and it never
    changes afterwards, so trade results stay comparable in `R` multiples.
 5. **Every update is a logged event,** with old and new values, the reason and the knowable time.
 6. **Inside a bar, the stop is applied first.** See items 8 and 12 of the
    [timing contract](#3-timing-contract).
+7. **Time stops on the hourly cycle.** A time stop takes effect at the first run after it falls due, and fills at
+   the first price after that run. The overrun is logged and reported. This is a limit of the cycle, not a rule
+   that extends the stop.
 
 ## 8. Live positions and publication
 

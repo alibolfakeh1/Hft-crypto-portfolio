@@ -24,6 +24,7 @@ Newest entries go at the bottom of each list. Entries are not rewritten. A chang
 | D-03 | Which Telegram channel, and has the owner checked any legal requirement for publishing positions? | Create a private test channel first. Decide on the public channel when P7 is ready. The owner approves the first post | P8 public posts |
 | D-04 | Should an always-on machine be added later, for continuous data and order-level recording? | Not needed now, by `D-15`. Revisit if the hourly cycle proves too slow or GitHub limits the jobs. The code stays portable | Continuous live data, `T3` |
 | D-08 | Does "live position" mean paper positions on live data? | Assumed yes. Real orders are a separate, later decision | P8 |
+| D-16 | Before live paper starts: does the owner accept the risk of running the hourly paper engine and a public channel on GitHub Actions? GitHub's terms say Actions may be used only to develop and test an application. See section 5 of `docs/08_DATA_CENTER.md` | Decide at P8, when it is real. Backtests and reports fit the terms much better and can continue until then. If the risk is not acceptable, move only the hourly job and the channel to another machine | P8 |
 | D-06 | Which licence? | None for now. Without a licence, people can read the code but have no right to reuse it. Choose one later if reuse is wanted | Nothing |
 
 ## Proposed by the team

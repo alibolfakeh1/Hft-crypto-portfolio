@@ -105,16 +105,30 @@ records both the event time and the detection time, so the delay stays visible.
 
 ### Staying within GitHub's terms
 
-GitHub's terms limit Actions to activity related to producing, testing, deploying or publishing the project, and they
-forbid a burden disproportionate to the benefit, naming serverless applications as an example. Misuse can lead to
-terminated jobs, a disabled repository or a suspended account. To stay well inside this:
+GitHub's terms contain three limits that matter here:
+
+- Actions may be accessed and used only "to develop and test your application(s)".
+- Activity on GitHub-hosted runners must relate to the production, testing, deployment or publication of the project.
+- A burden disproportionate to the benefit is forbidden, with serverless applications named as an example.
+
+Misuse can lead to terminated jobs, a disabled repository or a suspended account.
+
+| Part | How well it fits |
+|---|---|
+| Tests, code checks, backtests | Clearly development and testing |
+| Publishing the report to Pages | Publication of the project |
+| Daily data pipeline | Reasonable while it serves testing and the report, but less clear for a long-running production job |
+| Hourly paper engine | Can be argued as forward testing of the application, but this is not certain |
+| Public Telegram channel of positions | The weakest fit, because it looks like running a service |
+
+To reduce the risk:
 
 - Jobs are short: under about 3 minutes for the hourly run, and about 60 minutes for the daily run.
 - No continuous loops, and no serving of traffic.
 - The code stays portable, so the system can move if GitHub ever objects. The ledger is safe in git.
 
 This reduces the risk but does not remove it, because GitHub decides how its terms apply. The risk falls on the
-owner's account.
+owner's account, so it is an owner decision before live paper starts (`D-16`).
 
 ## 6. Staying up
 
