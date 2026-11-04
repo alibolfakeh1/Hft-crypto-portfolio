@@ -15,9 +15,11 @@ never disagree.
 ## Architecture
 
 ```text
-report engine -> versioned results store -> read-only local API -> desktop app
-                                                                -> Telegram bot -> channel
+scheduled GitHub jobs -> results branch and GitHub Pages -> desktop app, over HTTPS
+                      -> Telegram channel
 ```
+
+The whole system runs on GitHub, with no always-on backend (decision `D-15`).
 
 ## Telegram
 
@@ -26,14 +28,15 @@ report engine -> versioned results store -> read-only local API -> desktop app
   changes are throttled so the channel stays readable, while the ledger keeps every change.
 - **Operations alerts:** data and system problems go to a private chat, not the public channel, unless
   the problem means the published positions cannot be trusted. In that case the channel is told.
-- **Bot in a private chat:** commands restricted to an allow-list of owner user ids.
+- **Posts only.** Instant bot commands need an always-on process, so the bot does not answer commands for now.
+- **Posts show both times:** when the event happened and when the run detected it.
 - Respect Telegram rate limits, retry safely, and avoid duplicate posts.
 
 ## Desktop app
 
 - Installs and runs on Windows, as a single packaged application.
-- Has a live positions view, as defined in section 8 of the charter, that updates as events arrive.
-- Works offline from the local results store, and shows clearly how old the data is.
+- Has a live positions view, as defined in section 8 of the charter, refreshed from the published results.
+- Reads published results over HTTPS, caches them for offline use, and shows clearly how old the data is.
 
 ## Rules
 
@@ -42,8 +45,7 @@ report engine -> versioned results store -> read-only local API -> desktop app
   results, including in Telegram images.
 - Post only from the append-only ledger. A channel post is never edited to hide a result.
 - Show the baseline `V0` next to a gated result, and show costs.
-- Tokens come only from environment variables or the operating system's secure store. Never from code,
-  logs or screenshots.
+- Tokens are kept only as GitHub Actions secrets. Never in code, logs or screenshots.
 - **Before anything is posted to a channel for the first time, the owner must approve.** Treat posting
   as publishing. Test against a private test channel first.
 - Do not invent metrics in the front end. If a number is missing, ask for it from the report engine.

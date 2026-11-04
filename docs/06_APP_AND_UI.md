@@ -7,14 +7,19 @@ the design. Metric definitions are in [the portfolio outputs document](04_PORTFO
 ## 1. Architecture
 
 ```text
-live data -> paper engine -> append-only ledger ─┐
-backtests -> report engine -> results store ─────┴-> read-only local API -> desktop app
-                                                                         -> Telegram bot -> channel
+hourly job: new data -> paper engine -> ledger on the results branch -> Telegram channel
+daily job:  backtests -> report engine -> results branch and GitHub Pages
+                                                  │
+                                                  └-> desktop app reads them over HTTPS
 ```
 
-Proposed stack, pending decision `D-05`: a Python read-only API, and a desktop app that wraps a local web UI
-in a native window, packaged as one Windows application. The same chart components can then serve the
-desktop app, the HTML tear sheet and the Telegram images, so there is one visual language to maintain.
+Everything runs on GitHub (decision `D-15`), so there is no always-on backend. The desktop app is a client
+that reads published results and caches them locally. Telegram posts are sent by the scheduled jobs, so a
+post can be up to an hour after the event, or later if a run is late, and each post shows both times.
+
+Proposed stack, pending decision `D-05`: a desktop app that wraps a local web UI in a native window, packaged
+as one Windows application. The same chart components can then serve the desktop app, the HTML tear sheet and
+the Telegram images, so there is one visual language to maintain.
 
 ## 2. Desktop views
 
@@ -70,13 +75,15 @@ See decision `D-03`.
 
 ### Private bot commands
 
-Restricted to an allow-list of owner user ids: `/status`, `/positions`, `/portfolio`, `/strategy <id>`,
-`/health` and `/pause_posts`. There is no command that places an order.
+A bot that answers commands instantly needs an always-on process, which GitHub does not provide. So the bot only
+posts. A command could be answered at the next hourly run if this later proves useful. There is no command that
+places an order, in any mode.
 
 ## 4. Security
 
-- Tokens come only from environment variables or the operating system's secure store. See `.env.example`.
-- The local API binds to localhost and is read-only.
+- Tokens are kept as GitHub Actions secrets, or in the operating system's secure store on the desktop. See
+  `.env.example`.
+- The desktop app only reads published results, and holds no secrets.
 - Logs and screenshots must never include tokens.
 - The repository is public, so assume everything committed will be read.
 

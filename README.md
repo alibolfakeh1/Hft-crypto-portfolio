@@ -3,7 +3,7 @@
 Research into mid-frequency strategies on BTC and ETH. Advanced candle strategies propose trades, then
 order-flow and order-imbalance features help decide whether and when to enter and when to exit. Each strategy
 has a dynamic stop and target model. Results are shown as a professional portfolio, and live paper positions
-will be published to a Telegram channel.
+will be published to a Telegram channel. Everything runs on GitHub itself: Actions, its cache, and Pages.
 
 > **Status: documents only.** No code has been written and no strategy has been tested. There are no results.
 

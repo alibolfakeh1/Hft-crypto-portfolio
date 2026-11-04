@@ -2,7 +2,12 @@
 
 The policy that `data-steward` enforces. Its goals are that the disk never fills up, and that data we
 cannot get back is never lost by accident. Retention periods below are starting defaults, to be revised
-once real measurements and the server's disk size are known (decision `D-04`).
+from real measurements.
+
+**Current mode.** The system runs on GitHub only (decision `D-15`). `DATA_QUOTA_GB` is therefore the
+Actions cache budget, 8 GB by default. Raw files last for one job and are deleted once curated data passes
+its checks. Rows and rules about live recordings (`T3`) and recorder headroom are inactive until an
+always-on machine is added.
 
 ## 1. Classes
 
@@ -95,7 +100,7 @@ note, and last integrity check result.
 - Check each source's terms before keeping or redistributing its data. Publishing derived statistics and
   publishing raw data are different questions.
 
-## 9. Start recording early
+## 9. If an always-on machine is added
 
-Recording `T3` belongs early in the roadmap, because every day not recorded is lost for good, and no free
-source offers this history later. Building the recorder comes before the research that needs its data.
+Recording `T3` should then start immediately, because every day not recorded is lost for good, and no free
+source offers this history later.

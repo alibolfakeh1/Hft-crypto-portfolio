@@ -3,30 +3,30 @@
 How market data gets in, where it lives, how results get out, and how the system stays running. Owned by
 `data-steward`. Retention rules are in [the data lifecycle document](05_DATA_LIFECYCLE.md).
 
-## 1. Why the data does not live in GitHub
+## 1. Why market data does not live in git
 
-GitHub is the home of the code, the catalog summaries and the results. It cannot be the home of the data:
+The system runs on GitHub itself, but git history is the home of the code and the small results, not the data:
 
 - GitHub blocks files over 100 MiB. One day of Bybit `ob200` for BTC is about 228 MB.
 - Book data alone is on the order of 150 GB per year for two symbols, and GitHub recommends far smaller
   repositories.
 - This repository is public, and redistributing an exchange's data is a separate legal question.
 
-So data lives in a data center, under `DATA_ROOT`, on a machine that stays on. Only small results reach GitHub.
+So the data center runs on GitHub's runners and cache, under `DATA_ROOT`. See [section 5](#5-running-on-github-itself).
 
 ## 2. The whole flow
 
 ```text
 Exchange archives ──┐
                     ├─> ingest ─> raw zone ─> curated zone ─> feature zone ─> compute ─> results
-Live feeds ─────────┘                                                                    │
+Hourly live poll ───┘                                                                    │
                                                                 ┌────────────────────────┤
   data-steward: catalog, integrity, retention, deletion         ▼                        ▼
                                                           GitHub, Pages          desktop app, Telegram
 ```
 
 - **Historical path:** daily archive files, used for backtests and reports.
-- **Live path:** continuous feeds, used for live paper positions and for recording data no archive offers.
+- **Live path:** recent trades polled once an hour from public REST sources, used for live paper positions.
 - **One codebase.** Bars and features are built by the same code on both paths. Each day, bars built live are
   reconciled against bars built from that day's archive, and any difference is reported.
 
@@ -35,7 +35,7 @@ Live feeds ─────────┘                                       
 ```text
 DATA_ROOT/
   raw/archive/<venue>/<dataset>/<symbol>/date=YYYY-MM-DD/    files exactly as delivered, with checksums
-  raw/live/<venue>/<channel>/<symbol>/date=YYYY-MM-DD/       messages with receive time, compressed
+  raw/live/<venue>/<channel>/<symbol>/date=YYYY-MM-DD/       polled live data with receive time
   curated/<dataset>/venue=<v>/symbol=<s>/month=YYYY-MM/      clean Parquet with one schema per dataset
   features/<feature_id>/<version>/symbol=<s>/month=YYYY-MM/  computed features, versioned
   results/runs/<run_id>/                                     backtest and report outputs
@@ -49,7 +49,7 @@ DATA_ROOT/
 | Zone | Class | Rule |
 |---|---|---|
 | `raw/archive` | `RE-DOWNLOADABLE` | Never edited. Deleted by policy once curated data passes its checks |
-| `raw/live` | `IRREPLACEABLE` | Never edited. Compressed after a day, and deleted only by policy |
+| `raw/live` | `RE-DOWNLOADABLE` for a limited time | Never edited. Deleted once curated, since the source keeps recent history. A gap longer than that history is permanent |
 | `curated` | `DERIVED` | Rebuilt rather than patched |
 | `features` | `DERIVED` | A changed definition means a new version, never an overwrite |
 | `ledger`, `decisions` | `IRREPLACEABLE` | Kept forever, with an off-site copy |
@@ -75,19 +75,46 @@ Measured on 2026-11-04 using files dated 2026-11-03. One day is a first look, no
 - **Binance `bookDepth` is a compact imbalance source.** It gives cumulative depth at ±0.2% and ±1% to ±5%,
   about every 30 seconds. It exists on 2023-06-01 and not on 2022-06-01.
 
-## 5. Where each job runs
+## 5. Running on GitHub itself
 
-| Job | Where | Why |
+By the owner's decision (`D-15`), the whole system runs on GitHub, with no server.
+
+| Part | Where it lives |
+|---|---|
+| Daily historical pipeline | Scheduled Actions job, with a time budget of about 60 minutes. Backfill continues across runs |
+| Hourly live cycle | Scheduled Actions job, short, with no overlapping runs |
+| `raw` zone | The runner's disk, for one job only. The exchange archives are the real raw store |
+| `curated`, `features`, `catalog` | Actions cache, with a budget of 8 GB against the default 10 GB limit. If lost, catch-up rebuilds it from the archives |
+| `ledger`, `decisions`, status, run log | The `results` branch in git. Small, append-only and public |
+| Report | GitHub Pages |
+| Tests and code checks | Actions |
+| Alerts | A separate watchdog workflow, through Telegram |
+
+### What running only on GitHub gives up
+
+| Capability | On GitHub | Consequence |
 |---|---|---|
-| Live recorder, live bars, paper engine, Telegram posts | **Always-on server** | These need continuous connections. See below |
-| Backfill, daily catch-up, feature builds, backtests | Server. GitHub Actions can cover the light historical part until a server exists | Actions has limited disk and time |
-| Tests and code checks | GitHub Actions | Free for public repositories |
-| Publishing the report to GitHub Pages | GitHub Actions | This is the publication of the project |
-| Watchdog | GitHub Actions | It must run outside the machine it watches |
+| Continuous feeds | Not possible. A job stops at 6 hours, and Actions is not meant to host a service | Live paper positions run on an hourly cycle, not tick by tick |
+| Order-level recording (`T3`) | Not possible | Features that need `T3` wait, unless an always-on machine is added later |
+| Live order book | Only a snapshot at poll time | Live gates use trades and candles only. `T2` comes from next-day archives, for research only |
+| Exact timing | GitHub says scheduled runs can be delayed under load and can be dropped | Each run logs how late it was, and the report shows it. The next run catches up |
+| Live strategies under 1 hour | Not practical | 5-minute and 15-minute timeframes are backtest only |
 
-**Live work cannot run on GitHub Actions.** A job stops at 6 hours. GitHub says scheduled runs can be delayed under
-load and can even be dropped. Its terms also say Actions should not be used as part of a serverless application or
-a standalone service, and misuse can lead to a disabled repository or a suspended account.
+A position on this cycle can detect a stop or an entry up to an hour late, or longer if a run is late. The ledger
+records both the event time and the detection time, so the delay stays visible.
+
+### Staying within GitHub's terms
+
+GitHub's terms limit Actions to activity related to producing, testing, deploying or publishing the project, and they
+forbid a burden disproportionate to the benefit, naming serverless applications as an example. Misuse can lead to
+terminated jobs, a disabled repository or a suspended account. To stay well inside this:
+
+- Jobs are short: under about 3 minutes for the hourly run, and about 60 minutes for the daily run.
+- No continuous loops, and no serving of traffic.
+- The code stays portable, so the system can move if GitHub ever objects. The ledger is safe in git.
+
+This reduces the risk but does not remove it, because GitHub decides how its terms apply. The risk falls on the
+owner's account.
 
 ## 6. Staying up
 
@@ -99,9 +126,8 @@ failure does not go unnoticed.
 - **Idempotent jobs.** Running a job twice gives the same result.
 - **Atomic writes.** Files are written to a temporary name, verified, then renamed. A crash cannot leave a half-
   written partition looking complete.
-- **Supervised services.** Live services restart automatically and reconnect with backoff.
-- **Outside watchdog.** The server writes a heartbeat. A separate scheduled check alerts the owner on Telegram if the
-  heartbeat goes stale, because a dead server cannot report its own death.
+- **Watchdog.** A separate workflow checks the age of the last result and alerts the owner on Telegram. It runs on the
+  same platform, so a GitHub outage can silence it too.
 - **Visible staleness.** Every output shows the age of its data. Stale data is labelled, never shown as current.
 
 ### What happens when something fails
@@ -111,10 +137,12 @@ failure does not go unnoticed.
 | Archive file late or missing | That date stays pending | Picked up by a later run. Alert if overdue |
 | Download corrupted | Checksum fails, file goes to quarantine | Downloaded again |
 | A scheduled GitHub run is delayed or dropped | Nothing is lost | The next run catches up |
-| GitHub disables a schedule after 60 days without activity (public repositories) | Scheduled runs stop | Regular result commits keep the repository active. The server also checks when the last report was published and raises an alert. To be confirmed in practice |
-| Live feed drops | Gap recorded, automatic reconnect | The gap cannot be recovered. Affected feature windows are marked invalid |
-| Server down | Recording and live positions stop | Watchdog alerts. On restart, an `OUTAGE` event goes into the ledger and the channel is told. Open positions are reassessed at the first valid price |
-| Disk filling up | Watermark actions from the lifecycle document | Recorder headroom is protected |
+| GitHub disables a schedule after 60 days without activity (public repositories) | Scheduled runs stop | Regular result commits should keep the repository active. To be confirmed in practice |
+| Polling source unavailable | Gap recorded | The next run catches up from the source's recent history. A longer gap is permanent, and affected windows are marked invalid |
+| Actions cache lost or evicted | Curated data is missing | Catch-up rebuilds it from the archives. The report shows partial coverage until then |
+| GitHub Actions outage | Everything waits | Catch-up on return. An `OUTAGE` event goes into the ledger and the channel is told. Open positions are reassessed at the first valid price |
+| Cache over budget | Oldest entries are pruned | The newest copy always stays |
+| GitHub restricts the jobs | Everything stops | The code is portable and the ledger is in git, so the system can move |
 | Exchange changes a format | Validation fails, data is quarantined | Alert. Fix the adapter, then rebuild |
 
 ## 7. Who deletes data
@@ -135,8 +163,7 @@ Estimates from single-day measurements. Volatile periods will be larger.
 | Binance `aggTrades`, BTC | 12 MB | Keep flow bars, delete raw |
 | Bybit trades, BTC | 50 MB | Keep flow bars, delete raw |
 | Bybit `ob200`, BTC and ETH | 430 MB | Keep features, delete raw |
-| Live L3 recording, BTC and ETH | About 30 GB raw JSON, before compression. Not yet measured over a day | Keep 90 days compressed if the disk allows |
 
-Replaying one day of `ob200` took 95 seconds in plain Python on one core. A rough starting point for the server is 4
-CPU cores, 8 GB of memory and 500 GB to 1 TB of SSD. The live recording rate is what decides the disk size, so revise
-this after a measured day.
+Replaying one day of `ob200` took 95 seconds in plain Python on one core. A runner's disk is limited, so large files
+are processed one day at a time and removed before the next one. Only curated data and features are kept between
+runs, so the cache budget decides how much history fits, and this must be revised from measured sizes.

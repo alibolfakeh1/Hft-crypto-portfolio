@@ -17,6 +17,10 @@ paper positions to a Telegram channel.
 
 **Public project.** The repository is public. Nothing published here is investment advice.
 
+**Runs on GitHub itself.** There is no server (decision `D-15`). Backtests can use any timeframe in scope. Live
+paper positions run on an hourly cycle at 1-hour or 4-hour timeframes. See
+[what this gives up](08_DATA_CENTER.md#5-running-on-github-itself).
+
 ## 2. Decision stack
 
 Each layer has one job. Layers are not collapsed into one score.
@@ -72,6 +76,10 @@ Every value has a **knowable time**, the earliest moment a live system could hav
 11. Parameters are selected on training folds only. Test blocks are never reused for selection.
 12. A stop or target update computed at time `t` applies from `t + latency`. An update computed on a
     bar close applies from the next bar, never to the bar that produced it.
+13. On the hourly live cycle, a decision is made at the time of the run, however much earlier its setup
+    became knowable. A paper entry fills at the first price available after that run. A stop or target touched
+    between runs is resolved from 1-minute bars at the next run and recorded with both its event time and its
+    detection time. Backtests of live-eligible variants reproduce this cycle.
 
 ## 4. Data tiers
 
@@ -83,7 +91,7 @@ data they require. A strategy's testable history is limited by the highest tier 
 | `T0` | Candles | Setups | Years |
 | `T1` | Signed trades | Trade-flow features, volume profile, VWAP | Years, to be confirmed per venue |
 | `T2` | Conflated L2 book | Imbalance, depth and spread features | Daily archive, depth of history to be confirmed |
-| `T3` | Order-level L3 events | Order lifecycle and queue features | Forward only, from our own recording |
+| `T3` | Order-level L3 events | Order lifecycle and queue features | Forward only, from our own recording. Not available while running on GitHub only |
 
 ### Checks made on 2026-11-04
 
@@ -163,8 +171,9 @@ Hard rules, for every strategy:
 
 ## 8. Live positions and publication
 
-Strategies that reach gate G6 run forward on live market data as paper positions. No real orders are
-sent. See rule 3 in [CLAUDE.md](../CLAUDE.md).
+Strategies that reach gate G6 run forward on live market data as paper positions, on an hourly cycle of
+scheduled GitHub jobs. "Live" here means current to within the last run, not tick by tick, and every view shows
+the age of its data. No real orders are sent. See rule 3 in [CLAUDE.md](../CLAUDE.md).
 
 - **Live view.** For each open position: strategy, symbol, side, entry time and price, size, `R`, current
   stop and target, distance to each, unrealised P&L in money and in `R`, age, and the stop and target
