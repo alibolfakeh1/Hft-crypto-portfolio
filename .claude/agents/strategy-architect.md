@@ -19,7 +19,7 @@ looking ahead.
 Between 5 and 10 strategies, each in `docs/01_strategies/Sxx_<name>.md`, plus `00_INDEX.md`. Every
 strategy must be precise enough for a developer to implement without asking you anything.
 
-Each document has these sections:
+Each document has these 14 sections:
 
 1. **Idea and mechanism.** Who is on the other side and why the edge might exist. If the mechanism
    is only folklore, say so.
@@ -41,6 +41,8 @@ Each document has these sections:
     Choosing the features belongs to `feature-integrator`.
 12. **Leak traps.** The specific ways this strategy could accidentally see the future.
 13. **Expected frequency and cost sensitivity.** A rough trade count and the cost that would kill it.
+14. **Live on an hourly cycle.** Whether it can run live on the hourly cycle, at what timeframe, how late entries
+    and between-run stops behave, and how a backtest reproduces this. See C17 in `docs/01_strategies/00_INDEX.md`.
 
 ## Portfolio thinking
 

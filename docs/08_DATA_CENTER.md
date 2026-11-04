@@ -57,7 +57,9 @@ DATA_ROOT/
 
 ## 4. Rules learned from the first real data
 
-Measured on 2026-11-04 using files dated 2026-11-03. One day is a first look, not a full audit.
+Measured on 2026-11-04 using files dated 2026-11-03. One day is a first look, not a full audit. Figures about Binance
+files in this section are derived from Binance Vision data, licensed CC BY-NC-SA 4.0. This project is not associated
+with or endorsed by Binance. Whether each source remains in use is an open decision (`D-17`).
 
 - **Canonical bars are built from trades.** Rebuilding Binance 1-minute bars from `aggTrades` gave identical
   daily volume and taker-buy volume, but 127 of 1,440 bars differed by more than 0.001 BTC, by up to 1.627 BTC,
@@ -86,6 +88,7 @@ By the owner's decision (`D-15`), the whole system runs on GitHub, with no serve
 | `raw` zone | The runner's disk, for one job only. The exchange archives are the real raw store |
 | `curated`, `features`, `catalog` | Actions cache, with a budget of 8 GB against the default 10 GB limit. If lost, catch-up rebuilds it from the archives |
 | `ledger`, `decisions`, status, run log | The `results` branch in git. Small, append-only and public |
+| State between hourly runs: recent bars, running VWAP totals, profile bins | Actions cache, not git, because it is derived market data. A run rebuilds it deterministically after a cache miss, or logs `DATA_GAP` |
 | Report | GitHub Pages |
 | Tests and code checks | Actions |
 | Alerts | A separate watchdog workflow, through Telegram |

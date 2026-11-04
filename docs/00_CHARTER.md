@@ -41,7 +41,7 @@ Every strategy runs in the variants below, so the value of each decision can be 
 
 | Variant | Entry | Exit |
 |---|---|---|
-| `V0S` | Candle only | Fixed stop and target, set at entry and never moved. Control only |
+| `V0S` | Candle only | Fixed stop, target and maximum hold, set at entry and never moved. Control only |
 | `V0` | Candle only | Dynamic stop and target model |
 | `VE` | Flow gate | Dynamic stop and target model |
 | `VX` | Candle only | Dynamic model plus flow |
@@ -79,15 +79,19 @@ Every value has a **knowable time**, the earliest moment a live system could hav
 8. Stops and targets inside a bar are resolved conservatively: if both could have been hit in the
    same bar, assume the stop was hit first, unless finer data settles the order.
 9. Funding is charged at its actual settlement times.
-10. Normalisers, scalers, thresholds and seasonal profiles are fitted only on past data and frozen
-    before the block they are applied to.
+10. Anything estimated across a sample and then applied forward (scalers, thresholds, seasonal profiles) is
+    fitted only on past data and frozen before the block it is applied to. A fixed-window statistic recomputed at
+    each step from data at or before that step (`ATR`, a rolling percentile rank) is a causal indicator with no
+    fitted state, and needs no freezing. A threshold on such an indicator is still a fitted object.
 11. Parameters are selected on training folds only. Test blocks are never reused for selection.
 12. A stop or target update computed at time `t` applies from `t + latency`. An update computed on a
     bar close applies from the next bar, never to the bar that produced it.
 13. On the hourly live cycle, a decision is made at the time of the run, however much earlier its setup
     became knowable. A paper entry fills at the first price available after that run. A stop or target touched
     between runs is resolved from 1-minute bars at the next run and recorded with both its event time and its
-    detection time. Backtests of live-eligible variants reproduce this cycle.
+    detection time. Paper stops and targets are modelled as orders resting on the exchange between runs, with
+    stop slippage charged. This is fair only if a real system would hold such orders, and reports say so. Backtests
+    of live-eligible variants reproduce this cycle.
 
 ## 4. Data tiers
 
@@ -171,8 +175,9 @@ Hard rules, for every strategy:
    stop backward.
 3. **Flow can only reduce risk.** Flow features may exit early, scale out or tighten a stop. They may
    never widen a stop, extend a time stop or extend a target.
-4. **Position size comes from the initial stop.** `R` is the initial stop distance and it never
-   changes afterwards, so trade results stay comparable in `R` multiples.
+4. **Position size comes from the initial stop.** The fill is not yet known when size is sent, so size uses the
+   distance from the decision price to the initial stop. `R` is the distance from the actual fill to the initial
+   stop, and it never changes afterwards, so trade results stay comparable in `R` multiples.
 5. **Every update is a logged event,** with old and new values, the reason and the knowable time.
 6. **Inside a bar, the stop is applied first.** See items 8 and 12 of the
    [timing contract](#3-timing-contract).
@@ -190,7 +195,8 @@ the age of its data. No real orders are sent. See rule 3 in [CLAUDE.md](../CLAUD
   stop and target, distance to each, unrealised P&L in money and in `R`, age, and the stop and target
   history. The portfolio view adds net and gross exposure and open risk.
 - **Channel posts.** Position opened, stop or target changed, scale-out and position closed, plus a daily
-  portfolio summary. Each post carries the `PAPER` label, the strategy's current gate and a timestamp.
+  portfolio summary. Each post carries the `PAPER` label, the strategy's current gate, the time of the event and
+  the time the run detected it.
 - **Append-only ledger.** Every position event goes to a hash-chained ledger before it is posted. A
   losing trade is never hidden. A correction is a new event. Changing a strategy's version starts a new,
   visibly labelled segment of its record, so a backtest can never be mixed into the forward record.
