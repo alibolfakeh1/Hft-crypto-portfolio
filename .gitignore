@@ -1,0 +1,44 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Market data and generated results never go in git
+data/
+results/
+*.parquet
+*.feather
+*.arrow
+*.h5
+*.hdf5
+*.csv.gz
+*.data.zip
+*.zst
+*.lz4
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Local tooling
+.claude/settings.local.json
+.idea/
+.vscode/
+*.log
+
+# Operating systems
+Thumbs.db
+.DS_Store
