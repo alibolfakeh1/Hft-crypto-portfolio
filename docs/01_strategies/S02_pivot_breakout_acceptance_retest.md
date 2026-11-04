@@ -1,8 +1,8 @@
 # S02 Pivot breakout, acceptance and retest
 
-Status: draft for leak audit. Not tested. Tier `T0`. Default `T_d` 1h. Long and short. Live-eligible at 1h,
-see section 14.
-Common rules C1 to C17 are in [00_INDEX.md](00_INDEX.md#5-common-conventions) and apply throughout.
+Status: revised after the leak audit of 2026-11-04, awaiting re-audit. Not tested. Tier `T0`. Default `T_d` 1h. Long and
+short. Live-eligible at 1h, see section 14.
+Common rules C1 to C18 are in [00_INDEX.md](00_INDEX.md#5-common-conventions) and apply throughout.
 
 ## 1. Idea and mechanism
 
@@ -50,7 +50,8 @@ R3 = H + 2*(P - L)  S3 = L - 2*(H - P)     # used as targets only
 ```
 
 **Tradable set.** Daily `{S2, S1, P, R1, R2}`, and optionally weekly `{S1, P, R1}`, from the last completed
-UTC day and week.
+UTC day and week. A bar is evaluated against the set in force at its open, under
+[C2](00_INDEX.md#c2-bars-and-calendar).
 
 **Band.** `b_k = 0.10 * ATR_k`.
 
@@ -75,7 +76,7 @@ the sequence ends. `l` stays available for a new break.
 
 | Object | Knowable at |
 |---|---|
-| Daily and weekly levels | 00:00 UTC and Monday 00:00 UTC, from completed periods only |
+| Daily and weekly levels | 00:00 UTC and Monday 00:00 UTC, from completed periods only. They first act on the bar that opens at that time |
 | Break | Close of the break bar |
 | Acceptance | Close of the last acceptance bar, never at the break |
 | `SRV` | Each bar's close, with the median from the previous 8 weeks only |
@@ -130,16 +131,17 @@ Schedule: every `T_d` close. All go through [C8](00_INDEX.md#c8-stop-ratchet-and
 | `T1` reached | `T1` filled | `T1_level - 1.5 * ATR_b` |
 | Ladder ratchet | A level `m` above `l_base` has two consecutive closes above `m + b` | `m - 0.50 * ATR_b` |
 
-Rungs for the ladder are the current tradable set plus `R3`. The ladder uses whichever set is active at
-that close.
+Rungs for the ladder are the current tradable set plus `R3`. Both closes must come from bars that open at or after
+the rung's knowable time, so a close at the roll itself does not count toward a rung of the new set.
 
 ### 7.3 Target logic
 
 - At `t_k`: `T1` is the nearest level at least `1.5 * (C_k - S0)` above `C_k`, including `R3` as a candidate.
   `T2` is the next level above that. If none exists, `T2 = T1 + (T1 - l_base)`.
-- At the UTC roll, at the close of the bar ending 00:00: unfilled targets are rebuilt from the new set. `T1`
-  (if unfilled) is the nearest level at least `0.5 * ATR_b` above `C_b` and at or above `fill + 1.5 * R`.
-  `T2` is the next above. If none exists, the old target stays.
+- At the UTC roll, at the close of the bar ending 00:00: unfilled targets are rebuilt from the new set. If `T1` is
+  unfilled, it becomes the nearest level at least `0.5 * ATR_b` above `C_b` and at or above `fill + 1.5 * R`, and `T2`
+  is the next above. If `T1` has filled, `T2` becomes the nearest level at least `0.5 * ATR_b` above `C_b`. If none
+  exists, the old target stays.
 
 Targets may move either way, and the stop never moves back with them.
 
@@ -197,7 +199,8 @@ Invented numbers, for checking arithmetic only. Prior UTC day: `H = 3,480`, `L =
   3,497.67, `CLV = 0.80`.
 - `S_struct = 3,506.67 - 9 = 3,497.66`. `R_min = max(18, 16.9) = 18`. So `S0 = 3,497.66`.
 - `T1 = R2 = 3,573.33`, 47.33 away against the required 42.5. `T2 = R3 = 3,666.67`.
-- Next open 3,527, so `fill = 3,527.35` and `R = 29.69`. `BE+ = 3,531.58`.
+- `R_dec = 3,526 - 3,497.66 = 28.34`. The collar is 3,535, and the next open of 3,527 is inside it.
+- So `fill = 3,527.35` and `R = 29.69`. `BE+ = 3,531.58`.
 
 | `n` | Close | O | H | L | C | Event at this close | Stop after close | `T1` | `T2` |
 |---|---|---|---|---|---|---|---|---|---|
@@ -208,7 +211,7 @@ Invented numbers, for checking arithmetic only. Prior UTC day: `H = 3,480`, `L =
 | 5 | 23:00 | 3,558 | 3,565 | 3,551 | 3,562 | | 3,502.16 | 3,573.33 | 3,666.67 |
 | 6 | 00:00 | 3,562 | 3,570 | 3,556 | 3,568 | `SRV` check passes. UTC roll: day `H 3,570, L 3,405, C 3,568`, so `R1 = 3,623.67`, `R2 = 3,679.33` | 3,502.16 | 3,623.67 | 3,679.33 |
 | 7 | 01:00 | 3,568 | 3,592 | 3,563 | 3,588 | `C >= fill + 1.5R`: `BE+` | 3,531.58 | 3,623.67 | 3,679.33 |
-| 8 | 02:00 | 3,588 | 3,604 | 3,584 | 3,600 | | 3,531.58 | 3,623.67 | 3,679.33 |
+| 8 | 02:00 | 3,588 | 3,604 | 3,584 | 3,600 | Second close above new `P + b = 3,516.13` from a bar opening after the roll. Ladder candidate 3,505.33 is below the stop, no change | 3,531.58 | 3,623.67 | 3,679.33 |
 | 9 | 03:00 | 3,600 | 3,612 | 3,596 | 3,608 | | 3,531.58 | 3,623.67 | 3,679.33 |
 | 10 | 04:00 | 3,608 | 3,626 | 3,603 | 3,618 | `H > T1`: 50% out at 3,623.66 (`+3.24R`). `T1_level - 27` | 3,596.66 | filled | 3,679.33 |
 | 11 | 05:00 | 3,618 | 3,640 | 3,614 | 3,636 | First close above 3,625.47 | 3,596.66 | | 3,679.33 |
@@ -216,7 +219,8 @@ Invented numbers, for checking arithmetic only. Prior UTC day: `H = 3,480`, `L =
 | 13 | 07:00 | 3,646 | 3,655 | 3,622 | 3,628 | | 3,614.66 | | 3,679.33 |
 | 14 | 08:00 | 3,628 | 3,632 | 3,609 | 3,615 | `L <= 3,614.66`: stop, 50% at 3,614.66 (`+2.94R`) | closed | | |
 
-Result before costs: `0.5 * 3.24 + 0.5 * 2.94 = 3.09R`. `R` stayed 29.69 throughout. This path was chosen to
+Result before costs: `0.5 * 3.24 + 0.5 * 2.94 = 3.09R`. `Result_B = (0.5 * 96.31 + 0.5 * 87.31) / 28.34 = 3.24`. `R` stayed
+29.69 throughout. This path was chosen to
 exercise the rules and does not represent a typical outcome. If instead bar 3 had closed at 3,500, below
 `l_base - b = 3,504.87`, the position would have exited at the next open by invalidation, at a loss well
 under `1R`.
@@ -297,22 +301,23 @@ for hours to days, so one late hour hurts the entry location but does not remove
 | `RR_late` | `T1 - P_dec >= 1.0 * (P_dec - S0)` |
 | Thesis | `P_dec > l_base + b_k`. Price must still be above the level |
 
-If a UTC roll falls between `t_k` and `t_dec`, the setup's `T1` and `T2` are still the ones from `t_k` for
-these checks, and the roll rule in 7.3 acts at its own close as usual. Setups older than `A_max` are not
-re-armed. The level can trade again on a new break.
+If a UTC roll falls between `t_k` and `t_cut`, the setup's `T1` and `T2` are still the ones from `t_k`, for these checks
+and after the fill. The roll rule in 7.3 acts only on a position already open at the roll close, so it first applies to
+this trade at the next roll. Setups older than `A_max` are not re-armed. The level can trade again on a new break.
 
 Using the example in 7.12, with `C_k = 3,526`, `S0 = 3,497.66`, `T1 = 3,573.33` and `ATR = 18`:
 
 - `P_dec = 3,536` at a run 52 minutes late: chase 10 passes against 13.5, risk 38.34 passes against 45, but
   reward 37.33 is below 38.34. Result: `STALE_SETUP`, reason `RR_LATE`.
-- `P_dec = 3,530`: chase 4, risk 32.34, reward 43.33. All pass. The fill is the next 1m open after the run.
+- `P_dec = 3,530`: chase 4, risk 32.34, reward 43.33. All pass. The entry goes out with its collar at 3,539, and the fill
+  is the first 1m open with `open_time >= t_dec + latency`.
 
 **Stops and targets between runs.**
 
 - Stops and targets touched between runs are resolved from 1m bars at the next run, with both `event_time` and
   `detection_time` recorded. Inside one 1m bar, the stop is first.
 - All rules in 7.2, including the `n = 6` participation check and the ladder, are computed from 1h closes during
-  the run. They act from `t_dec + latency`.
+  the run, with position state as of each close. They act from `effective_from`.
 - If a run is dropped, two closes are processed at once, in time order. Ladder acceptance can complete on the
   second of them. The stop that was active before the run governs the whole gap.
 - The invalidation in 7.8 and the time stops fill after the run that saw them. A long gap can therefore turn a
@@ -320,6 +325,8 @@ Using the example in 7.12, with `C_k = 3,526`, `S0 = 3,497.66`, `T1 = 3,573.33` 
 - The stop is never lowered, even when a late close produces a candidate above `P_dec`. The `P_dec` clamp in C17
   reduces the candidate, and the ratchet holds the old stop if the candidate falls below it.
 - The UTC roll is applied at the first run that processes the 00:00 close. Live flow gates may use trades only.
+- The roll rule's `fill + 1.5 * R` term is fill-based, so under `.T` it follows the
+  [rule against a later fill raising a target](00_INDEX.md#c17-hourly-live-cycle).
 
 **Backtest reproduction.** `CYCLE` under [C17](00_INDEX.md#c17-hourly-live-cycle), with `C-LATE` for selection.
 Report the count of `STALE_SETUP` by reason, and compare the `NO_RETEST` counterfactual under both modes. Because

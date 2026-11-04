@@ -1,10 +1,14 @@
 # Candle strategy index
 
-Status: draft for leak audit. Date: 2026-11-04. Owner: `strategy-architect`.
+Status: revised after the leak audit of 2026-11-04, findings L-01 to L-37, and awaiting re-audit of the
+changed text. Date: 2026-11-04. Owner: `strategy-architect`. Changes are listed in
+[CHANGES_2026-11-04.md](CHANGES_2026-11-04.md).
 
 **Nothing in this folder has been tested.** No document claims or implies that any strategy is
-profitable. Every frequency, stop distance and cost figure here is a design estimate or an arithmetic
-illustration, to be replaced by measured values at gate G3. Worked examples use invented prices.
+profitable. Trade counts, typical stop sizes and cost figures in sections 9 and 13 of each document are
+descriptive design estimates or arithmetic illustrations, to be replaced by measured descriptions at gate
+G3. Measuring them changes no rule: a rule constant changes only by a new document version, which counts as
+a trial. See [C12](#c12-indicators-and-frozen-values). Worked examples use invented prices.
 
 ## 1. The strategies
 
@@ -49,7 +53,8 @@ I kept ten candidates because each has a different counterparty story and fails 
 and S05 came closest to being the same idea, since both retest a broken level. I kept both because S02
 relies on coordination around a formula level, where nobody necessarily holds a position, while S05
 relies on real inventory trapped in a zone with a known price range. If the correlation in section 3
-comes back high at G4, S05 is the one to retire.
+comes back high at G4, S05 is the first candidate to retire, under the rules in
+[C18](#c18-selection-purge-and-retirement).
 
 For the tenth slot I chose volatility compression and dropped the three-candle fair value gap fill. A
 gap fill is a displacement-defined zone, so its mechanism is mostly contained in S04, and the expected
@@ -98,19 +103,29 @@ stop and target parameters are deliberately **not** in the grids. They are froze
 is the fastest way to overfit an exit.
 
 The hourly-cycle requirement did not raise this count. S08 and S09 now use 1h defaults, because a
-timeframe that can never run live is a poor use of trials. The delay scenarios in
-[C17](#c17-hourly-live-cycle) are stress reports on a chosen configuration. They are logged, but they are
-not used to pick parameters beyond the one selection scenario named there.
+timeframe that can never run live is a poor use of trials. S08's 30m runs still count as trials, although
+they cannot be selected. The delay scenarios in [C17](#c17-hourly-live-cycle) are stress reports on a chosen
+configuration. They are logged, but they are not used to pick parameters beyond the one selection scenario
+named in [C18](#c18-selection-purge-and-retirement). The `m` and `H` of each `V0S` control are outside the
+grids and are frozen. Changing them is a counted trial.
 
 ## 5. Common conventions
 
 Every strategy document uses the rules below. They are written once here so they cannot drift. A
 strategy document may add to them and must state any exception explicitly.
 
-C6 and C7 describe the `IDEAL` simulation, where a decision happens exactly at the bar close and fills at
-the next open. [C17](#c17-hourly-live-cycle) describes the `CYCLE` simulation, which is what the live paper
-record actually does. Sections 1 to 13 of each document, including the worked examples, are written in
-`IDEAL` terms. Section 14 of each document states how they change under `CYCLE`.
+**Simulation modes.** Every result belongs to exactly one mode, and the mode is recorded on it.
+
+| Mode | Decision | Entry and close-based exit fill, and when an update acts | Used by |
+|---|---|---|---|
+| `IDEAL` | At the bar close, **labelled zero latency and zero allowance** | The next `T_d` open. An update acts from the next `T_d` bar | All strategies, as a research measure. Never compared with live results |
+| `IDEAL-1M` | At the bar close | The first 1m bar with `open_time >= t + max(latency, A)`, where `t` is the close and `A` is the allowance. The exit engine walks 1m bars | All strategies, reported beside `IDEAL` everywhere. It is the selection mode for S01 and S06 |
+| `CYCLE` | At a run, [C17](#c17-hourly-live-cycle) | Steps 5 and 6 of C17 | Live-eligible strategies. The only mode compared with live results |
+
+One fill model holds for a whole sample within a mode. There is no switch to finer data where coverage
+happens to exist. `latency` and `A` are declared in [C17](#c17-hourly-live-cycle). C6 and C7 are written in
+`IDEAL` terms, as are sections 1 to 13 of each document and their worked examples. Section 14 of each document
+states how they change under `CYCLE`.
 
 ### C1. Instrument and venue
 
@@ -126,9 +141,19 @@ as venue-independent without that retest.
 - Bars sit on a fixed UTC grid. A 1h bar closes on the hour, a 4h bar at 00, 04, ..., 20 UTC.
 - A UTC day is `(00:00, 24:00]`. A UTC week runs from Monday 00:00 to the next Monday 00:00.
 - `T_d` is the strategy's decision timeframe. `n` counts bars since entry, and the fill bar is `n = 1`.
-- If a bar needed by a formula is missing, the object is not computed and no setup is created. Nothing is
-  forward-filled or backfilled. A gap during an open position is logged, and the next available bar is
-  processed by [C7](#c7-exit-engine).
+- **Bar source.** Canonical bars are built from trades under decision `D-12`. In every mode, 1m bars come from
+  trades and `T_d` bars are aggregated from those 1m bars, so `IDEAL` and `CYCLE` read the same bars. Official
+  venue bars are a reconciliation check at gate G1.
+- **Levels and the bar that built them.** A bar is evaluated against the level set in force at its open. A new
+  UTC day or week set first acts on the bar that opens at the roll, so the bar that closes at the roll is never
+  tested against a level built from itself. Rules that update an open trade at the close of that roll bar are
+  unchanged: they read the new set at that close and act as any other update does.
+- **Missing bars.** If a bar needed by a formula is missing, the object is not computed and no setup is created.
+  Nothing is forward-filled or backfilled. See [C3](#c3-indicators) for how indicators recover.
+- **A gap during an open position in `IDEAL`.** Mark the trade `GAP_UNRESOLVED` and report it both ways: as if
+  the active stop was touched at the start of the gap, and as if no touch happened. The worse of the two is the
+  headline. `IDEAL-1M` follows the same rule for a gap in 1m bars. `CYCLE` has its own rule in
+  [C17](#c17-hourly-live-cycle).
 
 ### C3. Indicators
 
@@ -138,35 +163,63 @@ of its last input bar.
 | Name | Definition |
 |---|---|
 | `TR_k` | `max(H_k - L_k, abs(H_k - C_(k-1)), abs(L_k - C_(k-1)))` |
-| `ATR_k` | Wilder ATR(14) on `T_d`. Seed with the mean of the first 14 `TR`. Then `ATR_k = (13*ATR_(k-1) + TR_k) / 14` |
+| `ATR_k` | Wilder ATR(14) on `T_d`, unless a list or rule names another timeframe. Seed with the mean of the first 14 `TR`. Then `ATR_k = (13*ATR_(k-1) + TR_k) / 14` |
 | `ATRD` | Wilder ATR(14) on UTC daily bars, last completed day only. It changes at 00:00 UTC |
-| `VR_k` | `ATR_k / median(ATR_(k-N+1), ..., ATR_k)`, with `N` the number of `T_d` bars in 30 days |
-| `SRV_k` | Seasonal relative volume: `V_k / median(V of the same weekly slot in each of the previous 8 weeks)`. If fewer than 4 of those slots exist, `SRV` is undefined and any condition using it fails, so no setup is created |
+| `VR_k` | `ATR_k / median(ATR_(k-N+1), ..., ATR_k)`, with `N` the number of `T_d` bars in 30 days. Undefined with fewer than `N/2` values in the window |
+| `SRV_k` | Seasonal relative volume: `V_k / median(V of the same weekly slot in each of the previous 8 weeks)`. Undefined with fewer than 4 of those slots |
 | `CLV_k` | `(C_k - L_k) / (H_k - L_k)`, or `0.5` if `H_k = L_k` |
 | `clip(x, a, b)` | `min(max(x, a), b)` |
 | `DayOpen` | Open of the first `T_d` bar of the current UTC day |
 
-### C4. Swing pivots
+**Warm-up and recovery.**
+
+- Recursive values warm up from a canonical start date, declared in configuration, and carry their state forward.
+  A live run keeps that state, and a rebuild after a cache miss replays from the canonical start, so live and
+  backtest values match exactly.
+- After a gap in a timeframe's bars, `ATR` on that timeframe is undefined until 14 complete bars have followed the
+  gap, and it is then re-seeded with the mean of those 14 `TR`.
+- Any condition using an undefined value fails, so no setup is created. At a close where an open position's update
+  needs an undefined value, that update is not computed and the stop holds.
+- Filling a missing value to avoid any of this is forbidden.
+
+### C4. Swing pivots and registers
 
 - `SwingHigh(i; Lf, Rt)` is true when `H_i > max(H_(i-Lf), ..., H_(i-1))` and
   `H_i >= max(H_(i+1), ..., H_(i+Rt))`.
 - `SwingLow(i; Lf, Rt)` is true when `L_i < min(L_(i-Lf), ..., L_(i-1))` and
   `L_i <= min(L_(i+1), ..., L_(i+Rt))`.
 - The swing is **knowable at `t_(i+Rt)`**, its confirmation time, and never at `t_i`.
-- `Sigma(Lf, Rt, a)` is the alternating list of confirmed swings. On confirmation of a swing `X` at time
-  `t`, with `last` the current end of the list:
+- If one bar `i` is both a swing high and a swing low, both confirm at one close. Process the high first if
+  `C_i >= O_i`, otherwise the low first. This uses only that bar's data, so replay and live agree.
+- `Sigma(Lf, Rt, a)` is the alternating list of confirmed swings. On confirmation of a swing `X` at time `t`,
+  with `last` the latest entry valid at `t`:
 
 ```text
 if X has the same type as last:
-    if X is more extreme than last: replace last with X
+    if X is more extreme than last:
+        last.valid_to = t
+        add X with valid_from = t
     else: ignore X
 else:
-    if abs(X.price - last.price) >= a * ATR at t: append X
+    if abs(X.price - last.price) >= a * ATR: add X with valid_from = t
     else: ignore X
 ```
 
-Every decision in this list is made at a confirmation time, so the list can be replayed without looking
-ahead. A replacement never changes a stop that has already moved.
+`ATR` here is on the list's own timeframe, valued at the confirmation bar. A replacement never changes a stop
+that has already moved.
+
+**Registers are event-sourced.** This applies to every list of objects in this folder: swing lists, zones, flips,
+liquidity pools and anchors.
+
+- Each entry carries `valid_from`, its confirmation or birth time, and `valid_to`, the time it was replaced or
+  superseded, empty while it stands.
+- A change of state (`broken_at`, `consumed_at`, `dead_at`, `superseded_at`, each touch) is an event with its own time.
+- **Every read is as of a time `t`:** an entry is visible when `valid_from <= t < valid_to`, and a state event counts
+  only if its time is at or before `t`.
+- **A final-state table is forbidden as an input** to any decision, stop, target, placebo or report calculation.
+- **Truncation invariance is a required test for every register.** Recomputing with all data after `t` removed must
+  give the same as-of state at `t`. The timestamp audit cannot replace this test: a final-state list joined by
+  knowable time passes `knowable_time <= decision_time` and still uses later data.
 
 ### C5. Setup object and gate window
 
@@ -177,52 +230,68 @@ A setup is created at the close of the trigger bar `k`, from closed bars only. I
 - Flow variants may send `ENTER` from `t_k` until `expiry`. They use the same `S0`. The gate must return
   `EXPIRE` if the price has moved more than `0.5 * ATR_k` from `C_k`, and must refuse entry if
   `abs(price - S0)` is below the floor of [C9](#c9-floors).
-- A vetoed or expired setup stays in the record with its `V0` counterfactual.
+- A vetoed or expired setup stays in the record with its counterfactual, as in [C14](#c14-event-log).
 
 ### C6. Entry, fill, `R` and size
 
-- A decision at `t_k` fills no earlier than `t_k + latency`. In a bar simulation the fill reference is
-  `O_(k+1)`. A long pays `O_(k+1) * (1 + slip)`, a short receives `O_(k+1) * (1 - slip)`. If finer data
-  exists, use the first trade after `t_k + latency` instead.
-- **Entry guard.** Cancel and log `ENTRY_GUARD` if the fill reference is at or beyond `S0`, or if
-  `abs(O_(k+1) - C_k) > 0.5 * ATR_k`.
-- `R = abs(fill - S0)`. It is fixed at the fill and never changes.
-- **Size** is sent at `t_k`, before the fill price is known, so it uses `risk_budget / abs(C_k - S0)`. The
-  risk budget belongs to layer 5.
-- `V0` uses taker entries only. No strategy here relies on passive fills, so gate G5's passive-fill test
-  is not needed for `V0`.
+- **Decision price.** `P_D` is `C_k` in `IDEAL` and `IDEAL-1M`, and `P_dec` in `CYCLE`.
+- **Fill reference.** A decision at `t_k` fills no earlier than `t_k + latency`. The fill reference `F` is `O_(k+1)`
+  in `IDEAL`, labelled zero latency. In the other modes it is the open of the first 1m bar named in the mode table.
+  A long pays `F * (1 + slip)`, a short receives `F * (1 - slip)`.
+- **Collar.** The entry is sent as a marketable limit, immediate or cancel, with its limit fixed at the decision: a
+  long at `P_D + 0.5 * ATR_k`, a short at `P_D - 0.5 * ATR_k`. If `F` is beyond the collar there is no fill, logged
+  `ENTRY_COLLAR`. The test is on `F`, before slippage. Nothing else cancels an order already sent.
+- **A gap the other way fills.** If `F` is at or beyond `S0`, the trade exists. [C7](#c7-exit-engine) stops it on the
+  fill bar at `F` less stop slippage, logged `ENTRY_THROUGH_STOP`. Its `Result_B` uses `R_dec`, and no `Result_R`
+  is reported for it.
+- **`R_dec` and size.** `R_dec = abs(P_D - S0)` is recorded with the decision and never changes. Size is sent before
+  the fill price is known, so it is `risk_budget / R_dec`. The risk budget belongs to layer 5.
+- **`R`.** `R = abs(fill - S0)`, fixed at the fill. It is the input to every rule written in `R` multiples.
+  Accounting is in [C10](#c10-accounting).
+- **Passive fills.** `V0` entries are taker orders, so gate G5's passive-fill test is not needed for entries. Target
+  exits are passive fills, and G5 applies to them. See [C7](#c7-exit-engine).
 
 Slippage needs care. Published work finds the largest crypto volatility burst in the first minute of the
 hour, with smaller ones at minutes 15, 30 and 45
 ([Hansen et al.](https://ar5iv.labs.arxiv.org/html/2109.12142)). A decision on a bar close therefore
-tends to fill inside that burst, so `slip` must be measured at bar opens and not averaged over all minutes.
+tends to fill inside that burst, so `slip` must reflect bar opens and not an average over all minutes. How its
+value is set is in [C12](#c12-indicators-and-frozen-values).
 
 ### C7. Exit engine
 
-Long side shown. A short is the mirror image.
+Long side shown. A short is the mirror image. In `IDEAL-1M` the same loop walks 1m bars, with close-based rules still
+evaluated at `T_d` closes. There, a pending exit fills at the 1m bar named in the mode table, and every earlier 1m bar is walked
+first under the stop in force.
 
 ```text
 for each bar b from the fill bar onward, while quantity > 0:
+    if an exit is pending:                      # decided at t_(b-1) by an invalidation, time stop or flow exit
+        exit all at O_b, less slip              # a stop gap on this open is the same price,
+        end                                     # and is labelled by the earlier decision
     S = active stop, Ts = active targets        # set at t_(b-1); on the fill bar, S0 and the setup targets
-    if b is not the fill bar and O_b <= S:
-        exit all at O_b, less stop slippage     # STOP_GAP
+    if O_b <= S:
+        exit all at O_b, less stop slippage     # ENTRY_THROUGH_STOP on the fill bar, otherwise STOP_GAP
     elif L_b <= S:
         exit all at S, less stop slippage       # STOP. The stop is tested first (timing contract, item 8)
     else:
         for each unfilled target Ti in ascending order:
-            if H_b > Ti: exit its planned quantity at Ti    # trade-through, no positive slippage
+            if H_b > Ti: exit its planned quantity at Ti    # passive fill on a trade-through
     at t_b, if quantity > 0, in this order:
-        1. invalidation rules: if any fires, decide EXIT, filled at O_(b+1)
+        1. invalidation rules: if any fires, set an exit pending
         2. time stops: same handling
         3. compute stop candidates and target updates, apply C8, log, effective from bar b+1
 ```
 
-- Same-bar conflicts resolve to the stop, so a bar that touches both records no scale-out. One-minute bars
-  may settle the order when both `S` and `Ti` lie inside `[L_b, H_b]`, walking the same loop. If one
-  one-minute bar contains both, the stop is first. Updates still take effect only from the next `T_d` bar.
-- A target requires a trade through its price by at least one tick. A gap beyond a target fills at the
-  target, not at the better open.
-- Stop slippage is a separate required configuration value, because stops fill worst during cascades.
+- **Same-bar conflicts.** When both `S` and a `Ti` lie inside `[L_b, H_b]` of one `T_d` bar, 1m bars are always used,
+  walking the same loop. If one 1m bar contains both, the stop is first. Where 1m data is missing, the stop is first
+  and the bar is counted in a report. Updates still take effect only from the next `T_d` bar.
+- **Targets are passive fills.** A target needs a trade through its price by at least one tick, and fills at its price
+  with no positive slippage. A gap beyond a target fills at the target, not at the better open. The fee on target
+  exits is a declared configuration value, and the base case uses the taker rate.
+- **G5 stress for targets.** Report two cases: a required trade-through of 2 bp, and a target that exits at the next 1m
+  open after the touch, less `slip`.
+- **Slippage.** Stop slippage is a separate required configuration value, because stops fill worst during cascades.
+  Close-based and time exits pay `slip`.
 
 ### C8. Stop ratchet and `BE+`
 
@@ -246,15 +315,31 @@ S0 (long) = min(S_struct, C_k - R_min(a))
 ```
 
 The factor 4 limits the base-case cost to about `0.25R` per trade. The value `a` differs by strategy.
-`RT` here is frozen at the 1x base case, so the 2x and 3x cost reports change P&L and not the trade list.
+`RT` here is frozen at the 1x base case, so the 2x and 3x cost reports change P&L and not the trade list. Because
+`RT` feeds setups through this floor, its value is set as [C12](#c12-indicators-and-frozen-values) requires.
 
 ### C10. Accounting
 
-`Result_R = sum(f_i * (X_i - fill) / R) - (fees + slippage + funding) / R` for a long, where `f_i` is the
-fraction of the original quantity exiting at price `X_i`. Funding is charged at actual settlement times
-on positions open at that moment, using the rate published then. No rule may use a future funding rate.
-Binance's default for USDT-margined contracts is every 8 hours at 00:00, 08:00 and 16:00 UTC, and it can
-differ by contract ([Binance funding](https://www.binance.com/en/support/faq/detail/360033525031)).
+For a long, with `q0 = risk_budget / R_dec` and `f_i` the fraction of the original quantity exiting at price `X_i`:
+
+```text
+money P&L = q0 * sum(f_i * (X_i - fill)) - fees - funding
+Result_B  = money P&L / risk_budget  = sum(f_i * (X_i - fill)) / R_dec - (fees + funding) / risk_budget
+Result_R  = sum(f_i * (X_i - fill)) / R - (fees + funding) / (q0 * R)
+```
+
+- Price slippage is already inside `fill` and `X_i`. The cost term holds fees and funding only, so nothing is
+  counted twice.
+- **`Result_B` is the measure** for gates, placebo comparisons, `V0` against `V0S`, `IDEAL` against `CYCLE`, and parameter
+  selection, as charter section 7 rule 4 requires. A fill close to the stop makes `R` tiny and inflates `Result_R`, and
+  `R_dec` does not have that problem. Reports may show `Result_R` beside it.
+
+**Funding** is charged at actual settlement times, on the quantity open at that moment, using the rate published then.
+No rule may use a future funding rate. It is charged when `entry fill time < settlement <= exit fill time`, consistent
+with `(open, close]` bars: a fill at the first trade after a settlement pays nothing for it, and an exit after a
+settlement pays it. Settlement times and rates come from the chosen venue. As an example of one venue's schedule,
+Binance's default for USDT-margined contracts is every 8 hours at 00:00, 08:00 and 16:00 UTC, and it can differ by
+contract ([Binance funding](https://www.binance.com/en/support/faq/detail/360033525031)).
 
 ### C11. Overlap policy
 
@@ -262,44 +347,95 @@ One open position per strategy and symbol. A setup that arrives while one is ope
 `SKIPPED_OPEN` and not traded. Reversing into the opposite side requires a new setup after the position
 is flat. Portfolio-level overlap between strategies belongs to layer 5.
 
-### C12. Rolling indicators and fitted objects
+Under `CYCLE`, `SKIPPED_OPEN` is judged on the position state committed at `t_dec`, with a pending exit counted as open.
+If several setups for one strategy and symbol pass in one run, the one with the earliest `t_k` proceeds and the others
+are `SKIPPED_OPEN`.
 
-A fixed-window statistic computed only from bars at or before `t` (`ATR`, `VR`, `SRV`, percentile ranks)
-is treated as an indicator: it has no fitted state and is recomputed causally at each close. A value
-estimated across a sample and then applied forward is a fitted object and is frozen at the start of each
-walk-forward block. Only one object in this folder is fitted: the seasonal profile of S09. See open
-question 1 in [section 8](#8-open-questions-for-the-project-manager-and-leak-auditor).
+### C12. Indicators and frozen values
+
+**Indicators.** A statistic computed at each close only from bars at or before that close (`ATR`, `VR`, `SRV`, percentile
+ranks) is a causal indicator with no fitted state, under timing contract item 10, and needs no freezing.
+
+**Three kinds of frozen value:**
+
+| Kind | Members | Rule |
+|---|---|---|
+| Estimated | S09's seasonal profile. `RT` and stop slippage, if they are not declared as constants | Fitted only on data before the block they apply to, frozen for that block, and the value logged in the trial registry |
+| Selected thresholds | Any grid value, such as `PR_max`, `SRV_min` and `Q_min` | Chosen on training folds under [C18](#c18-selection-purge-and-retirement), frozen for the block |
+| Declared constants | Everything else: stop and target multiples, `VR_k <= 2.0`, the `CR` band, the `Q` weights, `A_max`, chase and `RR_late` values, `m` and `H`, and `RT` and stop slippage if declared | Set before any run. A change is a new document version and a counted trial |
+
+`RT` and stop slippage must be one or the other, chosen before the first run. A value measured over a whole history and
+applied to it would let later data change `S0` for an early setup, and is forbidden.
+
+**Estimation calendar.** Estimated values refit at 00:00 UTC on 1 January, 1 April, 1 July and 1 October. It is declared
+here before any run, without sight of any result, and a change is a counted trial. S09's rules for what happens across a
+refit are in [its section 3](S09_utc_session_range_breakout.md#3-definitions).
 
 ### C13. `V0S` control
 
 Same setup, same entry, same `S0` and `R` as `V0`. One fixed target at `fill + m*R` (long) or `fill - m*R`
 (short), and a fixed maximum hold of `H` bars, closed at the next open. No scale-out, no invalidation, no
-update of any kind. Same fees and funding. Each document gives `m` and `H`.
+update of any kind. Same fees and funding. Each document gives `m` and `H`, and both are declared constants.
+
+A `V0S` target is set from the fill, so the fill bar uses that target, an exception to the setup target named in
+[C7](#c7-exit-engine). `V0S` follows C7 for a pending exit and for exit slippage. Under the cycle, `H` follows charter
+section 7 rule 7.
 
 ### C14. Event log
 
 Every event is logged with old value, new value, reason, computed-at time and effective-from time:
-`SETUP_CREATED`, `ENTRY`, `STOP_UPDATE`, `TARGET_UPDATE`, `SCALE_OUT`, `INVALIDATION`, `TIME_STOP`, `EXIT`,
-`ENTRY_GUARD`, `SKIPPED_OPEN`. Under `CYCLE`, also `STALE_SETUP` and `DATA_GAP`, and every event carries
-the time fields defined in [C17](#c17-hourly-live-cycle).
+`SETUP_CREATED`, `ENTRY`, `ENTRY_COLLAR`, `ENTRY_THROUGH_STOP`, `STOP_UPDATE`, `TARGET_UPDATE`, `SCALE_OUT`, `INVALIDATION`,
+`TIME_STOP`, `EXIT`, `SKIPPED_OPEN`, `GAP_UNRESOLVED`. Under `CYCLE`, also `STALE_SETUP`, `DATA_GAP` and `GAP_CLOSE`, and every
+event carries the time fields defined in [C17](#c17-hourly-live-cycle).
+
+**Mode.** Every event, registry row and report carries a `mode` field. Report code refuses to combine modes in one statistic.
+
+**Counterfactuals.** A setup not taken (`VETO`, `EXPIRE`, `STALE_SETUP`, `SKIPPED_OPEN`, `ENTRY_COLLAR`) keeps a counterfactual. In `IDEAL`
+and `IDEAL-1M`, it is the same trade in that mode, ignoring the failed check. Under `CYCLE` there are two labelled fields:
+
+| Field | Meaning | Where it may be used |
+|---|---|---|
+| `CF_CYCLE` | The same trade under `CYCLE`, filling at the step 5 price and ignoring the failed check | `CYCLE` statistics, and the ledger |
+| `CF_IDEAL` | The same setup under `IDEAL` | Analysis only. Never in the ledger, and never in `CYCLE` statistics |
+
+A counterfactual result is a later event, with `knowable_time` at its maturity. Training may read it only after that time.
 
 ### C15. Placebo control
 
-For gates G3 and G4, run each level-based strategy with its levels replaced by random levels drawn at the
-same distance distribution, keeping everything else unchanged. This copies the design of
+For gates G3 and G4. This copies the design of
 [Osler (2000)](https://www.newyorkfed.org/medialibrary/media/research/epr/00v06n2/0007osle.html), where
 arbitrary levels "bounced" 56.2 percent of the time and published levels 60.8 percent. A bounce rate alone
-therefore says little, and only the difference from the placebo is informative. For the strategies with
-no level (S03, S10), use random entry times with the same stop and target geometry. Placebo runs are
-controls and are recorded as such in the trial registry.
+therefore says little, and only the difference from the placebo is informative.
+
+**Strategies with levels or bands (S01, S02, S04, S05, S06, S08).**
+
+- A placebo level is drawn at the real level's knowable time, as a distance in `ATR` units from the close at that time.
+  A placebo band also keeps the real object's width in `ATR` units.
+- The distance distribution is built only on earlier blocks, from real levels and the closes at their knowable times. The
+  first block therefore has no placebo.
+- The whole level set is replaced, including levels used as targets, so no real level stays in the placebo's result.
+
+**Strategies with no level (S03, S10).** Entry bars are drawn uniformly over bars passing the strategy's non-signal filters.
+The side is random, at the block's real long and short share, and independent of returns. S03's stop uses the causal list as
+of that bar. S10's box is the box as of that bar.
+
+**S07.** A random-anchor placebo, in its [section 10](S07_anchored_vwap_pullback.md#10-regime-expectations). **S09.** The window is
+moved by a random whole number of hours, and the whole schedule moves with it, in its
+[section 10](S09_utc_session_range_breakout.md#10-regime-expectations).
+
+**All placebos.** At least 100 draws, declared in advance and reported as a distribution. Redrawing or selecting a draw is forbidden.
+The configuration and the mode are the same as the real run. Under `CYCLE`, placebo setups pass through the same run function, checks and
+run times. Comparisons use `Result_B`. Placebo runs are recorded in the trial registry as controls.
 
 ### C16. Rounding and arithmetic in examples
 
 Stops and targets round to the instrument tick: a long stop or target rounds down, a short stop or target
 rounds up. Worked examples use BTC tick 0.1 and ETH tick 0.01, `fee_taker = 5 bp` and `slip = 1 bp`, so
 `RT = 12 bp`. These are **assumptions for arithmetic only**, not venue facts. Binance's fee page refers to
-a separate schedule that I could not open. Examples show results in `R` before costs and hold `ATR` flat
-unless a table shows otherwise.
+a separate schedule that I could not open.
+
+Worked examples run in `IDEAL`, and hold `ATR` flat unless a table shows otherwise. Entries show `slip`, because `R` depends on it.
+Exit prices are shown before exit slippage, and results in `R` and `Result_B` are shown before fees, funding and exit slippage.
 
 ### C17. Hourly live cycle
 
@@ -308,110 +444,208 @@ that scheduled runs can be delayed under load, especially at the top of the hour
 be dropped ([GitHub Actions documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)).
 It publishes no delay distribution, so nothing here assumes one.
 
-**What a run sees.** Closed 1-minute bars since the last processed minute, trades since then for tier `T1`
-strategies, and the committed state from the previous run. It sees no book, so no book feature can gate a
-live entry or exit.
-
-**Timeframes.** Under 1h is backtest-only, unless a document justifies otherwise, and none does. The nominal
-start is a fixed minute that avoids the top of the hour, such as minute 7.
-
-**Order of work in one run**, for each symbol and strategy:
+**The run clock.** This index owns this definition, and `GATE_SPEC.md` refers to it rather than defining its own.
 
 ```text
-1. Load state: positions, active stops and targets, last processed minute.
-   If any 1m bar between the last processed minute and now is missing, log DATA_GAP.
-   Resolve nothing past the gap and take no new decisions for this symbol. Never fill or assume.
-2. Resolve any fill left pending by the previous run. Then walk each open position through the new 1m bars
-   in time order, using the stop and targets that were active before this run. Same logic as C7 with the 1m
-   bar as the bar:
-       gap through the stop -> exit at that 1m open
-       L_1m <= S            -> exit at S                 # stop first inside one 1m bar
+t_poll[source] = the time that source's fetch began
+t_cut          = floor_1m( min over sources of t_poll[source] - A )
+```
+
+`A` is the declared allowance. A run can fetch several sources at different moments, so the earliest fetch sets the cut-off. A
+candle-only strategy uses its one candle source. All of steps 1 to 4 use only bars and trades with close time at or before `t_cut`,
+and `P_dec` is the close of the last such bar. This is identical live and in backtests.
+
+**What a run sees.** Closed 1-minute bars since the last processed minute, trades for tier `T1` strategies, and funding settlement
+times and rates, all up to `t_cut`, plus the committed state from the previous run. It sees no book, so no book feature can gate a
+live entry or exit.
+
+**Timeframes.** Under 1h is backtest-only, unless a document justifies otherwise, and none does.
+
+**Declared run constants.** Frozen before any run, in configuration, with these values. A change is a counted trial.
+
+| Constant | Value | Note |
+|---|---|---|
+| Nominal start | Minute 7 of each hour | Avoids the top of the hour |
+| `latency` | 500 ms | Time from commit to the first possible fill or update |
+| `A` | 10 s, `UNVERIFIED` | Time for a closed bar or a trade to become readable. To be measured later from a GitHub runner |
+| `D_run` | 60 s for tier `T0`, 180 s for tier `T1` | Declared run duration, used in backtests in place of a real commit time |
+| Fetch offset | 0 s for the one candle source. Other sources are declared in `GATE_SPEC.md` | In backtests, `t_poll[source] = run_start + its offset` |
+| Fill wait | 2 minutes | Longest wait in step 5 |
+
+**Order of work in one run**, for each symbol and strategy. The run function has two separate parts:
+
+```text
+decide(data with close time <= t_cut):
+ 1. Set t_cut by the run clock. Load state: positions, the stored history of stops and targets, the last
+    processed minute. P_dec = close of the last 1m bar with close time <= t_cut. Check for gaps, below.
+ 2. Walk each open position through the new 1m bars, in time order, with C7's logic on the 1m bar. For each 1m bar,
+    the stop and targets are those in force for it, read from the stored history (effective_from <= its open_time).
+    Resolve first any entry fill or exit left pending by the last run, walking every 1m bar before the fill bar.
+    Charge funding on the quantity open at each settlement passed. A missing rate is logged as DATA_GAP for funding
+    and is not assumed.
+       gap through the stop -> exit at that 1m open, less stop slippage
+       L_1m <= S            -> exit at S, less stop slippage    # stop first inside one 1m bar
        H_1m > Ti            -> scale out at Ti
-3. Build T_d bars from 1m bars. For each T_d bar newly closed, in time order, and for positions still open:
+ 3. Build T_d bars from 1m bars. For each T_d bar newly closed, in time order:
+       position state is as of t_b: T1 fill, stage, MFE and highest high use only 1m bars up to t_b
+       a position already closed in the walk gets no further rules
        run invalidation rules and time stops
        compute stop and target updates, carrying each through C8 into the next
-       run setup detection
-4. Set t_dec = now. P_dec = close of the last completed 1m bar. Commit all decisions to the ledger.
-5. Entries and close-based exits fill at the open of the first 1m bar with open_time >= t_dec + latency.
-   If that bar does not exist yet, wait up to 2 minutes, otherwise the next run resolves it.
-6. New stops and targets take effect from t_dec + latency.
+       run setup detection and the late-entry checks
+    Fills from the walk stand. The rules for close b apply to whatever quantity remains.
+ 4. Commit all decisions to the ledger. t_dec = the commit time.
+
+settle(the committed decisions, data up to t_dec + latency + fill wait):
+ 5. Entries, close-based exits and time exits fill at the open of the first 1m bar with open_time >= t_dec + latency,
+    entries under the C6 collar, exits less slip. For a pending exit, first walk every 1m bar before the fill bar
+    under the stop in force. A touch there stands, and the pending exit is cancelled and logged as superseded.
+    Otherwise it fills. If the fill bar does not exist within the fill wait, the next run's step 2 resolves it.
+ 6. effective_from for each new stop and target = the open time of that same first 1m bar. Add them to the stored
+    history. Every earlier 1m bar, including the one straddling t_dec + latency, keeps the previous stop and targets.
 ```
+
+`settle` receives the decisions and has no way to change them. Truncation invariance applies to `decide`, because only `settle` may read
+past `t_cut`. `t_dec` is used only for fills and `effective_from`. Since `effective_from` follows from `t_dec` alone, a run that dies after its
+commit loses nothing, and the next run derives it.
 
 **Timing consequences.**
 
-- An update computed from the bar closing at `t_b` is knowable at `t_b`, but is computed at `t_dec` and
-  acts only from `t_dec + latency`. The old stop stays in force in between. A stop is never applied
-  retroactively over a period in which it did not exist. This satisfies timing contract item 12.
+- An update computed from the bar closing at `t_b` is knowable at `t_b`, is computed during the run, and acts only from
+  `effective_from`. The old stop stays in force in between. A stop is never applied retroactively over a period in which it did
+  not exist. This satisfies timing contract item 12.
 - `C8` gains one clamp under `CYCLE`, since price may have moved after the close:
-  `S_new = max(S_old, min(S_cand, C_b - 0.10*ATR_b, P_dec - 0.10*ATR_b))` for a long, mirrored for a short.
-  Stops still only tighten.
-- Update schedules stay on `T_d` closes, the same as `IDEAL`. On a 4h strategy, the three runs between 4h
-  closes only resolve touches. They do not compute updates.
-- A close-based exit fills after the run that noticed it. A late run makes the exit later, and this is
-  recorded and never hidden. It does not extend the time stop rule: the decision is still due at the same bar.
-- `n`, trailing lows and highest highs are based on `T_d` bars. Highest high since entry counts only 1m bars
-  at or after the fill.
+  `S_new = max(S_old, min(S_cand, C_b - 0.10*ATR_b, P_dec - 0.10*ATR_b))` for a long, mirrored for a short. `P_dec` is set in
+  step 1, before any of these. Stops still only tighten.
+- Strategy model updates happen only at `T_d` closes, the same as `IDEAL`. On a 4h strategy, the three runs between 4h closes resolve
+  touches and compute no model update. Flow may still act at those runs, as described under "Flow under `CYCLE`" below.
+- **Time stops follow charter section 7 rule 7.** A time stop takes effect at the first run after it falls due, and fills after that
+  run. The overrun is logged, and the result earned during overruns is reported, because it can be positive. Price after the due
+  time cannot cancel a time stop, because step 3 reads the position as of `t_b`.
+- A close-based exit also fills after the run that noticed it. A late run makes the exit later, and this is recorded and never hidden.
+- `n` counts `T_d` closes, and `n = 1` is the `T_d` bar that contains the fill, so a late fill can make `n = 1` a later bar than in
+  `IDEAL`. Trailing lows are based on `T_d` bars. Highest high since entry counts only 1m bars at or after the fill.
+- **Label.** Item 13 of the timing contract models paper stops and targets as orders resting on the exchange between runs. Every
+  `CYCLE` chart and table says so, and says that this is fair only if a real system would hold such orders.
 
 **Time fields on every event.**
 
 | Field | Meaning |
 |---|---|
-| `knowable_time` | When the input became knowable, usually a bar close |
+| `mode` | `IDEAL`, `IDEAL-1M` or `CYCLE`, with the scenario and seed in a backtest |
+| `knowable_time` | When the input became knowable, usually a bar close. For an event that depends on a fill, the fill's time |
 | `event_time` | Close time of the 1m bar in which a touch or fill happened, or `t_dec` for a decision |
-| `detection_time` | Start of the run that found it |
-| `effective_from` | When a new stop or target starts to act |
+| `detection_time` | `run_start` of the run that found it |
+| `t_cut`, `t_dec` | The run's data cut-off and commit time |
+| `effective_from` | Open time of the first 1m bar on which a new stop or target acts |
 | `lateness` | `detection_time - knowable_time` |
 
-**Late entries.** A setup is detected at `t_dec`, up to an hour or more after its trigger bar closed at
-`t_k`. The trigger, `S0` and targets stay as computed at `t_k`, and are not recomputed for the later price.
-Before deciding `ENTER`, all of these must pass, or the setup is logged as `STALE_SETUP` with its reason and
-its `V0` `IDEAL` counterfactual:
+**Gaps in 1m bars.**
+
+- If any 1m bar between the last processed minute and `t_cut` is missing, log `DATA_GAP`. Resolve nothing past the gap, and take no new
+  decisions for this symbol in this run. Never fill or assume.
+- If the gap is still open at the next run, decide to close each open position. It fills through step 5, at the first available 1m open
+  after that run's `t_dec + latency`, logged `GAP_CLOSE`. A fill any earlier would come before its own decision.
+- Bars that arrive later may resolve touches only, with their true `detection_time`. If they show a stop or target touched before the
+  `GAP_CLOSE` fill, a correction event is appended. Nothing is edited, under rule 10 of `CLAUDE.md`.
+
+**Late entries.** A setup is detected at a run, up to an hour or more after its trigger bar closed at `t_k`. The trigger, `S0` and targets
+stay as computed at `t_k`, and are not recomputed for the later price. In step 3, before deciding `ENTER`, all of these must pass, or the
+setup is logged as `STALE_SETUP` with its reason and its counterfactuals under [C14](#c14-event-log):
 
 | Check | Rule |
 |---|---|
-| Age | `t_dec - t_k <= A_max`, given per strategy |
-| Path | No 1m bar between `t_k` and `t_dec` touched `S0` or `T1`, and no `T_d` close in that span fired the strategy's invalidation |
+| Age | `t_cut - t_k <= A_max`, given per strategy |
+| Path | No 1m bar between `t_k` and `t_cut` touched `S0` or `T1`, and no `T_d` close in that span fired the strategy's invalidation |
 | Chase | `abs(P_dec - C_k) <= chase * ATR_k`, given per strategy |
 | Risk | `abs(P_dec - S0)` is at least the setup's `R_min` and at most the strategy's stop cap |
 | Reward | `(T1 - P_dec) >= RR_late * (P_dec - S0)` for a long, given per strategy |
 | Thesis | Strategy-specific: the price must still be on the correct side of the level or zone |
 
-At fill, the C6 rule that the fill reference must not be at or beyond `S0` still applies, and if it fails the
-entry is cancelled. `R = abs(fill - S0)`, fixed from there. Size is sent using `abs(P_dec - S0)`.
+The entry then goes out under the [C6](#c6-entry-fill-r-and-size) collar, around `P_dec`: `P_dec + 0.5 * ATR_k` for a long, and
+`P_dec - 0.5 * ATR_k` for a short. A fill reference beyond it gives `ENTRY_COLLAR`, and one at or beyond `S0` gives
+`ENTRY_THROUGH_STOP`. `R_dec = abs(P_dec - S0)` and size are set at the decision. `R = abs(fill - S0)` is fixed at the fill.
 
-**Flow under `CYCLE`.** A gate may only use what a run can see: closed bars and trades since the last run.
-It is evaluated at runs only, so `WAIT` means the next run, up to `expiry` and `A_max`. Flow exits follow
-step 5 and flow tightening follows step 6.
+**Flow under `CYCLE`.**
 
-**Backtest reproduction.** Every live-eligible strategy reports both `IDEAL` and `CYCLE`. `CYCLE` must:
+- A gate may only use what a run can see. It is evaluated at runs only, so `WAIT` means the next run, up to `expiry` and `A_max`.
+- Flow exits follow step 5 and flow tightening follows step 6. Flow may act at any run, including runs between `T_d` closes on a 4h strategy, since
+  it can only reduce risk under charter section 7 rule 3.
+- **A later fill must not raise a target.** Under `.T`, where `WAIT` can make the fill later than the first look, targets stay as computed for the setup.
+  Each fill-based term in a target rule, of the form `fill + x * R`, uses the less distant of its actual value and its value with the first look's
+  `P_dec` in place of `fill` and `abs(P_dec - S0)` in place of `R`. This is the case in S02, S03, S07 and S10.
 
-1. Call the same run function as live, one simulated run at a time, on a dataset truncated at `t_dec`.
-2. Show the run data only up to `t_dec`, minus a declared data-availability allowance.
-3. Build `T_d` bars from 1m bars, and check them against the venue's own bars at gate G1.
-4. Draw run times from a declared, seeded scenario:
+**Backtest reproduction.** Every live-eligible strategy reports `IDEAL`, `IDEAL-1M` and `CYCLE`. `CYCLE` must:
 
-| Scenario | Delay after the nominal minute | Dropped runs | Use |
+1. Call the same `decide` and `settle` as live, one simulated run at a time. `decide` receives a dataset truncated at `t_cut`. `settle` receives
+   the committed decisions, and data up to `t_dec + latency + fill wait`.
+2. Use the run clock above, with `t_dec = run_start + D_run`, for all of steps 1 to 4 and their tests.
+3. **Model each run's fetch.** A run that would exceed its time budget or a source's rate limit must behave in the backtest as it would live, by logging
+   the same gap and taking the same fail-closed path, even though an archive would have the data. Per-source page size, rate limit and retention are
+   in `GATE_SPEC.md`.
+4. Build `T_d` bars from 1m bars, and check them against the venue's own bars at gate G1. Include funding in the walk, as live does.
+5. Draw run times from a declared, seeded scenario:
+
+| Scenario | Delay after the nominal minute | Dropped runs | Outages | Use |
+|---|---|---|---|---|
+| `C-FAST` | 2 minutes, fixed | None | None | Upper bound for comparison |
+| `C-LATE` | Uniform, 2 to 45 minutes | 5 percent | None | **Parameter selection** and the headline `CYCLE` result, until measured data replaces it |
+| `C-BAD` | Uniform, 2 to 60 minutes | 15 percent | None | Stress report |
+| `C-GAP` | As `C-LATE` | As `C-LATE` | One 90-minute hole in 1m bars per 30 days, at random times | Data-gap stress report. Real gap logs replace it at G8 |
+| `C-MEASURED` | Empirical, from real run logs, once at least 30 days exist | Empirical | Empirical | Replaces `C-LATE` as a new, visibly labelled configuration |
+
+These delay and outage values are my assumptions and are not GitHub figures. Report at least 5 seeds for each random scenario, with the spread.
+Selecting a seed is forbidden.
+
+6. For gate G8, replay the live period with the **actual** run timestamps. The trade list must match the ledger exactly, and each mismatch goes in
+   the paper versus simulation report.
+7. Report the `IDEAL` minus `CYCLE` difference in `Result_B` per trade as the cost of the cycle, and `IDEAL-1M` beside both. `R` may be shown too.
+
+A backtest result quoted beside a live record must be the `CYCLE` one. `IDEAL` and `IDEAL-1M` are research measures and are never compared with
+live results.
+
+**Required tests when code exists.** On every register and engine: truncation invariance, future perturbation, the shift test and the timestamp
+audit. Also that `decide` gives identical output with data after `t_cut` removed, and that each stop and target acting on a 1m bar in a walk has
+`effective_from` at or before that bar.
+
+**Worked timeline.** A 1h setup bar closes at 13:00. The last good run was the 12:07 one. The 13:07 run is dropped. The next run starts at 14:21:05, and a
+candle-only strategy's one fetch begins at that moment. So `t_cut = floor_1m(14:20:55) = 14:20:00`, and `P_dec` is the close of the 1m bar closing 14:20. It
+walks 1m bars from about 12:06 onward using the stops in force from the stored history, then processes the 13:00 and 14:00 closes in order, each with position
+state as of its close. The setup has age 80 minutes and `lateness` 81 minutes. With `D_run` of 60 s, `t_dec` is 14:22:05, so the first 1m bar with
+`open_time >= 14:22:05.5` opens at 14:23. If the checks pass, the fill is that open. A position's stop update computed from the 13:00 close has `effective_from`
+14:23, not 13:00.
+
+### C18. Selection, purge and retirement
+
+**Purge.** Under timing contract item 11, a training setup is removed from `V0` selection when `t_k + H_max` reaches the test block. `H_max` is the maximum
+possible hold and not the actual exit, because a rule on the actual exit would make removal depend on the outcome. Under `CYCLE`, add `A_max` plus 2 hours
+for one dropped run.
+
+| Strategy | `T_d` | `H_max` | `A_max` under `CYCLE` |
 |---|---|---|---|
-| `C-FAST` | 2 minutes, fixed | None | Upper bound for comparison |
-| `C-LATE` | Uniform, 2 to 45 minutes | 5 percent | **Parameter selection** and the headline `CYCLE` result, until measured data replaces it |
-| `C-BAD` | Uniform, 2 to 60 minutes | 15 percent | Stress report |
-| `C-MEASURED` | Empirical, from real run logs, once at least 30 days exist | Empirical | Replaces `C-LATE` as a new, visibly labelled configuration |
+| S01 | 15m, 30m | 12 h, 24 h | Control only, 90 min |
+| S02 | 1h | 3 d | 90 min |
+| S03 | 1h, 4h | 10 d, 10 d | 90 min, 150 min |
+| S04 | 1h, 4h | 4 d, 7 d | 75 min, 150 min |
+| S05 | 1h, 4h | 3 d, 6 d | 90 min, 150 min |
+| S06 | 5m, 15m | 8 h, 12 h | Control only, 90 min |
+| S07 | 1h | 5 d | 90 min |
+| S08 | 1h, 30m | 24 h, 24 h | 75 min at 1h. 30m has no `CYCLE` |
+| S09 | 1h | 11 h | 75 min |
+| S10 | 1h, 4h | 5 d, 10 d | 90 min, 150 min |
 
-These delay values are my assumptions and are not GitHub figures. Report at least 5 seeds for each random
-scenario, with the spread. Selecting a seed is forbidden.
+**Selection.**
 
-5. For gate G8, replay the live period with the **actual** run timestamps. The trade list must match the
-   ledger exactly, and each mismatch goes in the paper versus simulation report.
-6. Report the `IDEAL` minus `CYCLE` difference in `R` per trade as the cost of the cycle.
+- Parameters are chosen on training folds only, and within one mode. Modes are never compared to pick a configuration.
+- For a live-eligible strategy, selection is among its configurations that can run live, under `C-LATE`, on `Result_B`, using the mean over at least 5 seeds.
+- S01 and S06 cannot run live, so they select under `IDEAL-1M`.
+- A configuration that cannot run live is a labelled comparison report. It cannot be selected, and its runs still count as trials. This applies to S08 at 30m.
 
-A backtest result quoted beside a live record must be the `CYCLE` one. `IDEAL` is a research measure of the
-idea and is never compared with live results.
+**Dropping or retiring.**
 
-**Worked timeline.** A 1h setup bar closes at 13:00. The last good run was the 12:07 one. The 13:07 run is
-dropped. The 14:07 run starts at 14:21. It walks 1m bars from about 12:07 onward using the stops active since
-that run, then processes the 13:00 and 14:00 closes in order. The setup has `lateness` 81 minutes, and passes
-or fails the checks using `P_dec` at 14:21. If it passes, the fill is the open of the 14:22 1m bar. A position's
-stop update computed from the 13:00 close acts only from about 14:21, not from 13:00.
+- A decision to drop or retire a stream or a configuration is logged in the trial registry, with the data it used.
+- A comparison that picks a configuration uses training folds only.
+- A retired stream stays in the portfolio record up to its retirement date. Survivors are quoted only on later blocks, and as survivors.
+- A new document version counts as new trials.
 
 ## 6. Evidence grades
 
@@ -506,38 +740,39 @@ listing page, and any claim from that source is limited accordingly.
   venue changes since then may have shifted it, which is why S09 refits the profile by block.
 - **Exchange bar boundaries.** From memory, venues label bars as `[open, close)`, while the charter says
   `(open_time, close_time]`. The official Binance page I tried did not show kline fields. `data-steward`
-  should confirm and map this.
+  should confirm and map this at G1 on the chosen source, since treating a bar's open-time label as its
+  knowable time would be a one-bar leak.
 - **All statements in sections 9 and 13 of each document about typical BTC and ETH behaviour and
   typical stop sizes.** These are my trading judgement unless a source is linked. They are not measured.
 
 ## 8. Open questions for the project manager and leak auditor
 
-1. **Timing contract item 10.** It says normalisers and thresholds are fitted on past data and frozen before
-   the block. Read literally, a rolling `VR`, `SRV` or percentile rank would break it, because it updates
-   inside the block. I treat these as causal indicators under [C12](#c12-rolling-indicators-and-fitted-objects).
-   I think that is the right reading, since freezing `ATR` would make no sense, but it should be ruled on.
-2. **Charter section 7, rule 4.** Size comes from the initial stop, but the fill is not known when size is
-   sent. I split this: size uses `abs(C_k - S0)` and `R` uses the fill. See [C6](#c6-entry-fill-r-and-size).
-3. **`V0S`.** The charter gives it a fixed stop and target only. Without a time limit some control trades
-   would stay open for a very long time, so I added a fixed maximum hold set at entry. It does not move.
-4. **`VWAP` data tier.** The charter places VWAP in tier `T1`. S07 needs `T1` for its true value and allows
-   a labelled `T0-APPROX` for cross-checks only.
-5. **Paper stops between runs.** The cycle resolves a touched stop or target from 1m bars at its exact level,
-   as if a resting order had been working. No such order exists on the paper system. This is fair only if a
-   future real system would hold exchange-side stops and targets. Otherwise the live paper record overstates
-   what an hourly job could achieve, and should be labelled accordingly.
-6. **Charter section 2, layer 2 and tiers `T2` and `T3`.** With no live book, book features can be tested in
-   research but cannot gate a live position. `feature-integrator` should mark them as backtest-only.
-7. **Charter section 8.** The live view and channel posts were written with timely events in mind. Under the
-   cycle every post is at least one run late, and a post may report a stop already hours old. Posts should
-   show `event_time` and `detection_time` side by side.
-8. **Scheduled job continuity.** GitHub's documentation says scheduled workflows in public repositories are
-   disabled after 60 days with no repository activity. `app-builder` should confirm that ledger commits keep
-   the schedule alive, and should alert if a run has not happened.
-9. **State between runs in a public repository.** Rule 7 in `CLAUDE.md` forbids market data in git. S07 and S08
-   need running trade totals or a day's trades across runs, and every strategy needs recent 1m bars. Running
-   VWAP totals and profile bins are derived from market data, so `data-steward` should rule on whether they may
-   be committed. If not, they must live in a cache, and a run must be able to rebuild them deterministically
-   from the venue after a cache miss, or else log `DATA_GAP`.
-10. **Role file.** `.claude/agents/strategy-architect.md` lists 13 sections. The owner's requirement adds a
-    fourteenth, "Live on an hourly cycle", which every document here has. That file is outside what I may edit.
+### Closed
+
+| Earlier question | Closed by |
+|---|---|
+| 1. Rolling normalisers under timing item 10 | Charter item 10 now separates fixed-window indicators from fitted objects. See [C12](#c12-indicators-and-frozen-values) |
+| 2. Size against `R` under section 7 rule 4 | Charter rule 4 now rules on this. See [C6](#c6-entry-fill-r-and-size) and [C10](#c10-accounting) |
+| 3. Maximum hold in `V0S` | The charter's variant table now includes a fixed maximum hold. See [C13](#c13-v0s-control) |
+| 5. Paper stops between runs | Charter item 13 now models them as resting orders, with reports saying so. See [C17](#c17-hourly-live-cycle) |
+| 6. Book features on a live position | Charter section 2 now has `.L` and `.R` kinds, and the data center document limits live gates to trades and candles |
+| 7. Timely events in channel posts | Charter section 8 now requires the time of the event and the time the run detected it on each post |
+| 9. State between runs in a public repository | `08_DATA_CENTER.md` section 5 keeps it in the Actions cache, with a deterministic rebuild or `DATA_GAP` |
+| 10. Role file | The role file now lists section 14 |
+
+### Still open
+
+1. **`VWAP` data tier.** The charter places VWAP in tier `T1`. S07 needs `T1` for its true value and allows a labelled `T0-APPROX` for cross-checks
+   only. This stands unless someone objects to keeping that cross-check.
+2. **Scheduled job continuity.** GitHub's documentation says scheduled workflows in public repositories are disabled after 60 days with no repository
+   activity. `08_DATA_CENTER.md` expects result commits to keep it active, "to be confirmed in practice". `app-builder` should confirm this, and should
+   alert if a run has not happened.
+3. **`docs/02_features/` depends on text changed here.** `feature-integrator` should conform it. `GATE_SPEC` still has: a fill at or beyond `S0` being cancelled,
+   the `t_last` clock in place of the run clock in C17, `P_dec` and `t_dec` as they stood in the old step 4, updates acting from `t_dec + latency`, and objectives in
+   net `R`, where charter rule 4 asks for `Result_B`. Its purge rule uses a label interval, where this index uses `H_max`. Links to the renamed C4 and C12 headings
+   may also need updating.
+4. **Fold plan.** `GATE_SPEC` marks its fold plan as to be confirmed once `V0` results exist. A fold plan chosen after seeing results would be selection on them,
+   and it should be fixed before the first `V0` run. S09's calendar in [C12](#c12-indicators-and-frozen-values) does not depend on it.
+5. **Proof of freezing.** The auditor notes that nothing shows the frozen constants were set without sight of outcomes. A hash of these documents committed before
+   the first run would make that checkable. `project-manager` to decide.
+6. **Venue.** Under `D-01` and `D-17`, the research source and venue are undecided. Funding schedules, bar labels and tick sizes must be read from the chosen source.

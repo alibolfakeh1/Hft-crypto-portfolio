@@ -1,7 +1,8 @@
 # S10 Volatility compression expansion
 
-Status: draft for leak audit. Not tested. Tier `T0`. Default `T_d` 4h. Long and short. Live-eligible at 4h and 1h, see section 14.
-Common rules C1 to C17 are in [00_INDEX.md](00_INDEX.md#5-common-conventions) and apply throughout.
+Status: revised after the leak audit of 2026-11-04, awaiting re-audit. Not tested. Tier `T0`. Default `T_d` 4h. Long and short.
+Live-eligible at 4h and 1h, see section 14.
+Common rules C1 to C18 are in [00_INDEX.md](00_INDEX.md#5-common-conventions) and apply throughout.
 
 ## 1. Idea and mechanism
 
@@ -39,6 +40,9 @@ BBW_k = 4 * sd_k / SMA_k
 PR_k  = share of BBW values in the last 30 days of bars (including k) that are <= BBW_k
 CF_k  = PR_k <= PR_max                 # compression flag, default PR_max = 0.10
 ```
+
+`PR_k` is undefined with fewer than half of the 30-day window's values, in the same way as `VR` in
+[C3](00_INDEX.md#c3-indicators). A condition using an undefined value fails, and nothing is filled.
 
 **Box.** Over the `B` bars ending at `k - 1` (default `B = 12`):
 
@@ -118,13 +122,15 @@ The multiple falls from 3.5 toward 2.0 as `ATR` expands from its level at entry 
 ### 7.3 Target logic
 
 - `T1 = max(BH + BoxH, fill + 2.0 * R)`, set at the fill. At `t_k`, before a fill exists, `C_k` and `C_k - S0` stand in for `fill` and `R`.
+- **Exception to C7.** [C7](00_INDEX.md#c7-exit-engine) uses the setup's targets on the fill bar. Here the fill bar uses the `T1` set at the fill, in the same way as C13 does for `V0S`.
 - After `T1` fills, a climax target is recomputed at each close, and moves every bar:
 
 ```text
 T2_b = max(HH_b + 2.0 * ATR_b, fill + 3.0 * R)
 ```
 
-It means: sell into a bar that runs two full `ATR` beyond the highest high so far, and otherwise let the chandelier decide.
+It means: sell into a bar that runs two full `ATR` beyond the highest high so far, and otherwise let the chandelier decide. Under `.T`, the `fill + x * R` terms in `T1` and `T2_b` follow the
+[rule against a later fill raising a target](00_INDEX.md#c17-hourly-live-cycle).
 
 ### 7.4 Scale-out
 
@@ -172,7 +178,8 @@ Invented numbers, for checking arithmetic only. ETH, `T_d = 4h`. Box: `BH = 3,18
 
 - `S_struct = 3,135 - 7 = 3,128`. `C - S_struct = 70`. `R_min = max(35, 15.4) = 35`, and the cap is 84. So `S0 = 3,128`.
 - At the setup, `T1 = max(3,270, 3,198 + 140) = 3,338`.
-- Next open 3,199, so `fill = 3,199.32`, `R = 71.32`. Then `T1 = max(3,270, 3,341.96) = 3,341.96`. `fill + 1R = 3,270.64`. `fill + 3R = 3,413.28`.
+- `R_dec = 70`. The collar is 3,212, and the next open of 3,199 is inside it.
+- So `fill = 3,199.32`, `R = 71.32`. Then `T1 = max(3,270, 3,341.96) = 3,341.96`, which also rules the fill bar. `fill + 1R = 3,270.64`. `fill + 3R = 3,413.28`.
 
 `ATR` is computed from `TR` in this table, not held flat.
 
@@ -191,7 +198,7 @@ Invented numbers, for checking arithmetic only. ETH, `T_d = 4h`. Box: `BH = 3,18
 | 11 | 04:00 | 3,498 | 3,512 | 3,440 | 3,452 | 72 | 45.76 | 1.63 | 2.87 | Candidate 3,428.87 is lower, the ratchet holds. Target moves up | 3,431.50 | `T2` 3,651.52 |
 | 12 | 08:00 | 3,452 | 3,470 | 3,418 | 3,430 | | | | | `L <= 3,431.50`: stop, 75% at 3,431.50 (`+3.26R`) | closed | |
 
-Result before costs: `0.25 * 2.00 + 0.75 * 3.26 = 2.94R`. `R` stayed 71.32 throughout. This path was chosen to exercise the rules and does not represent a typical outcome. The usual outcome for this design is a small loss or a thesis exit. Bar 11 shows the ratchet at
+Result before costs: `0.25 * 2.00 + 0.75 * 3.26 = 2.94R`. `Result_B = (0.25 * 142.64 + 0.75 * 232.18) / 70 = 3.00`. `R` stayed 71.32 throughout. This path was chosen to exercise the rules and does not represent a typical outcome. The usual outcome for this design is a small loss or a thesis exit. Bar 11 shows the ratchet at
 work: `ATR` rising pulled the candidate down, and the stop refused to follow.
 
 ## 8. Parameters
@@ -219,7 +226,7 @@ Total: 8 configurations. Band window, percentile window and all stop and target 
 | Quiet markets that stay quiet | Should fail by thesis exit | A high share of thesis exits, near small losses |
 | False breaks | Should fail by back-in-the-box | Share of those exits |
 | Market-wide adaptation | Should decay, as Fang et al. describe for stock indexes | Rolling results over time, reported by year |
-| Any regime | Should beat its [placebo](00_INDEX.md#c15-placebo-control) | Random entry times with the same stop and target model, plus a version using an unconditional breakout with no compression filter |
+| Any regime | Should beat its [placebo](00_INDEX.md#c15-placebo-control) | Entry bars drawn uniformly over bars passing the non-signal condition `CF` count and `BoxH` limit, with the side random at the block's real long and short share, and the same stop and target model from the box as of that bar. A named extra is an unconditional breakout with no compression filter |
 
 ## 11. Flow hooks
 
@@ -261,7 +268,7 @@ be reported separately.
 | Path | `S0` or the setup's `T1` touched since `t_k`, or a `T_d` close below `BM`, voids the setup |
 | Chase | `abs(P_dec - C_k) <= 0.5 * ATR_k` |
 | Risk | `P_dec - S0` between the setup's `R_min(1.25)` and `3.0 * ATR_k` |
-| `RR_late` | Not applicable, because `T1` is set from the real fill by 7.3 |
+| `RR_late` | Not applicable, because `T1` is set from the real fill by 7.3. Under `.T` the rule in C17 limits it |
 | Thesis | `P_dec > BH`: price must still be outside the box |
 
 Using the example in 7.12, with `C_k = 3,198`, `S0 = 3,128`, `ATR = 28`:
@@ -272,7 +279,7 @@ Using the example in 7.12, with `C_k = 3,198`, `S0 = 3,128`, `ATR = 28`:
 **Stops and targets between runs.**
 
 - Touches between runs are resolved from 1m bars at the next run, with `event_time` and `detection_time` recorded. Inside one 1m bar, the stop is first.
-- At 4h, the runs between 4h closes only resolve touches. Only a run that processes a 4h close computes updates, and these act from `t_dec + latency`. A dropped run at a 4h close means a stop can be stale for five hours. This is a real cost at this timeframe, and it appears in the record.
+- At 4h, the runs between 4h closes resolve touches and compute no model update. Only a run that processes a 4h close computes model updates, and these act from `effective_from`. Flow may still act at the other runs, under C17. A dropped run at a 4h close means a stop can be stale for five hours. This is a real cost at this timeframe, and it appears in the record.
 - `HH_b` for the fill bar uses only 1m bars at or after the fill. Later bars use the whole `T_d` bar.
 - `VRe_b` and `k_b` use `T_d` closes only, so they do not depend on run timing.
 - `T2_b` stays at its last value between closes, and is not recomputed at runs between 4h closes.

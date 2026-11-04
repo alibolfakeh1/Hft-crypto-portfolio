@@ -1,8 +1,8 @@
 # S04 Supply and demand zones
 
-Status: draft for leak audit. Not tested. Tier `T0`. Default `T_d` 1h. Long and short. Live-eligible at 1h and
-4h, see section 14.
-Common rules C1 to C17 are in [00_INDEX.md](00_INDEX.md#5-common-conventions) and apply throughout.
+Status: revised after the leak audit of 2026-11-04, awaiting re-audit. Not tested. Tier `T0`. Default `T_d` 1h. Long and
+short. Live-eligible at 1h and 4h, see section 14.
+Common rules C1 to C18 are in [00_INDEX.md](00_INDEX.md#5-common-conventions) and apply throughout.
 
 ## 1. Idea and mechanism
 
@@ -40,30 +40,30 @@ The result must be judged against the [placebo](00_INDEX.md#c15-placebo-control)
 
 ## 3. Definitions
 
-**Base.** A run of 1 to 5 consecutive bars ending at `base_end`, with `ATR_b = ATR_(base_end)`:
+**Base.** A run of 1 to 5 consecutive bars ending at `base_end`, with `ATR_base = ATR_(base_end)`:
 
-- every bar has `H_i - L_i <= 1.0 * ATR_b` and `abs(C_i - O_i) <= 0.5 * ATR_b`,
-- the whole run has `max(H) - min(L) <= 1.5 * ATR_b`.
+- every bar has `H_i - L_i <= 1.0 * ATR_base` and `abs(C_i - O_i) <= 0.5 * ATR_base`,
+- the whole run has `max(H) - min(L) <= 1.5 * ATR_base`.
 
 **Departure, demand.** The 1 to 3 bars after `base_end`, ending at bar `e`:
 
 | # | Condition |
 |---|---|
 | a | Every departure bar has `C > O` |
-| b | At least one departure bar has `H - L >= 1.2 * ATR_b` |
+| b | At least one departure bar has `H - L >= 1.2 * ATR_base` |
 | c | Mean `CLV` over the departure bars is at least 0.60 |
 | d | `C_e > max(H over base)` |
-| e | `C_e - prox >= 1.5 * ATR_b` |
+| e | `C_e - prox >= 1.5 * ATR_base` |
 
 **Zone lines, demand.**
 
 ```text
 prox = max over base of max(O_i, C_i)                          # top of the bodies
 dist = min(L over base bars and the first departure bar)       # lowest wick
-h    = prox - dist                                             # require 0.1*ATR_b <= h <= 1.5*ATR_b
+h    = prox - dist                                             # require 0.1*ATR_base <= h <= 1.5*ATR_base
 ```
 
-**Arrival, demand (DBR).** `O_(base_start-3) - C_(base_start-1) >= 1.0 * ATR_b`. Price came down into the base.
+**Arrival, demand (DBR).** `O_(base_start-3) - C_(base_start-1) >= 1.0 * ATR_base`. Price came down into the base.
 
 **Search order at each close `e`.** Try departure length 1, then 2, then 3, and take the first that satisfies the
 conditions. Then take the longest valid base ending just before it. If a zone with the same `base_end` already exists,
@@ -76,32 +76,40 @@ entries.
 **Quality score.**
 
 ```text
-D = min(1, (C_e - prox) / (3 * ATR_b))           # departure strength, frozen at birth
-    if the largest departure bar range > 4 * ATR_b: D = min(D, 0.5)      # likely forced flow
-T = 1 - min(1, h / (1.5 * ATR_b))                # base tightness, frozen at birth
+D = min(1, (C_e - prox) / (3 * ATR_base))           # departure strength, frozen at birth
+    if the largest departure bar range > 4 * ATR_base: D = min(D, 0.5)      # likely forced flow
+T = 1 - min(1, h / (1.5 * ATR_base))                # base tightness, frozen at birth
 F = 0.5 ^ touches_before * max(0, 1 - age / MaxAge)        # freshness, updated over time
 Q = 100 * (0.5*D + 0.3*T + 0.2*F)
 ```
 
-The weights are fixed by judgement and are not fitted. `MaxAge` is 14 days of bars. `age` is bars since birth.
+The weights are declared constants, fixed by judgement and not fitted. `MaxAge` is 14 days of bars. `age` is the number of bars
+from `e` to the close being evaluated.
 
-**Touch.** A bar with `L <= prox` after birth. Consecutive such bars count as one. `touches_before` counts touches
-closed before the bar being evaluated, and excludes the current one.
+**Touch.** A bar with `L <= prox` after birth. Consecutive such bars count as one touch, counted at the close of its first bar.
+`touches_before` at bar `k` counts touches whose first bar closed before `t_k`. A touch that began at `k-1` and continues at `k` is
+therefore included, and one that begins at `k` is not.
 
-**Zone end.** Broken when `C < dist - 0.25 * ATR`, which passes it to S05. Dead when `age > MaxAge`.
+**Register.** Zones follow [C4](00_INDEX.md#c4-swing-pivots-and-registers): `valid_from = t_e`, state events carry their own times, and
+every read is as of a time. A zone is active at `t` when it has no `broken_at`, `dead_at` or `superseded_at` at or before `t`.
 
-**Overlap.** If a new zone overlaps an active same-side zone by more than half of its own height, keep the one with
-the higher `Q` at the new zone's birth.
+**Zone end.** `broken_at` is the close with `C < dist - 0.25 * ATR`, which passes the zone to S05. `dead_at` is the first close with
+`age > MaxAge`.
+
+**Overlap.** If a new zone overlaps an active same-side zone by more than half of its own height, the one with the higher `Q` at the
+new zone's `t_e` stands, and the older zone wins a tie. The loser gets `superseded_at = t_e` of the new zone. An older loser was valid
+until that moment, and stays usable for every read before it. A new loser is registered with its state and is never active. Both stay
+in the register.
 
 ## 4. Knowable times
 
 | Object | Knowable at |
 |---|---|
 | Zone, `prox`, `dist`, `D`, `T` | `t_e`, the close of the last departure bar. Never at the base |
-| `ATR_b` | `t_base_end`, so the departure cannot inflate its own yardstick |
-| `touches_before` | Updated at each touching bar's close |
-| `F`, `Q` | Evaluated at the current close, using only touches and age up to the previous close |
-| Broken or dead | The close that causes it |
+| `ATR_base` | `t_base_end`, so the departure cannot inflate its own yardstick |
+| `touches_before` | At `t_k`, counts touches whose first bar closed before `t_k` |
+| `F`, `Q` | Evaluated at the current close, with `age` at that close and `touches_before` as above |
+| Broken, dead, superseded | The close that causes it. Earlier reads are unchanged |
 | Stack zone, new opposing zone | Their own `t_e`, effective next bar |
 
 ## 5. Setup rules
@@ -111,7 +119,7 @@ the higher `Q` at the new zone's birth.
 | # | Condition |
 |---|---|
 | a | Zone active, and `touches_before` is within the limit (default 0) |
-| b | `Q_k >= Q_min` (default 55) |
+| b | `Q_k >= Q_min` (default 60, a grid value) |
 | c | `C_(k-1) > prox` and `L_k <= prox` |
 | d | `L_k >= dist - 0.25 * ATR_k` |
 | e | `C_k > prox` and `CLV_k >= 0.50` |
@@ -179,7 +187,7 @@ than 2 touches, and `HHz`, the highest high between the zone's birth and `t_k`.
 - The stop buffer scales with `VR`.
 - `VR_k > 2.0` blocks new entries. During shocks, zones form in a different volatility regime from the one they are
   tested in.
-- A departure bar over `4 * ATR_b` caps `D` at 0.5, so a likely liquidation departure rarely clears `Q_min` on its own.
+- A departure bar over `4 * ATR_base` caps `D` at 0.5, so a likely liquidation departure rarely clears `Q_min` on its own.
 
 ### 7.6 Floors
 
@@ -218,7 +226,7 @@ the target in.
 
 ### 7.12 Worked example, long
 
-Invented numbers, for checking arithmetic only. `T_d = 1h`, ETH. `VR = 1.0` held flat. Zone formation, with `ATR_b = 20`:
+Invented numbers, for checking arithmetic only. `T_d = 1h`, ETH. `VR = 1.0` held flat. Zone formation, with `ATR_base = 20`:
 
 | Bar | O | H | L | C | Role |
 |---|---|---|---|---|---|
@@ -231,12 +239,14 @@ Invented numbers, for checking arithmetic only. `T_d = 1h`, ETH. `VR = 1.0` held
 - `prox = 3,207`, `dist = 3,196`, `h = 11`, `mid = 3,201.5`.
 - `D = 45 / 60 = 0.75`, `T = 1 - 11/30 = 0.633`, `F = 1` at birth. `Q = 100 * (0.375 + 0.19 + 0.20) = 76.5`.
 
-Price rises to `HHz = 3,290`. 48 bars later, with `ATR = 18`, the first return comes. `F = 1 - 48/336 = 0.857`, so
-`Q = 73.6`. Trigger bar closes 14:00: `O 3,222, H 3,225, L 3,203, C 3,216`, `CLV = 0.59`.
+Price rises to `HHz = 3,290`. 48 bars later, with `ATR = 18`, the first return comes, so `age = 48` and `touches_before = 0`.
+`F = 1 - 48/336 = 0.857`, so `Q = 73.6`, above the default `Q_min = 60`. Trigger bar closes 14:00: `O 3,222, H 3,225, L 3,203, C 3,216`,
+`CLV = 0.59`.
 
 - `S_struct = 3,196 - 4.5 = 3,191.5`. `R_min = max(13.5, 15.4)`. `S0 = 3,191.50`, and `C - S0 = 24.5`.
 - Threshold for `T1` is 3,252.75. An active supply zone has `prox = 3,262`, `dist = 3,270`, so `T1 = 3,262`. `T2 = HHz = 3,290`.
-- Next open 3,215.5, so `fill = 3,215.82`, `R = 24.32`, `BE+ = 3,219.68`.
+- `R_dec = 24.50`. The collar is 3,225, and the next open of 3,215.5 is inside it.
+- So `fill = 3,215.82`, `R = 24.32`, `BE+ = 3,219.68`.
 
 | `n` | Close | O | H | L | C | Event at this close | Stop after close | Next target |
 |---|---|---|---|---|---|---|---|---|
@@ -259,7 +269,8 @@ Price rises to `HHz = 3,290`. 48 bars later, with `ATR = 18`, the first return c
 | 17 | 07:00 | 3,258 | 3,270 | 3,255 | 3,268 | | 3,225.50 | `T2` 3,281 |
 | 18 | 08:00 | 3,268 | 3,283 | 3,266 | 3,279 | `H > T2`: 50% out at 3,281 (`+2.68R`) | closed | |
 
-Result before costs: `0.5 * 1.90 + 0.5 * 2.68 = 2.29R`. `R` stayed 24.32 throughout. This path was chosen to exercise
+Result before costs: `0.5 * 1.90 + 0.5 * 2.68 = 2.29R`. `Result_B = (0.5 * 46.18 + 0.5 * 65.18) / 24.50 = 2.27`. `R` stayed 24.32
+throughout. This path was chosen to exercise
 the rules and does not represent a typical outcome. Had bar 2 closed at 3,200, below `mid`, the position would have
 exited at the next open by absorption, at about `-0.65R`.
 
@@ -307,9 +318,10 @@ Questions for `feature-integrator`.
 |---|---|---|
 | Zone dated by its base | Treating a base at 10:00 as a zone at 10:00, when the departure finished at 13:00 | Knowable at `t_e` only. A touch before `t_e` cannot exist for this zone |
 | Score using later data | `D` measured to the eventual top of the rally | `D` uses `C_e` only |
-| `ATR_b` from after departure | The departure inflating the yardstick | `ATR` at `base_end` |
-| Freshness with later touches | `F` using all touches in the zone's life | Touches before the evaluated bar only |
+| `ATR_base` from after departure | The departure inflating the yardstick | `ATR` at `base_end` |
+| Freshness with later touches | `F` using all touches in the zone's life | Touches whose first bar closed before the evaluated bar only |
 | Survivorship of zones | Testing only zones that held | Every zone that passes the definition stays in the register, including those that broke before any trade |
+| Later zone removes an earlier one | Zone A born Monday, overlapped by a stronger zone B born Wednesday. A final register deletes A for Tuesday as well | A stays valid until `superseded_at = t_e` of B. Reads are as of a time, and truncation invariance is required |
 | Target from a zone not yet known | A supply zone born at bar 15 used as a target at entry | Candidates at `t_k` only, then recomputed at each later birth |
 | Stack stop too early | Using a base's low before its departure completes | Only at the stack zone's `t_e`, effective next bar |
 | Search order hindsight | Trying all departure lengths and keeping the best | The first valid length, in increasing order, at each close |
@@ -346,7 +358,7 @@ Using the example in 7.12, with `C_k = 3,216`, `S0 = 3,191.50`, `T1 = 3,262`, `A
 - `P_dec = 3,218`: chase 2, risk 26.5, reward 44. All pass.
 
 A zone found late stays usable, because its inputs are closed bars. A zone born at the 13:00 close and first processed
-by a 14:21 run can serve a trigger bar closing at 14:00, since all of that is known at `t_dec`. Bars are processed in
+by a 14:21 run can serve a trigger bar closing at 14:00, since all of that is at or before that run's `t_cut`. Bars are processed in
 time order so touch counts stay correct.
 
 **Stops and targets between runs.**
@@ -354,11 +366,13 @@ time order so touch counts stay correct.
 - Touches between runs are resolved from 1m bars at the next run, with `event_time` and `detection_time` recorded. Inside
   one 1m bar, the stop is first.
 - Reaction test, zone spent, zone stack and target recomputes are computed at each processed `T_d` close, in time order,
-  and act from `t_dec + latency`. `n` still counts `T_d` closes, so a delay never shifts a test to a different bar.
+  with position state as of that close, and act from `effective_from`. `n` counts `T_d` closes from the bar containing the fill. A
+  late fill can make `n = 1` a later bar than in `IDEAL`, but after the fill a late run does not move a test to a different bar.
 - The absorption exit fills after the run that saw it, so a long gap makes it more costly. `CYCLE` must show this.
 - Stops only tighten: the `P_dec` clamp in C17 can reduce a candidate, and the ratchet then keeps the old stop.
 
 **Backtest reproduction.** `CYCLE` under [C17](00_INDEX.md#c17-hourly-live-cycle), with `C-LATE` for selection, and the zone
 register replayed by simulated run in time order. Report the count of `STALE_SETUP` by reason, and absorption exit prices
 in both modes. I expect a noticeable `IDEAL` minus `CYCLE` gap here, because good reactions leave `RR_late` behind quickly.
-That is untested. If the gap removes most of an `IDEAL` result, the 1h version should be dropped from live in favour of 4h.
+That is untested. Any choice between 1h and 4h for live is a selection, made on training folds only and logged, under
+[C18](00_INDEX.md#c18-selection-purge-and-retirement).

@@ -1,8 +1,8 @@
 # S03 Market structure, BOS and CHoCH
 
-Status: draft for leak audit. Not tested. Tier `T0`. Default `T_d` 1h. Long and short. Live-eligible at 1h and
-4h, see section 14.
-Common rules C1 to C17 are in [00_INDEX.md](00_INDEX.md#5-common-conventions) and apply throughout.
+Status: revised after the leak audit of 2026-11-04, awaiting re-audit. Not tested. Tier `T0`. Default `T_d` 1h. Long and
+short. Live-eligible at 1h and 4h, see section 14.
+Common rules C1 to C18 are in [00_INDEX.md](00_INDEX.md#5-common-conventions) and apply throughout.
 
 ## 1. Idea and mechanism
 
@@ -40,32 +40,33 @@ evidence is poor. Nothing tests swing-based BOS rules at 1h or 4h.
 
 ## 3. Definitions
 
-**Swings.** `Sigma(Lf, Rt, a)` from [C4](00_INDEX.md#c4-swing-pivots), default `Lf = 5`, `Rt = 3`, `a = 1.0`, on
+**Swings.** `Sigma(Lf, Rt, a)` from [C4](00_INDEX.md#c4-swing-pivots-and-registers), default `Lf = 5`, `Rt = 3`, `a = 1.0`, on
 `T_d`. The higher-timeframe list `Sigma_H` uses the same parameters on 4h bars if `T_d = 1h`, and on UTC daily
-bars if `T_d = 4h`.
+bars if `T_d = 4h`. Each list's amplitude test uses `ATR` on that list's own timeframe, at the confirmation bar. Both
+lists are read as of the time in question, under C4.
 
 **Break band.** `b_k = 0.10 * ATR_k`. Breaks are close-based, and a wick never breaks structure.
 
 **Structure state machine.** Run at each close, after adding any swing confirmed at that close:
 
 ```text
-SH = latest swing high in Sigma, if not yet broken
-SL = latest swing low in Sigma, if not yet broken
+SH = latest swing high in Sigma as of t_k, if it has no broken_at
+SL = latest swing low in Sigma as of t_k, if it has no broken_at
 
 if SH exists and C_k > SH.price + b_k:
-    mark SH broken
+    SH.broken_at = t_k
     if state == UP: event = BOS_UP; bos_count = bos_count + 1
     else:           event = CHoCH_UP; state = UP; bos_count = 0
 
 if SL exists and C_k < SL.price - b_k:
-    mark SL broken
+    SL.broken_at = t_k
     if state == DOWN: event = BOS_DOWN; bos_count = bos_count + 1
     else:             event = CHoCH_DOWN; state = DOWN; bos_count = 0
 ```
 
 Initial `state` is `NONE`, and the first break of either kind is treated as a CHoCH, with no trade.
 
-**Higher low.** `SL_last` and `SL_prev` are the two latest swing lows in `Sigma`, whether broken or not. A higher
+**Higher low.** `SL_last` and `SL_prev` are the two latest swing lows in `Sigma` as of `t_k`, whether broken or not. A higher
 low means `SL_last.price > SL_prev.price`, with `SL_last` confirmed before the BOS bar.
 
 **Leg.** `Leg = SH.price - SL_last.price`, where `SH` is the swing high just broken.
@@ -77,7 +78,7 @@ low means `SL_last.price > SL_prev.price`, with `SL_last` confirmed before the B
 | Object | Knowable at |
 |---|---|
 | Swing at bar `i` | `t_(i+Rt)`, never `t_i` |
-| Entry in `Sigma`, including replacements | The confirmation time |
+| Entry in `Sigma`, including replacements | `valid_from` is its confirmation time. A replacement sets the old entry's `valid_to` to that time and changes nothing earlier |
 | BOS, CHoCH, `state` | The close that causes them |
 | `Sigma_H` swing | Confirmation on that higher timeframe's closed bars |
 | `Leg`, `T1`, `T2` | `t_k`, recomputed at each later BOS close |
@@ -141,7 +142,7 @@ Schedule: only at `T_d` closes, when the event below occurs. All go through
 ### 7.3 Target logic
 
 Candidates at `t_k`: the measured move `MM = SH.price + 1.618 * Leg`, and the nearest unbroken swing high in
-`Sigma_H` above `C_k`.
+`Sigma_H` above `C_k`, read as of `t_k`.
 
 - `T1` is the lowest candidate at or above `C_k + 1.25 * (C_k - S0)`. If there is none,
   `T1 = C_k + 1.5 * (C_k - S0)`.
@@ -209,7 +210,8 @@ Earlier confirmed history: `CHoCH_UP` at 10:00 closed above a lower high. Swing 
 - `S0 = 65,650 - 90 = 65,560`. `C - S0 = 1,000`. `R_min = max(300, 319.5)`, so the structure stop stands.
 - `Leg = 850`. `MM = 67,875.3`. `Sigma_H` swing high 67,900. The threshold is 67,810, so `T1 = 67,875.3`.
   `T2 = 68,725.3`.
-- Next open 66,565, so `fill = 66,571.7`, `R = 1,011.7`, `BE+ = 66,651.5`.
+- `R_dec = 1,000`. The collar is 66,710, and the next open of 66,565 is inside it.
+- So `fill = 66,571.7`, `R = 1,011.7`, `BE+ = 66,651.5`.
 
 | `n` | Close | O | H | L | C | Event at this close | Stop after close | `T1` | `T2` |
 |---|---|---|---|---|---|---|---|---|---|
@@ -235,13 +237,14 @@ Earlier confirmed history: `CHoCH_UP` at 10:00 closed above a lower high. Swing 
 | 24 | 23:00 | 68,030 | 68,130 | 67,990 | 68,090 | | 66,800.0 | | 68,592.2 |
 | 25 | 00:00 | 68,090 | 68,210 | 68,060 | 68,180 | Swing low 67,790 confirmed. Step: `67,790 - 90` | 67,700.0 | | 68,592.2 |
 | 26 | 01:00 | 68,180 | 68,230 | 67,860 | 67,900 | | 67,700.0 | | 68,592.2 |
-| 27 | 02:00 | 67,900 | 67,950 | 67,720 | 67,740 | `C < 67,760`: `CHoCH_DOWN`. Stop 67,700 not touched. Exit decided | exit next open | | |
-| 28 | 03:00 | 67,735 | | | | 70% out at 67,735 (`+1.15R`) | closed | | |
+| 27 | 02:00 | 67,900 | 67,950 | 67,720 | 67,740 | `C < 67,760`: `CHoCH_DOWN`. Stop 67,700 not touched. Exit pending | exit next open | | |
+| 28 | 03:00 | 67,735 | | | | Pending exit is first in the loop: 70% out at 67,735 (`+1.15R`), whatever the bar does later | closed | | |
 
 Bars 17 to 21, for checking the swings: opens 67,880, 68,140, 68,380, 68,290, 68,060. Highs 68,180, 68,420, 68,520,
 68,330, 68,120. Lows 67,850, 68,090, 68,220, 68,010, 67,820. Closes 68,140, 68,380, 68,290, 68,060, 67,870.
 
-Result before costs: `0.3 * 1.31 + 0.7 * 1.15 = 1.20R`. `R` stayed 1,011.7 throughout. This path was chosen to
+Result before costs: `0.3 * 1.31 + 0.7 * 1.15 = 1.20R`. `Result_B = (0.3 * 1,328.3 + 0.7 * 1,163.3) / 1,000 = 1.21`. `R` stayed
+1,011.7 throughout. This path was chosen to
 exercise the rules and does not represent a typical outcome. Notice bar 8: the low that will become the new stop has
 printed, yet the stop stays at 65,560 until bar 11. Any rule that moved it earlier would be a repaint.
 
@@ -271,7 +274,7 @@ Total: 8 configurations. Amplitude `a` and all stop and target constants are fro
 | Ranges | Should fail by whipsaw | Chop count high, many `CHoCH` exits near `-1R` or less |
 | V-shaped reversals | Should fail: no higher low exists until well after the turn | Trade starts late in a move that is ending |
 | Squeeze tops | Partly handled by the climax rule | Compare exits on climax tighten against the counterfactual without it |
-| Any regime | Should beat random entries with the same stop and target geometry | [Placebo](00_INDEX.md#c15-placebo-control) |
+| Any regime | Should beat random entries, drawn over bars that pass the non-signal filters c, d, e and f with the block's real long and short share, with the stop from the list as of that bar | [Placebo](00_INDEX.md#c15-placebo-control) |
 
 ## 11. Flow hooks
 
@@ -289,9 +292,9 @@ Questions for `feature-integrator`.
 | Trap | Concrete failure | Guard |
 |---|---|---|
 | Swing used at its extreme | At 07:00 in the example, using the 66,530 low as support | Knowable at 10:00, the confirmation close |
-| Repainted `Sigma` | A later, more extreme swing replacing an earlier one, then used on bars before that replacement | Replacements take effect at their confirmation time |
+| Repainted `Sigma` | A later, more extreme swing replacing an earlier one, then used on bars before that replacement. A final list joined by knowable time also loses the replaced swing on those bars, and passes the timestamp audit | Replacements take effect at their confirmation time, and every read is `valid_from <= t < valid_to`. A final list is forbidden as an input, and truncation invariance is required |
 | Stop on the confirmation bar | Stop raised at the 10:00 close acting inside the bar closing 10:00 | Effective from the next bar |
-| Higher-timeframe swing merged early | A 4h swing used before its 4h confirmation | Uses only closed bars of that timeframe, joined by `knowable_time` |
+| Higher-timeframe swing merged early | A 4h swing used before its 4h confirmation | Uses only closed bars of that timeframe, with the same as-of read |
 | Wick break counted | Using `H > SH` to declare BOS | Close-based only, with band |
 | Fitting amplitude after seeing trends | Re-tuning `a` | Frozen and not in the grid |
 
@@ -303,8 +306,8 @@ third of that at 4h.
 **Cost.** Typical `R` about 150 to 250 bp at 1h, and 300 to 500 bp at 4h, by my judgement. At the illustrative
 `RT = 12 bp`, cost is about `0.05R` to `0.08R` at 1h and less at 4h. Fees are not what kills this. It dies on hit
 rate and on the late entry, since entering at a BOS close with the stop behind a confirmed swing often puts `T1` only
-about `1.3R` away. Funding does matter, because holding periods cross many settlements: on Binance's default schedule
-a held position pays or receives funding every 8 hours. Report funding separately for this strategy.
+about `1.3R` away. Funding does matter, because holding periods cross many settlements, every 8 hours on a schedule such
+as Binance's default. Report funding separately for this strategy.
 
 ## 14. Live on an hourly cycle
 
@@ -333,16 +336,19 @@ Using the example in 7.12, with `C_k = 66,560`, `S0 = 65,560`, `SL_last = 65,650
 - Touches between runs are resolved from 1m bars at the next run, with both `event_time` and `detection_time`
   recorded. Inside one 1m bar, the stop is first.
 - Swing confirmation lag and cycle lag add up. In the example, the 66,530 low is confirmed at the 10:00 close, and the
-  new stop acts only from the run that processes it, for example 10:20. The earlier stop of 65,560 remains active during
-  that gap, and nothing is applied retroactively.
+  new stop acts only from the `effective_from` of the run that processes it, for example 10:21. The earlier stop of 65,560
+  remains in force during that gap, and nothing is applied retroactively.
 - Steps, BOS locks, climax tightens and target recomputes are computed at each processed `T_d` close, in time order,
-  and act from `t_dec + latency`. A dropped run can bring two closes together, and both go through the ratchet.
+  and act from `effective_from`. A dropped run can bring two closes together, and both go through the ratchet.
 - A `CHoCH_DOWN` exit fills after the run that saw it. On a late run the price may have fallen further by then. If it
   touched the stop first, the walk in C17 has already closed the trade at the stop.
-- At 4h, runs between closes only resolve touches.
+- At 4h, the runs between closes resolve touches and compute no model update. Flow may still act at them, under C17.
+- The `fill + 1.25 * R` threshold in 7.3 is fill-based, so under `.T` it follows the
+  [rule against a later fill raising a target](00_INDEX.md#c17-hourly-live-cycle).
 - Stops only tighten: the `P_dec` clamp in C17 can reduce a candidate, and the ratchet then keeps the old stop.
 
-**Backtest reproduction.** `CYCLE` under [C17](00_INDEX.md#c17-hourly-live-cycle), with `C-LATE` for selection, and
-`Sigma` replayed so that swing confirmation is processed at the simulated run, not at the bar close. Report counts by
+**Backtest reproduction.** `CYCLE` under [C17](00_INDEX.md#c17-hourly-live-cycle), with `C-LATE` for selection. Closes are
+processed in time order during each simulated run, and `Sigma` uses values at `t_(i+Rt)`, including `ATR` for the amplitude
+test, so the list never depends on run timing. Report counts by
 `STALE_SETUP` reason, and compare `IDEAL` and `CYCLE` on the share of exits by `CHoCH` and by stop. I expect a small cycle
 cost at 4h, and a larger one at 1h from extension rejections. That is untested.

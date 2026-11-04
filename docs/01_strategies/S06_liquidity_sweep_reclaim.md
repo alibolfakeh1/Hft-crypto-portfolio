@@ -1,8 +1,8 @@
 # S06 Liquidity sweep and reclaim
 
-Status: draft for leak audit. Not tested. Tier `T0`. Default `T_d` 15m. Long and short. Backtest only: not eligible
-for the hourly live cycle, see section 14.
-Common rules C1 to C17 are in [00_INDEX.md](00_INDEX.md#5-common-conventions) and apply throughout.
+Status: revised after the leak audit of 2026-11-04, awaiting re-audit. Not tested. Tier `T0`. Default `T_d` 15m. Long and
+short. Backtest only: not eligible for the hourly live cycle, see section 14.
+Common rules C1 to C18 are in [00_INDEX.md](00_INDEX.md#5-common-conventions) and apply throughout.
 
 ## 1. Idea and mechanism
 
@@ -45,12 +45,14 @@ note it because it is the only outcome claim I saw, and it is unfavourable.
 
 | Pool | Definition |
 |---|---|
-| `PDL` | Low of the last completed UTC day |
-| `PWL` | Low of the last completed UTC week |
-| Swing low | In `Sigma(5, 3, 1.0)` on 1h bars, unswept, age at most 7 days, and knowable at least 8 `T_d` bars before the sweep |
+| `PDL` | Low of the last completed UTC day, in force from the bar that opens at the roll, so a bar cannot sweep a low it set itself |
+| `PWL` | Low of the last completed UTC week, on the same terms |
+| Swing low | In `Sigma(5, 3, 1.0)` on 1h bars with 1h `ATR`, unswept, age at most 7 days, and knowable at least 8 `T_d` bars before the sweep |
 
-A pool is consumed by its first sweep or by any close beyond it, and gives at most one trade. Equal lows and nearby round
-numbers (multiples of 1,000 for BTC and 100 for ETH, within `0.25 * ATR` on 1h) are logged as tags and are not filters.
+A pool is consumed by its first sweep or by any close beyond it, logged as `consumed_at`, and gives at most one trade. Pools are a register
+under [C4](00_INDEX.md#c4-swing-pivots-and-registers), read as of the sweep. A swing pool is therefore visible while `valid_from <= t < valid_to`,
+even if a later, lower swing replaces it after the trade. Equal lows and nearby round numbers (multiples of 1,000 for BTC and 100 for ETH,
+within `0.25 * ATR` on 1h) are logged as tags and are not filters.
 
 **Sweep, long, of pool `l`, at bar `s`.**
 
@@ -76,8 +78,8 @@ is the highest one that the close reclaimed.
 
 | Object | Knowable at |
 |---|---|
-| `PDL`, `PDH` | 00:00 UTC, from the completed day |
-| `PWL`, `PWH` | Monday 00:00 UTC |
+| `PDL`, `PDH` | 00:00 UTC, from the completed day. They first act on the bar that opens at 00:00 |
+| `PWL`, `PWH` | Monday 00:00 UTC. They first act on the bar that opens then |
 | Swing pool | Its 1h confirmation close, and tradable 8 `T_d` bars later |
 | Sweep | Close of `s`. A touch alone is not a sweep |
 | Reclaim, `S0`, targets | `t_r` |
@@ -192,7 +194,8 @@ high at 3,352 is the nearest opposing pool, and `PSH = 3,325`.
 - Sweep and reclaim on one bar, closing 22:15: `O 3,306, H 3,309, L 3,292, C 3,302.5`. Depth 8, `CLV = 0.62`, `SRV = 1.4`.
 - `S_struct = 3,292 - 2.25 = 3,289.75`. `R_min = max(6.75, 15.85) = 15.85`, so the floor binds: `S0 = 3,286.64`. `D = 15.86`.
 - `T1 = PSH = 3,325`, at least 15.86 above `C`. `T2 = 3,352`, at least 31.7 above `C`.
-- Next open 3,303, so `fill = 3,303.33`, `R = 16.69`, `BE+ = 3,307.29`.
+- `R_dec = 15.86`. The collar is 3,307, and the next open of 3,303 is inside it.
+- So `fill = 3,303.33`, `R = 16.69`, `BE+ = 3,307.29`.
 
 | `n` | Close | O | H | L | C | Event at this close | Stop after close | Next target |
 |---|---|---|---|---|---|---|---|---|
@@ -207,7 +210,8 @@ high at 3,352 is the nearest opposing pool, and `PSH = 3,325`.
 | 9 | 00:30 | 3,335 | 3,342 | 3,331 | 3,339 | Trail `3,318 - 4.5` | 3,313.50 | `T2` 3,345 |
 | 10 | 00:45 | 3,339 | 3,346 | 3,336 | 3,344 | `H > T2`: 50% out at 3,345 (`+2.50R`) | closed | |
 
-Result before costs: `0.5 * 1.30 + 0.5 * 2.50 = 1.90R`. `R` stayed 16.69 throughout. This path was chosen to exercise the rules
+Result before costs: `0.5 * 1.30 + 0.5 * 2.50 = 1.90R`. `Result_B = (0.5 * 21.67 + 0.5 * 41.67) / 15.86 = 2.00`. `R` stayed 16.69
+throughout. This path was chosen to exercise the rules
 and does not represent a typical outcome. Had bar 2 closed at 3,298, below `l - 0.9`, the position would have exited at the next
 open by "reclaim lost", at about `-0.3R`.
 
@@ -257,6 +261,7 @@ Questions for `feature-integrator`. These hooks can only be tested in research, 
 | Reclaim chosen by hindsight | Taking the best of the bars in `s..s+N_r` | First qualifying close, in time order |
 | Opposing pool not yet known | A swing high confirmed after entry used as `T2` at entry | Only at its own close, by the recompute rule |
 | Touch counted as consumption retroactively | Removing a pool from history once it is known to break | The register changes only at the close of the bar that consumes it |
+| Pool lost to a later replacement | A pool at 3,300 is swept and reclaimed at 22:15, and the sweep low is confirmed as a swing at 02:00 and replaces it. In a final list the pool never existed at 22:15, so the trade disappears | As-of read, `valid_from <= t < valid_to`. A final list is forbidden as an input, and truncation invariance is required |
 
 ## 13. Expected frequency and cost sensitivity
 
@@ -279,10 +284,21 @@ stops and no connection to this mechanism. The mechanism would no longer be what
 
 **Late entries.** None are taken live. Hourly runs do not create S06 positions.
 
-**Stops and targets between runs.** There are no live S06 positions. In research, [C7](00_INDEX.md#c7-exit-engine) on `T_d` bars
-applies, with 1m bars settling same-bar conflicts. At 5m that settling step matters often and must be used.
+**Stops and targets between runs.** There are no live S06 positions. In research, [C7](00_INDEX.md#c7-exit-engine) applies, on `T_d` bars
+in `IDEAL` and on 1m bars in `IDEAL-1M`, with 1m bars always settling same-bar conflicts. At 5m that settling step matters often.
 
-**Backtest reproduction.** S06 reports `IDEAL` only, and every chart and table carries the label `IDEAL, NOT LIVE-COMPARABLE`. One
-control run is required: the 15m default through [`C-LATE`](00_INDEX.md#c17-hourly-live-cycle), with `A_max = 90` minutes, a chase
-limit of `0.75 * ATR_r`, and `RR_late = 1.0`, recorded in the trial registry as a control. It measures how much of any `IDEAL` result
-would survive the cycle, and so tests this verdict. A surprising result would justify a new document version, not a live run.
+**Backtest reproduction.** S06 reports `IDEAL` and `IDEAL-1M`, selects under `IDEAL-1M`, and every chart and table carries the label
+`NOT LIVE-COMPARABLE`. One control run is required: the 15m default through [`C-LATE`](00_INDEX.md#c17-hourly-live-cycle), recorded in the
+trial registry as a control. Its check values are declared here, before any result:
+
+| Check | Value for a long, short mirrored |
+|---|---|
+| `A_max` | 90 minutes after the reclaim close |
+| Path | `S0` or `T1` touched, or a `T_d` close below `l - 0.10 * ATR`, voids the setup |
+| Chase | `abs(P_dec - C_r) <= 0.75 * ATR_r` |
+| Risk | `P_dec - S0` between the setup's `R_min(0.75)` and `2.25 * ATR_r` |
+| `RR_late` | `T1 - P_dec >= 1.0 * (P_dec - S0)` |
+| Thesis | `P_dec > l + 0.10 * ATR_r` |
+
+The control measures how much of any research result would survive the cycle, and so tests this verdict. A surprising result would justify a
+new document version, which counts as new trials under [C18](00_INDEX.md#c18-selection-purge-and-retirement), and not a live run.

@@ -1,8 +1,8 @@
 # S01 Floor pivot rejection
 
-Status: draft for leak audit. Not tested. Tier `T0`. Default `T_d` 15m. Long and short. Backtest only: not
+Status: revised after the leak audit of 2026-11-04, awaiting re-audit. Not tested. Tier `T0`. Default `T_d` 15m. Long and short. Backtest only: not
 eligible for the hourly live cycle, see section 14.
-Common rules C1 to C17 are in [00_INDEX.md](00_INDEX.md#5-common-conventions) and apply throughout.
+Common rules C1 to C18 are in [00_INDEX.md](00_INDEX.md#5-common-conventions) and apply throughout.
 
 ## 1. Idea and mechanism
 
@@ -48,9 +48,9 @@ R2 = P + (H - L)    S2 = P - (H - L)
 ```
 
 **Active level set** at time `t`: daily `{S2, S1, P, R1, R2}` from the last completed UTC day, plus weekly
-`{S1, P, R1}` from the last completed UTC week. Levels are not merged. A coincidence of daily and weekly
-levels is logged as `confluence`, but it is not a filter, because Osler found firms' own strength rankings
-uninformative.
+`{S1, P, R1}` from the last completed UTC week. A bar is evaluated against the set in force at its open, under
+[C2](00_INDEX.md#c2-bars-and-calendar). Levels are not merged. A coincidence of daily and weekly levels is logged
+as `confluence`, but it is not a filter, because Osler found firms' own strength rankings uninformative.
 
 **Band.** `b_k = 0.10 * ATR_k`.
 
@@ -83,8 +83,8 @@ the next active level above `T1`. If there is none, `T2 = T1 + (T1 - l)`.
 
 | Object | Knowable at |
 |---|---|
-| Daily pivot set | 00:00 UTC, at the close of the completed day, usable by bars closing after that |
-| Weekly pivot set | Monday 00:00 UTC |
+| Daily pivot set | 00:00 UTC, at the close of the completed day. It first acts on the bar that opens at 00:00 |
+| Weekly pivot set | Monday 00:00 UTC. It first acts on the bar that opens then |
 | `ATR_k`, `CLV_k`, `VR_k` | `t_k` |
 | `ATRD` | 00:00 UTC, from the completed day |
 | `DayOpen` | First trade of the UTC day. Used only at closes after it |
@@ -147,9 +147,9 @@ Schedule: every `T_d` close. All go through [C8](00_INDEX.md#c8-stop-ratchet-and
 
 `T1` and `T2` are from the pivot ladder, set at `t_k`. They change only at the UTC roll: at the close of
 the bar ending 00:00, the current unfilled targets are rebuilt from the new daily set plus the current
-weekly set. The new `T1` (if unfilled) and `T2` are the nearest and next levels at least `0.5 * ATR_b`
-above `C_b`. If no such level exists, the old target stays. Targets may move in either direction. The stop
-is not affected.
+weekly set, using levels at least `0.5 * ATR_b` above `C_b`. If `T1` is unfilled, the new `T1` and `T2` are the
+nearest and next such levels. If `T1` has filled, the new `T2` is the nearest such level. If no such level
+exists, the old target stays. Targets may move in either direction. The stop is not affected.
 
 ### 7.4 Scale-out
 
@@ -205,7 +205,8 @@ So `P = 67,533.33`, `R1 = 68,816.67`, `S1 = 66,616.67`. `ATR = 180` and `VR = 1.
 - `S_struct = min(66,590, 66,598.67) - 63 = 66,527`. `C - S_struct = 263`.
 - `R_min = max(144, 4 * 0.0012 * 66,790) = 320.6`, so the cost floor binds: `S0 = 66,469.4`.
 - `T1 = P = 67,533.3`, room is 743 against the required 385. `T2 = R1 = 68,816.6`.
-- Next open `66,795`, so `fill = 66,801.7` and `R = 332.3`. Fixed from here on.
+- `R_dec = C - S0 = 320.6`. The collar is 66,880, and the next open of 66,795 is inside it.
+- So `fill = 66,801.7` and `R = 332.3`. Both `R` and `R_dec` are fixed from here on.
 
 | `n` | Close | O | H | L | C | Event at this close | Stop after close | `T2` |
 |---|---|---|---|---|---|---|---|---|
@@ -225,9 +226,10 @@ So `P = 67,533.33`, `R1 = 68,816.67`, `S1 = 66,616.67`. `ATR = 180` and `VR = 1.
 | 14 | 00:30 | 67,860 | 67,900 | 67,700 | 67,720 | Trail | 67,535.0 | 68,236.6 |
 | 15 | 00:45 | 67,720 | 67,760 | 67,510 | 67,540 | `L <= 67,535`: stop, 50% at 67,535 (`+2.21R`) | closed | |
 
-Result before costs: `0.5 * 2.20 + 0.5 * 2.21 = 2.20R`. `R` stayed 332.3 throughout. This path was chosen
-to exercise every rule and does not represent a typical outcome. Had bar 9 also traded down to the active
-stop of 66,571.6, the stop would have been taken first and no scale-out recorded.
+Result before costs: `0.5 * 2.20 + 0.5 * 2.21 = 2.20R`. `Result_B = (0.5 * 731.6 + 0.5 * 733.3) / 320.6 = 2.28`. `R`
+stayed 332.3 throughout. This path was chosen to exercise every rule and does not represent a typical outcome. Had
+bar 9 also traded down to the active stop of 66,571.6, 1m bars would settle the order, and if one 1m bar held both,
+the stop would have been taken first and no scale-out recorded.
 
 ## 8. Parameters
 
@@ -255,7 +257,7 @@ Total: 8 configurations. All stop and target constants are frozen and not search
 | Trend days | Should fail, levels break in sequence | Loss clusters on days with `abs(close - open)` above `1.2 * ATRD`, which is measured after the fact and never used as a filter |
 | Liquidation cascades | Should fail hard, with bad stop fills | Stop slippage far above base on those days |
 | Weekends | Fewer and smaller moves, `T1` only | Compare weekend and weekday result in `R` |
-| Any regime | Should beat its [placebo](00_INDEX.md#c15-placebo-control) | If rejection results match random levels, retire it |
+| Any regime | Should beat its [placebo](00_INDEX.md#c15-placebo-control) | If rejection results match random levels, that is a case for retiring it, decided and logged under [C18](00_INDEX.md#c18-selection-purge-and-retirement) |
 
 ## 11. Flow hooks
 
@@ -310,11 +312,23 @@ onto the cycle, its `A_max` would have to be about 30 minutes to keep the thesis
 guarantee that.
 
 **Stops and targets between runs.** There are no live S01 positions. In research, [C7](00_INDEX.md#c7-exit-engine)
-on `T_d` bars applies, with 1m bars settling same-bar conflicts.
+applies, on `T_d` bars in `IDEAL` and on 1m bars in `IDEAL-1M`, with 1m bars always settling same-bar conflicts.
 
-**Backtest reproduction.** S01 reports `IDEAL` only, and every chart and table carries the label
-`IDEAL, NOT LIVE-COMPARABLE`. One control run is required: the default configuration through
-[`C-LATE`](00_INDEX.md#c17-hourly-live-cycle), with `A_max = 90` minutes and a chase limit of `0.75 * ATR_k`,
-recorded in the trial registry as a control. It measures how much of any `IDEAL` result the cycle would
-destroy, and so tests this verdict. If `CYCLE` results turned out close to `IDEAL`, this section should be
-revisited by a new document version, and not by running S01 live on the strength of that one control.
+**Backtest reproduction.** S01 reports `IDEAL` and `IDEAL-1M`, selects under `IDEAL-1M`, and every chart and table
+carries the label `NOT LIVE-COMPARABLE`. One control run is required: the default configuration through
+[`C-LATE`](00_INDEX.md#c17-hourly-live-cycle), recorded in the trial registry as a control. Its check values are
+declared here, before any result:
+
+| Check | Value for a long, short mirrored |
+|---|---|
+| `A_max` | 90 minutes after the rejection close |
+| Path | `S0` or `T1` touched, or a `T_d` close below `l - 0.25 * ATR`, voids the setup |
+| Chase | `abs(P_dec - C_k) <= 0.75 * ATR_k` |
+| Risk | `P_dec - S0` between the setup's `R_min(0.8)` and `2.5 * ATR_k` |
+| `RR_late` | `T1 - P_dec >= 1.0 * (P_dec - S0)` |
+| Thesis | `P_dec > l + b_k` |
+
+The control measures how much of any research result the cycle would destroy, and so tests this verdict. If `CYCLE`
+results turned out close to `IDEAL-1M`, this section should be revisited by a new document version, which counts as new
+trials under [C18](00_INDEX.md#c18-selection-purge-and-retirement), and not by running S01 live on the strength of that
+one control.

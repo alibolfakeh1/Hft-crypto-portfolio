@@ -1,8 +1,8 @@
 # S07 Anchored VWAP pullback
 
-Status: draft for leak audit. Not tested. **Tier `T1`**: true VWAP needs trades. Default `T_d` 1h. Long and short.
-Live-eligible at 1h, see section 14.
-Common rules C1 to C17 are in [00_INDEX.md](00_INDEX.md#5-common-conventions) and apply throughout.
+Status: revised after the leak audit of 2026-11-04, awaiting re-audit. Not tested. **Tier `T1`**: true VWAP needs trades.
+Default `T_d` 1h. Long and short. Live-eligible at 1h, see section 14.
+Common rules C1 to C18 are in [00_INDEX.md](00_INDEX.md#5-common-conventions) and apply throughout.
 
 ## 1. Idea and mechanism
 
@@ -41,8 +41,11 @@ charts suggest.
 
 **Anchors.**
 
-- **Major list:** `Sigma(10, 5, 2.0)` on `T_d`. For a long, the anchor is the latest swing low in this list, while no close has
-  been below its price since the extreme, and its age is at most 21 days.
+- **Major list:** `Sigma(10, 5, 2.0)` on `T_d`. For a long, the anchor at `t_k` is the latest swing low in this list as of `t_k`,
+  while no close has been below its price since the extreme, and its age is at most 21 days. Lists are read as of a time, under
+  [C4](00_INDEX.md#c4-swing-pivots-and-registers), so a swing replaced later is still the anchor for every read before its `valid_to`.
+- **Entry anchor.** At entry, the anchor in use is frozen by id as `A0`. A later major swing replacing it in the list does not move
+  `A0`, its `sigma0`, the targets or the invalidation line.
 - **Minor list:** `Sigma(3, 3, 1.0)` on `T_d`. Used for the stop stack only, never for entries.
 - **Start of the sum.** With `T1`, the first trade in bar `i` at the swing's extreme price. In the `T0-APPROX` cross-check, the
   whole of bar `i`.
@@ -72,7 +75,7 @@ this anchor.
 | c | `L_k >= A_k - 0.50 * sigma_k` |
 | d | `C_k > A_k` |
 | e | `CLV_k >= 0.50` |
-| f | `A_k >= A_(k-6)`: the line is flat or rising |
+| f | `A_k >= A_(k-6)`: the line is flat or rising. This fails until 6 bars after `t_c`, since no earlier value exists |
 | g | `sigma_k >= 0.75 * ATR_k`: bands from a very young anchor are too narrow to mean anything |
 
 ## 4. Knowable times
@@ -80,7 +83,7 @@ this anchor.
 | Object | Knowable at |
 |---|---|
 | Swing anchor | Its confirmation close, `t_c`, which is `Rt` bars after the extreme |
-| `A_t`, `sigma_t` | Only from `t_c`, using trades already complete at `t`. The sum starts earlier but no value exists before `t_c` |
+| `A_t`, `sigma_t` | Only from `t_c`, using trades already complete at `t`. The sum starts earlier but no value exists before `t_c`. `IDEAL` is labelled zero allowance. In `IDEAL-1M` and `CYCLE`, the allowance `A` in [C17](00_INDEX.md#c17-hourly-live-cycle) applies before the value can be read |
 | Excursion flag | Each close at or after `t_c` |
 | Trigger, `S0`, targets | `t_k` |
 | Minor anchor in the stack | Its own confirmation close, effective next bar |
@@ -137,7 +140,9 @@ T1_b = max(A0_b + 1.5 * sigma0_b, fill + 1.0 * R)
 T2_b = max(A0_b + 3.0 * sigma0_b, fill + 2.0 * R)
 ```
 
-Neither may be set below `C_b + 0.25 * ATR_b`. At `t_k`, before a fill exists, `C_k` and `C_k - S0` stand in for `fill` and `R`.
+Neither may be set below `C_b + 0.25 * ATR_b`. At `t_k`, before a fill exists, `C_k` and `C_k - S0` stand in for `fill` and `R`, and the
+fill bar uses those setup targets, as C7 says. Under `.T`, the `fill + x * R` terms follow the
+[rule against a later fill raising a target](00_INDEX.md#c17-hourly-live-cycle).
 
 ### 7.4 Scale-out
 
@@ -186,9 +191,10 @@ readability every bar has `q = 300`, and the table gives each bar's VWAP.
 At the trigger close (12:00): the entry anchor has `N = 12,000`, `A = 63,800`, `sigma = 520`, and the excursion flag is set. Trigger bar:
 `O 64,050, H 64,120, L 63,760, C 64,010`.
 
-- `L` is at or below 63,930 and at or above 63,540. `CLV = 0.69`.
+- `L` is at or below 63,930 and at or above 63,540. `CLV = 0.69`. `t_c` is more than 6 bars back, so condition f can be read.
 - `cush = 260`. `S_struct = min(63,760, 63,540) - 95 = 63,445`. `R_min = max(380, 307.2)`. So `S0 = 63,445`.
-- Next open 64,015, so `fill = 64,021.4`, `R = 576.4`, `fill + 1R = 64,597.8`, `fill + 2R = 65,174.2`, `BE+ = 64,098.2`.
+- `R_dec = 565`. The collar is 64,200, and the next open of 64,015 is inside it.
+- So `fill = 64,021.4`, `R = 576.4`, `fill + 1R = 64,597.8`, `fill + 2R = 65,174.2`, `BE+ = 64,098.2`.
 
 One update in full, bar 1, with VWAP 64,090:
 `A = (12,000*63,800 + 300*64,090) / 12,300 = 63,807.07`. The running second moment gives `sigma = 515.56`.
@@ -211,7 +217,7 @@ One update in full, bar 1, with VWAP 64,090:
 | 13 | 01:00 | 65,020 | 65,040 | 64,700 | 64,760 | 64,850 | 63,998.87 | 589.86 | `A1 = 64,758.75` | 64,473.7 | | 65,768.4 |
 | 14 | 02:00 | 64,760 | 64,800 | 64,440 | 64,480 | | | | `L <= 64,473.7`: stop, 50% at 64,473.7 (`+0.78R`) | closed | | |
 
-Result before costs: `0.5 * 1.01 + 0.5 * 0.78 = 0.90R`. `R` stayed 576.4 throughout. This path was chosen to exercise the rules and does not
+Result before costs: `0.5 * 1.01 + 0.5 * 0.78 = 0.90R`. `Result_B = (0.5 * 581.7 + 0.5 * 452.3) / 565 = 0.92`. `R` stayed 576.4 throughout. This path was chosen to exercise the rules and does not
 represent a typical outcome. On bar 9 the entry anchor would allow a stop near 63,554, and the younger anchor allows 64,247.5, which shows
 why the stack exists.
 
@@ -240,7 +246,7 @@ Total: 4 configurations at `T_d = 1h`. Everything else is frozen.
 | Ranges | Should fail, since the line becomes a midpoint | Many invalidations, with `A` slope near zero |
 | V-shaped moves | Few trades, as the excursion needs a confirmed anchor | Count of triggers per anchor |
 | High-volume shocks | The line jumps, and stops ride up fast | Compare stop exits on days with `VR` above 2 |
-| Any regime | Should beat the [placebo](00_INDEX.md#c15-placebo-control) | The same rules with `A` replaced by an unweighted average price from the same anchor. A difference here is what shows volume weighting matters |
+| Any regime | Should beat the [placebo](00_INDEX.md#c15-placebo-control) | The placebo is a random anchor. An anchor bar is drawn uniformly over the block's bars, independently of price, and becomes usable `Rt` bars later, the same lag as a real swing. Its side is random, at the block's real long and short share, and the same rules run from it. A named extra, `AVERAGE-PRICE`, keeps the real anchor and replaces `A` with an unweighted average price from it. A difference from that extra is what shows volume weighting matters. It does not test the anchor |
 
 ## 11. Flow hooks
 
@@ -298,7 +304,7 @@ the example in 7.12, with `A = 63,800`, `sigma = 520`, `C_k = 64,010`, `S0 = 63,
 
 - Touches between runs are resolved from 1m bars at the next run, with `event_time` and `detection_time` recorded. Inside one 1m bar, the stop is first.
 - `A`, `sigma` and the stack are computed for each processed `T_d` close, using only trades at or before that close and not all trades up to the
-  run. The result is then the same whether the run was on time or late. New stops and targets act from `t_dec + latency`.
+  run. The result is then the same whether the run was on time or late. New stops and targets act from `effective_from`.
 - A band target between runs stays at the last value set, however far the true band has moved. It does not float between runs.
 - Two closes below `A0` are read at the run that processes the second. The exit fills after that run.
 - If any trades in the span are missing, the run logs `DATA_GAP` for this symbol, and does not compute a partial VWAP. Touches are still resolved from

@@ -1,7 +1,8 @@
 # S09 UTC session range breakout
 
-Status: draft for leak audit. Not tested. Tier `T0`. Default `T_d` 1h. Long and short. Live-eligible at 1h, see section 14.
-Common rules C1 to C17 are in [00_INDEX.md](00_INDEX.md#5-common-conventions) and apply throughout.
+Status: revised after the leak audit of 2026-11-04, awaiting re-audit. Not tested. Tier `T0`. Default `T_d` 1h. Long and short.
+Live-eligible at 1h, see section 14.
+Common rules C1 to C18 are in [00_INDEX.md](00_INDEX.md#5-common-conventions) and apply throughout.
 
 ## 1. Idea and mechanism
 
@@ -33,7 +34,7 @@ something, and never as a directional signal. Whether it adds anything is unknow
 
 ## 3. Definitions
 
-**Seasonal profile: the only fitted object in this folder.** At the start of each walk-forward block, on the prior 90 days of weekday data for that symbol and venue:
+**Seasonal profile: an estimated object under [C12](00_INDEX.md#c12-indicators-and-frozen-values).** At each date of the estimation calendar in C12, which is declared there before any run, on the prior 90 days of weekday data for that symbol and venue:
 
 ```text
 m_h     = mean log(volume in UTC hour h), for h = 0, ..., 23
@@ -43,8 +44,9 @@ h_peak  = hour with the highest m_h in the 8 hours from h_end
 T_flat  = h_end + 11
 ```
 
-These are frozen for the block, per timing contract item 10. Hours are written as clock times, so `h_peak = 16:00` means the bar closing at 16:00 starts that schedule step. My expectation from Hansen et al.
-is `h_s` near 04:00 and `h_peak` near 16:00, and the example uses those with `W = 8`. Nothing in the rule depends on that expectation.
+These are frozen until the next calendar date, per timing contract item 10. **Across a refit:** a range uses the profile in force at its `h_s`, and a position keeps the schedule it entered with, so a refit never changes a
+range in progress or an open trade. Hours are read by a bar's open time: hour `h` and the window `[h_s, h_end)` mean the bars that open in them, and `h_end` is the close of the last range bar. `h_peak` is written as a clock time, so
+`h_peak = 16:00` means the bar closing at 16:00 starts that schedule step. My expectation from Hansen et al. is `h_s` near 04:00 and `h_peak` near 16:00, and the example uses those with `W = 8`. Nothing in the rule depends on that expectation.
 
 **Daily range.** From the `T_d` bars in the window `[h_s, h_end)` on one day:
 
@@ -64,7 +66,7 @@ RH = max(H)    RL = min(L)    RW = RH - RL    RM = (RH + RL) / 2
 
 | Object | Knowable at |
 |---|---|
-| Profile, `h_s`, `h_peak`, `T_flat` | Frozen at the block start, from data before the block |
+| Profile, `h_s`, `h_peak`, `T_flat` | Frozen at each calendar date, from data before that date |
 | `RH`, `RL`, `RW`, `CR` | The close of the last bar in the range window, which is `h_end` |
 | `ATRD` | The last completed UTC day before `h_end` |
 | Break, `S0`, targets | `t_k` |
@@ -151,7 +153,7 @@ T2 = max(RH + 2.0 * RW, C_k + 2.50 * D)
 ### 7.7 Time stop
 
 - At the close of `n = 4`, if `C_b < fill + 0.5 * R`, exit at the next open.
-- **Hard flat.** At the close of the bar ending `T_flat` (23:00 in the example), exit at the next open. This is about an hour before the 00:00 UTC funding settlement on venues with that schedule.
+- **Hard flat.** At the close of the bar ending `T_flat` (23:00 in the example), exit at the next open. With the example's profile, this is about an hour before a 00:00 UTC funding settlement on venues with that schedule. Another profile or venue may not have that margin.
 
 ### 7.8 Invalidation
 
@@ -179,7 +181,8 @@ Invented numbers, for checking arithmetic only. BTC, `T_d = 1h`, `ATR = 260`, `V
 - Break bar closes 14:00: `O 67,360, H 67,620, L 67,330, C 67,590`. Above 67,506, `SRV = 1.6`, body is 79 percent of range.
 - `S_struct = 67,230 - 65 = 67,165`. `R_min = max(260, 324.4)`. `D = 425`. So `S0 = 67,165`.
 - `T1 = max(67,980, 68,121.25) = 68,121.2`. `T2 = max(68,480, 68,652.5) = 68,652.5`.
-- Next open 67,595, so `fill = 67,601.8`, `R = 436.8`, `fill + 1R = 68,038.6`, `BE+ = 67,682.9`.
+- `R_dec = 425`. The collar is 67,720, and the next open of 67,595 is inside it.
+- So `fill = 67,601.8`, `R = 436.8`, `fill + 1R = 68,038.6`, `BE+ = 67,682.9`.
 
 | `n` | Close | O | H | L | C | Event at this close | Stop after close | Next target |
 |---|---|---|---|---|---|---|---|---|
@@ -193,7 +196,7 @@ Invented numbers, for checking arithmetic only. BTC, `T_d = 1h`, `ATR = 260`, `V
 | 8 | 22:00 | 68,330 | 68,360 | 68,160 | 68,200 | No new high | 68,135.0 | `T2` 68,680 |
 | 9 | 23:00 | 68,200 | 68,250 | 68,090 | 68,120 | `L <= 68,135`: stop, 50% at 68,135 (`+1.22R`) | closed | |
 
-Result before costs: `0.5 * 1.19 + 0.5 * 1.22 = 1.21R`. `R` stayed 436.8 throughout. This path was chosen to exercise the rules and does not represent a typical outcome. Had this position not been stopped at bar 9, the hard flat at the
+Result before costs: `0.5 * 1.19 + 0.5 * 1.22 = 1.21R`. `Result_B = (0.5 * 519.4 + 0.5 * 533.2) / 425 = 1.24`. `R` stayed 436.8 throughout. This path was chosen to exercise the rules and does not represent a typical outcome. Had this position not been stopped at bar 9, the hard flat at the
 23:00 close would have closed it at the next open.
 
 ## 8. Parameters
@@ -218,7 +221,7 @@ Total: 4 configurations at `T_d = 1h`. Everything else is frozen. I dropped a 15
 | Weekdays with a macro catalyst in US hours | Should work best | Result by date, reviewed after the fact, with no calendar filter used |
 | Slow range markets | Should fail with false breaks | Many volume-check tightenings and invalidations |
 | Seasonal pattern changes | Should weaken | Compare how `h_s` and `h_peak` move between blocks, and how `SRV` at breaks behaves |
-| Any regime | Should beat its [placebo](00_INDEX.md#c15-placebo-control) | The same rule with a range window at a random hour. If the quiet window adds nothing, the seasonal idea has failed |
+| Any regime | Should beat its [placebo](00_INDEX.md#c15-placebo-control) | The same rule with the window moved by a random whole number of hours, and `h_end`, `h_peak` and `T_flat` moved with it, so that every schedule step stays defined. If the quiet window adds nothing, the seasonal idea has failed |
 
 ## 11. Flow hooks
 
@@ -233,7 +236,8 @@ Questions for `feature-integrator`. Trades are available to live runs, so trade-
 
 | Trap | Concrete failure | Guard |
 |---|---|---|
-| Seasonal profile on the full sample | Using 2024 volumes to choose `h_s` for 2022 | Fitted before each block, on prior data, and frozen |
+| Seasonal profile on the full sample | Using 2024 volumes to choose `h_s` for 2022 | Fitted before each calendar date, on prior data, and frozen |
+| Calendar chosen after results | Moving refits from quarterly to half-yearly once `V0` results show which works better | The calendar is declared in C12 before any run, and a change is a counted trial |
 | `SRV` with future slots | Median across weeks after the bar | Previous 8 weeks only |
 | Range known before its end | Trading a break at 11:00 of a range that ends at 12:00 | `RH` and `RL` are knowable only at `h_end`, and no earlier |
 | Choosing the first side with hindsight | Picking whichever side worked | The first qualifying close, in time order |
@@ -261,7 +265,7 @@ gross results there were about the size of the costs. Stop slippage during the v
 | Risk | `P_dec - S0` between the setup's `R_min(1.0)` and `3.0 * ATR_k` |
 | `RR_late` | `T1 - P_dec >= 0.75 * (P_dec - S0)` |
 | Thesis | `P_dec > RH`: price must still be outside the range |
-| Clock | `t_dec` must be at least 2 hours before `T_flat`. A setup found later than that is void |
+| Clock | `t_cut` must be at least 2 hours before `T_flat`. A setup found later than that is void |
 
 Using the example in 7.12, with `C_k = 67,590`, `S0 = 67,165`, `T1 = 68,121.2`, `ATR = 260`:
 
@@ -271,12 +275,12 @@ Using the example in 7.12, with `C_k = 67,590`, `S0 = 67,165`, `T1 = 68,121.2`, 
 **Stops and targets between runs.**
 
 - Touches between runs are resolved from 1m bars at the next run, with `event_time` and `detection_time` recorded. Inside one 1m bar, the stop is first.
-- The session clock uses `t_b`, the bar close time, and not the run's start. A late run therefore computes the same `k`, and the same recomputed `T2`, as an on-time run would have. They then act from `t_dec + latency`.
+- The session clock uses `t_b`, the bar close time, and not the run's start. A late run therefore computes the same `k`, and the same recomputed `T2`, as an on-time run would have. They then act from `effective_from`.
 - `n = 2` and `n = 4` checks are based on `T_d` closes, whatever time the run processes them.
 - **Hard flat under the cycle.** The decision belongs to the first run that processes the `T_flat` close. Normally that is minutes after 23:00, and the fill comes well before 00:00. If that run is dropped, the next run exits, after 00:00, and funding at 00:00 is charged at its actual time. Nothing hides this: the
   exit shows `lateness` and funding shows separately.
 - Stops only tighten: the `P_dec` clamp in C17 can reduce a candidate, and the ratchet then keeps the old stop.
-- The frozen profile for live comes from the same block calendar as research. A profile refresh is a logged event, and only applies from the block start.
+- The frozen profile for live comes from the same calendar as research, in C12. A profile refresh is a logged event, and applies only to ranges that start after it. An open position keeps the schedule it entered with.
 
-**Backtest reproduction.** `CYCLE` under [C17](00_INDEX.md#c17-hourly-live-cycle), with `C-LATE` for selection. It must use the same block calendar for the profile, and a dropped run around `T_flat` must carry the position past funding, exactly as live would. Report the share of hard-flat
+**Backtest reproduction.** `CYCLE` under [C17](00_INDEX.md#c17-hourly-live-cycle), with `C-LATE` for selection. It must use the same calendar for the profile, and a dropped run around `T_flat` must carry the position past funding, exactly as live would. Report the share of hard-flat
 exits that were late, and the funding they paid. Report `STALE_SETUP` by reason.

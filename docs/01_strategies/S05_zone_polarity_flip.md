@@ -1,8 +1,8 @@
 # S05 Zone polarity flip
 
-Status: draft for leak audit. Not tested. Tier `T0`. Default `T_d` 1h. Long and short. Live-eligible at 1h and
-4h, see section 14.
-Common rules C1 to C17 are in [00_INDEX.md](00_INDEX.md#5-common-conventions) and apply throughout.
+Status: revised after the leak audit of 2026-11-04, awaiting re-audit. Not tested. Tier `T0`. Default `T_d` 1h. Long and
+short. Live-eligible at 1h and 4h, see section 14.
+Common rules C1 to C18 are in [00_INDEX.md](00_INDEX.md#5-common-conventions) and apply throughout.
 
 ## 1. Idea and mechanism
 
@@ -14,7 +14,8 @@ about break-even. That buying is the reason a broken supply zone may act as supp
 expecting the old zone to hold.
 
 **Why this is not S02.** S02 trades a formula level, where nobody is known to hold a position. S05 requires a zone where
-trading demonstrably took place and then failed. If both look the same in the results, this one should be retired.
+trading demonstrably took place and then failed. If both look the same in the results, this one is the first candidate
+to retire, decided and logged under [C18](00_INDEX.md#c18-selection-purge-and-retirement).
 
 **How much of this is folklore.** The "role reversal" idea is ancient chart lore. The nearest research concerns
 reference prices: holding on to losers and reacting to one's cost basis. It does not show covering at break-even at a
@@ -66,6 +67,8 @@ X      = highest high from k_b until the retest, updated at each close
 may occur on that bar or on the next 2 bars.
 
 **Flip death.** Any close below `bottom - 0.25 * ATR`, any close below `mid` during the retest, or the end of the window.
+This is logged as `dead_at`. Flips are a register under [C4](00_INDEX.md#c4-swing-pivots-and-registers), read as of a time, and a
+dead flip stays in it.
 
 **Stage A and Stage B.** A trade is in Stage A from entry until `T1` fills or `C_b > X`, whichever comes first, and in Stage B
 after that.
@@ -176,6 +179,9 @@ One third at `T1`, the rest at `T2`.
 - Stage A: `C_b < mid`, exit at the next open. Trapped covering has not held the zone.
 - Stage B: `C_b < top - 0.25 * ATR_b`, exit at the next open. The zone was re-entered after the flip had been confirmed.
 
+The stage used at a close is the stage as of that close. Stage B invalidation therefore applies only from the first close
+at or after Stage B began.
+
 ### 7.9 Same-bar conflicts
 
 [C7](00_INDEX.md#c7-exit-engine) applies. If a bar could hit both the stop and `T1`, the stop is taken and Stage B does not
@@ -204,7 +210,8 @@ Invented numbers, for checking arithmetic only. `T_d = 1h`, BTC. `ATR = 280`, `V
 - Trigger bar closes 20:00: `O 66,480, H 66,510, L 66,300, C 66,440`. `L` is at or below `top`, `C > top`, `CLV = 0.67`.
 - `S0 = 66,100 - 70 = 66,030`. `C - S0 = 410`. `R_min = max(210, 318.9)`, so the structure stop stands.
 - `T1 = X = 66,900`. `L_r = 66,300`, so `T2 = 67,500`.
-- Next open 66,445, so `fill = 66,451.6`, `R = 421.6`, `BE+ = 66,531.3`.
+- `R_dec = 410`. The collar is 66,580, and the next open of 66,445 is inside it.
+- So `fill = 66,451.6`, `R = 421.6`, `BE+ = 66,531.3`.
 
 | `n` | Close | O | H | L | C | Event at this close | Stop after close | Next target |
 |---|---|---|---|---|---|---|---|---|
@@ -222,7 +229,8 @@ Invented numbers, for checking arithmetic only. `T_d = 1h`, BTC. `ATR = 280`, `V
 | 12 | 08:00 | 67,060 | 67,240 | 67,040 | 67,210 | | 66,710.0 | `T2` 67,340 |
 | 13 | 09:00 | 67,210 | 67,390 | 67,180 | 67,360 | `H > T2`: two thirds out at 67,340 (`+2.11R`) | closed | |
 
-Result before costs: `(1/3) * 1.06 + (2/3) * 2.11 = 1.76R`. `R` stayed 421.6 throughout. This path was chosen to exercise the
+Result before costs: `(1/3) * 1.06 + (2/3) * 2.11 = 1.76R`. `Result_B = ((1/3) * 448.4 + (2/3) * 888.4) / 410 = 1.81`. `R` stayed
+421.6 throughout. This path was chosen to exercise the
 rules and does not represent a typical outcome. Had bar 2 closed at 66,200, below `mid`, the position would have exited at
 the next open, at about `-0.6R`, without waiting for the stop at 66,030.
 
@@ -250,8 +258,8 @@ a weak zone can still trap someone. It is not a search dimension.
 | Trend resuming after a pause | Should work best | Result by whether the UTC day extended in the trade's direction, measured afterwards |
 | Ranges | Should fail: the break was noise | Many Stage A invalidations |
 | Liquidation-driven breaks | Excluded by the 4-`ATR` rule | Counterfactual of excluded flips |
-| Any regime | Should differ from S02 | Trade-level correlation with S02 at G4. If high, retire this one |
-| Any regime | Should beat [random levels](00_INDEX.md#c15-placebo-control) | A flip built from a random band of the same width |
+| Any regime | Should differ from S02 | Trade-level correlation with S02 at G4. If high, this is the first candidate to retire, under [C18](00_INDEX.md#c18-selection-purge-and-retirement) |
+| Any regime | Should beat [random levels](00_INDEX.md#c15-placebo-control) | A flip built from a random band of the same width, drawn at the break's knowable time, with `X` and the targets from the placebo path |
 
 ## 11. Flow hooks
 
@@ -308,10 +316,13 @@ Using the example in 7.12, with `C_k = 66,440`, `S0 = 66,030`, `X = T1 = 66,900`
 
 - Touches between runs are resolved from 1m bars at the next run, with `event_time` and `detection_time` recorded. Inside one
   1m bar, the stop is first.
-- A `T1` fill between runs starts Stage B at its `event_time` for the record. Its stop rules are computed at the next processed
-  `T_d` close and act from `t_dec + latency`, so the position may carry the Stage A stop for up to about two hours after `T1`.
+- **Position state is as of each close.** A `T1` fill between runs starts Stage B at its `event_time`. A close before that time is
+  evaluated in Stage A, with `T1` unfilled, even if the run that processes it has already walked the fill. So a time stop due at the
+  `n = 18` close still fires when `T1` fills after that close and before the run. The fill stands, and the exit applies to the
+  quantity that remains. Stage B's rules first apply at the first close at or after the fill, and they act from `effective_from`, so
+  the position may carry the Stage A stop for up to about two hours after `T1`.
 - Swing confirmations, the inventory clock at `n = 9` and the `T2` re-base are computed at processed closes, in time order.
-- Invalidation exits fill after the run that saw them.
+- Invalidation exits fill after the run that saw them, using the stage as of the close that fired them.
 - Stops only tighten: the `P_dec` clamp in C17 can reduce a candidate, and the ratchet then keeps the old stop.
 
 **Backtest reproduction.** `CYCLE` under [C17](00_INDEX.md#c17-hourly-live-cycle), with `C-LATE` for selection, and the flip register

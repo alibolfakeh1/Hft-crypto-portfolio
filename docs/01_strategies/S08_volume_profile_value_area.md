@@ -1,8 +1,8 @@
 # S08 Volume profile value area
 
-Status: draft for leak audit. Not tested. **Tier `T1`**: profiles need trades. Default `T_d` 1h. Long and short. Live-eligible at
-1h only, and 30m is backtest only, see section 14.
-Common rules C1 to C17 are in [00_INDEX.md](00_INDEX.md#5-common-conventions) and apply throughout.
+Status: revised after the leak audit of 2026-11-04, awaiting re-audit. Not tested. **Tier `T1`**: profiles need trades. Default `T_d` 1h.
+Long and short. Live-eligible at 1h only, and 30m is backtest only, see section 14.
+Common rules C1 to C18 are in [00_INDEX.md](00_INDEX.md#5-common-conventions) and apply throughout.
 
 ## 1. Idea and mechanism
 
@@ -53,7 +53,9 @@ are usable only if at least 6 hours of the UTC day have passed.
 
 **Band.** `b_k = 0.10 * ATR_k`.
 
-**Excursion state machine,** for the side below `VAL`. It resets at each UTC roll, and the mirror runs for `VAH`.
+**Excursion state machine,** for the side below `VAL`. It resets at each UTC roll, and the mirror runs for `VAH`. Each bar is evaluated
+against the profile in force at its open, under [C2](00_INDEX.md#c2-bars-and-calendar), so the bar that closes at the roll still uses the old
+profile, and the new one first acts on the bar that opens at the roll.
 
 ```text
 INSIDE:
@@ -98,7 +100,7 @@ An excursion gives at most one trade. Once `ACCEPTED`, it cannot produce a rejec
 
 | Object | Knowable at |
 |---|---|
-| `POC`, `VAH`, `VAL`, `VAW` | 00:00 UTC, at the end of the completed day, plus the data-availability allowance for trades |
+| `POC`, `VAH`, `VAL`, `VAW` | 00:00 UTC, at the end of the completed day. `IDEAL` is labelled zero allowance, so it uses them from the bar opening at the roll. In `IDEAL-1M` and `CYCLE`, the allowance `A` applies, so an update from them acts from `effective_from` |
 | `dPOC`, `dVAH`, `dVAL` | Each bar close, using trades up to that close, from 06:00 UTC onward |
 | Excursion, acceptance, triggers | The close that completes them |
 | `SRV` | Each close, from the previous 8 weeks only |
@@ -219,7 +221,8 @@ Invented numbers, for checking arithmetic only. BTC, `T_d = 1h`, `ATR = 350`, `V
 - Closes at 05:00 (66,560) and 06:00 (66,610) are both at or above 66,535. Trigger at 06:00, with `k - start = 3`, within `M = 4`. Depth 320 is within 525.
 - `S_struct = 66,180 - 87.5 = 66,092.5`. `R_min = max(262.5, 319.7)`, so the structure stop stands, and `C - S0 = 517.5`.
 - `T1 = POC = 67,200`, 590 away, against 388 required. `T2 = VAH = 67,900`.
-- Next open 66,615, so `fill = 66,621.7`, `R = 529.2`, `fill + 1R = 67,150.9`, `BE+ = 66,701.6`.
+- `R_dec = 517.5`. The collar is 66,785, and the next open of 66,615 is inside it.
+- So `fill = 66,621.7`, `R = 529.2`, `fill + 1R = 67,150.9`, `BE+ = 66,701.6`.
 
 Developing `dVAL` values are invented for the example, as they would come from trades.
 
@@ -237,7 +240,7 @@ Developing `dVAL` values are invented for the example, as they would come from t
 | 10 | 16:00 | 67,290 | 67,340 | 67,120 | 67,170 | 67,060 | Migration. `q = 5` | 66,972.5 | 67,608.3 |
 | 11 | 17:00 | 67,170 | 67,220 | 66,940 | 66,990 | | `L <= 66,972.5`: stop, 50% at 66,972.5 (`+0.66R`) | closed | |
 
-Result before costs: `0.5 * 1.09 + 0.5 * 0.66 = 0.88R`. `R` stayed 529.2 throughout. This path was chosen to exercise the rules and does not represent a typical outcome.
+Result before costs: `0.5 * 1.09 + 0.5 * 0.66 = 0.88R`. `Result_B = (0.5 * 578.3 + 0.5 * 350.8) / 517.5 = 0.90`. `R` stayed 529.2 throughout. This path was chosen to exercise the rules and does not represent a typical outcome.
 
 **Acceptance branch, in brief.** Same prior day. Three closes above `VAH + b` with mean `SRV` of 1.2, then a pullback bar with `L = 67,880`, `C = 67,990`. `S_struct = min(67,880, 67,900) - 87.5 = 67,792.5`, only
 197.5 away. `R_min = max(262.5, 326.4)`, so the floor binds: `S0 = 67,663.6`. `T1 = 67,900 + 700 = 68,600`, `T2 = 69,300`. A close below 67,865 before `T1` exits at the next open.
@@ -250,6 +253,8 @@ Result before costs: `0.5 * 1.09 + 0.5 * 0.66 = 0.88R`. `R` stayed 529.2 through
 | Profile | 1 completed UTC day, composite of 3 days | A single day is the classic. A composite may be steadier |
 
 Each configuration has two branches, reported separately: rejection and acceptance. Total: 8 trials. All stop, target and state machine constants are frozen.
+
+**Selection.** For the live candidate, selection is only among the 1h configurations, under `C-LATE`. 30m can never run under `CYCLE`, so it is a labelled comparison report. It cannot be selected, and its runs still count as trials, under [C18](00_INDEX.md#c18-selection-purge-and-retirement).
 
 ## 9. BTC and ETH notes
 
@@ -264,7 +269,7 @@ Each configuration has two branches, reported separately: rejection and acceptan
 | Balanced days following balanced days | Rejection should do best | Result by prior-day range and by whether the current day overlaps value |
 | Trend days and strong migration | Acceptance should do best, rejection should fail | Results by branch and day type measured afterwards |
 | Thin weekends | Profiles are based on less volume, and may be less meaningful | Result by day of week of the profile |
-| Both branches losing together | The classifier adds nothing | Compare each branch with its [placebo](00_INDEX.md#c15-placebo-control), using a random band of the same width |
+| Both branches losing together | The classifier adds nothing | Compare each branch with its [placebo](00_INDEX.md#c15-placebo-control): a random band of the same width in `ATR` units, drawn at the profile's knowable time, with a placebo `POC` at the real position inside the band, so that no real level stays in the targets |
 
 ## 11. Flow hooks
 
@@ -305,7 +310,7 @@ hours, so 1h can work, though it enters later than the classic rule. Live runs s
 | Check | Value for a long, short mirrored |
 |---|---|
 | `A_max` | 75 minutes after the trigger close |
-| Roll | If a UTC roll lies between `t_k` and `t_dec`, the setup is void: its reference profile has been replaced |
+| Roll | If a UTC roll lies between `t_k` and `t_cut`, the setup is void: its reference profile has been replaced |
 | Path | `S0` or `T1` touched since `t_k`, or a `T_d` close that fires the branch's invalidation, voids the setup |
 | Chase | `abs(P_dec - C_k) <= 0.75 * ATR_k` |
 | Risk | `P_dec - S0` between the setup's `R_min(0.75)` and `2.5 * ATR_k` |
@@ -320,11 +325,11 @@ Using the example in 7.12, with `C_k = 66,610`, `S0 = 66,092.5`, `T1 = 67,200`, 
 **Stops and targets between runs.**
 
 - Touches between runs are resolved from 1m bars at the next run, with `event_time` and `detection_time` recorded. Inside one 1m bar, the stop is first.
-- `dVAL`, `dVAH` and `dPOC` are computed for each processed 1h close, from trades at or before that close and not from trades up to the run. Late runs therefore produce the same values, and they act from `t_dec + latency`.
+- `dVAL`, `dVAH` and `dPOC` are computed for each processed 1h close, from trades at or before that close and not from trades up to the run. Late runs therefore produce the same values, and they act from `effective_from`.
 - `q` counts `T_d` closes since the `T1` fill, so the decay in 7.3 does not depend on when runs happen.
 - The prior profile changes when a run first processes the 00:00 close. A late or dropped run around 00:00 delays the roll updates only.
 - If any trades in the span are missing, the run logs `DATA_GAP` for this symbol and computes no partial profile. Touches are still resolved if 1m bars are complete.
 - Stops only tighten: the `P_dec` clamp in C17 can reduce a candidate, and the ratchet then keeps the old stop.
 
-**Backtest reproduction.** `CYCLE` under [C17](00_INDEX.md#c17-hourly-live-cycle) at 1h, with `C-LATE` for selection, with profiles rebuilt the same way as live and trades cut off at the simulated run. Report the branches separately, and also report the
-30m `IDEAL` result beside the 1h `CYCLE` result, labelled, as a direct measure of the classical rule against what can actually run.
+**Backtest reproduction.** `CYCLE` under [C17](00_INDEX.md#c17-hourly-live-cycle) at 1h, with `C-LATE` for selection among 1h configurations only, with profiles rebuilt the same way as live and trades cut off at `t_cut`. Report the branches separately, and also show the
+30m `IDEAL` and `IDEAL-1M` results beside the 1h `CYCLE` result, labelled, as a comparison of the classical rule with what can actually run. That comparison is never a selection.
