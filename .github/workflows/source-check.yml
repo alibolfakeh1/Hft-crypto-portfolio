@@ -1,12 +1,11 @@
 name: Source check
 
-# Reports which public market data sources GitHub-hosted runners can reach.
-# It stores nothing and needs no secrets.
+# Reports whether GitHub-hosted runners can reach a few public, non-dataset endpoints. It stores nothing and needs no
+# secrets. It runs only when started by hand, and it no longer touches any data archive: decision D-17 rules Binance
+# out, and no source is approved yet, so this must not access a dataset host. Add a probe here only for a source that
+# has been approved.
 
 on:
-  push:
-    branches: ["pipeline/**"]
-    paths: [".github/workflows/source-check.yml"]
   workflow_dispatch:
 
 permissions:
@@ -14,39 +13,19 @@ permissions:
 
 jobs:
   probe:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Probe sources
         run: |
-          D=$(date -u -d '2 days ago' +%F)
-          M=$(date -u -d "$(date -u +%Y-%m-01) -1 day" +%Y-%m)
-          B=https://data.binance.vision/data/futures/um
           {
-            echo "### Source check for $D"
+            echo "### Source check"
             echo
             echo "| Source | HTTP status | Size in bytes |"
             echo "|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
-          head_probe() {
-            out=$(curl -sIL -m 30 -A 'Mozilla/5.0' -o /dev/null -w '%{http_code} | %header{content-length}' "$2" || echo 'failed |')
-            echo "| $1 | $out |" >> "$GITHUB_STEP_SUMMARY"
-          }
           get_probe() {
             out=$(curl -sL -m 30 -A 'Mozilla/5.0' -o /dev/null -w '%{http_code} | %{size_download}' "$2" || echo 'failed |')
             echo "| $1 | $out |" >> "$GITHUB_STEP_SUMMARY"
           }
-          get_probe  "Binance archive, BTC 1m candles" "$B/daily/klines/BTCUSDT/1m/BTCUSDT-1m-$D.zip"
-          head_probe "Binance archive, BTC aggTrades"  "$B/daily/aggTrades/BTCUSDT/BTCUSDT-aggTrades-$D.zip"
-          head_probe "Binance archive, BTC bookDepth"  "$B/daily/bookDepth/BTCUSDT/BTCUSDT-bookDepth-$D.zip"
-          head_probe "Binance archive, BTC funding"    "$B/monthly/fundingRate/BTCUSDT/BTCUSDT-fundingRate-$M.zip"
-          head_probe "Bybit archive, BTC trades"       "https://public.bybit.com/trading/BTCUSDT/BTCUSDT$D.csv.gz"
-          head_probe "Bybit archive, BTC ob200"        "https://quote-saver.bycsi.com/orderbook/linear/BTCUSDT/${D}_BTCUSDT_ob200.data.zip"
-          get_probe  "Binance REST"                    "https://fapi.binance.com/fapi/v1/time"
-          get_probe  "Bybit REST"                      "https://api.bybit.com/v5/market/time"
-          get_probe  "OKX REST"                        "https://www.okx.com/api/v5/public/time"
-          get_probe  "Gate REST"                       "https://api.gateio.ws/api/v4/spot/time"
-          get_probe  "Coinbase REST"                   "https://api.coinbase.com/api/v3/brokerage/market/products/BTC-USD/ticker?limit=1"
-          get_probe  "Kraken REST"                     "https://api.kraken.com/0/public/Time"
-          get_probe  "Bitstamp REST"                   "https://www.bitstamp.net/api/v2/ticker/btcusd/"
           get_probe  "Telegram API"                    "https://api.telegram.org/"

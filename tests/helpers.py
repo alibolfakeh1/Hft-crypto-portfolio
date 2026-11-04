@@ -57,8 +57,11 @@ def trades_frame(rows: Sequence[tuple[int, float, float, bool]], *, first_id: in
 
 def zip_bytes(name: str, text: str) -> bytes:
     buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(name, text)
+    with zipfile.ZipFile(buffer, "w") as archive:
+        # A fixed date, or two identical files would differ by when they were zipped.
+        info = zipfile.ZipInfo(name, date_time=(2000, 1, 1, 0, 0, 0))
+        info.compress_type = zipfile.ZIP_DEFLATED
+        archive.writestr(info, text)
     return buffer.getvalue()
 
 

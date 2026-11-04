@@ -201,9 +201,12 @@ class Catalog:
         self._db.execute("PRAGMA journal_mode=DELETE")
         self._db.execute("PRAGMA synchronous=FULL")
         self._db.execute("PRAGMA foreign_keys=ON")
-        with self._db:
-            self._db.executescript(_SCHEMA)
-            self._db.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
+        # Only when needed, because opening a catalog just to read it must leave the file untouched.
+        version = self._db.execute("PRAGMA user_version").fetchone()[0]
+        if version != _SCHEMA_VERSION:
+            with self._db:
+                self._db.executescript(_SCHEMA)
+                self._db.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
 
     def close(self) -> None:
         self._db.close()

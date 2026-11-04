@@ -334,6 +334,17 @@ def test_catalog_survives_reopening_and_is_one_file(tmp_path: Path) -> None:
     assert found.size_bytes == 10
 
 
+def test_opening_a_catalog_to_read_it_leaves_the_file_untouched(tmp_path: Path) -> None:
+    path = tmp_path / "catalog.sqlite"
+    with Catalog(path) as catalog:
+        catalog.register_file(record("a"))
+    before = path.read_bytes()
+    with Catalog(path) as catalog:
+        assert catalog.get_file("a") is not None
+        assert catalog.files() != []
+    assert path.read_bytes() == before
+
+
 def test_manifest_fields_of_the_lifecycle_document_are_stored(tmp_path: Path) -> None:
     with Catalog(tmp_path / "c.sqlite") as catalog:
         catalog.upsert_dataset(

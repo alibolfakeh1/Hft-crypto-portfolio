@@ -1,0 +1,131 @@
+name: Live poll
+
+# One short pass over closed trades since the last cursor, once an hour. See docs/08_DATA_CENTER.md section 5.
+# Target under 3 minutes. It is never a loop, serves nothing, and runs never overlap.
+#
+# Two switches keep it off until a source is approved:
+#   1. The repository variable LIVE_POLL_ENABLED must be "true", or the job does not start at all. An hourly job that
+#      could do nothing is a burden with no benefit, and GitHub's terms ask us to avoid that.
+#   2. The source must be enabled in configs/pipeline.toml, or the code contacts nothing and records why.
+#
+# Each run logs its scheduled time, actual start, data age and any gap, so the report can show how late GitHub
+# really is. It commits to the results branch only on a meaningful state change. The daily pipeline commits the rest.
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-poll
+  cancel-in-progress: false
+
+env:
+  DATA_QUOTA_GB: "1"
+
+jobs:
+  poll:
+    if: github.event_name == 'workflow_dispatch' || vars.LIVE_POLL_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    outputs:
+      changed: ${{ steps.poll.outputs.changed }}
+      cache_saved: ${{ steps.save.outcome }}
+    steps:
+      - name: Note the start, before anything can delay it
+        run: |
+          {
+            echo "JOB_STARTED_AT=$(date -u +%FT%TZ)"
+            echo "DATA_ROOT=$RUNNER_TEMP/live_root"
+            echo "BUNDLE_DIR=$RUNNER_TEMP/bundle"
+            echo "PREVIOUS_STATE=$RUNNER_TEMP/previous_state.json"
+          } >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: false
+      - name: Install
+        run: uv sync --frozen --no-dev --python 3.12
+      - name: Restore the poll state
+        id: restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.DATA_ROOT }}
+          key: live-poll-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: live-poll-v1-
+      - name: Read the last published state, to recognise a lost cache
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/contents/live_state.json?ref=results" \
+            -H "Accept: application/vnd.github.raw+json" > "$PREVIOUS_STATE" || rm -f "$PREVIOUS_STATE"
+      - name: Poll
+        id: poll
+        env:
+          SCHEDULE: ${{ github.event.schedule }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          uv run --frozen --no-dev hft-crypto poll \
+            --time-budget 120s \
+            --scheduled-cron "$SCHEDULE" \
+            --job-started-at "$JOB_STARTED_AT" \
+            --event "$EVENT" \
+            --previous-state "$PREVIOUS_STATE" \
+            --bundle-dir "$BUNDLE_DIR"
+      - name: Save the poll state
+        id: save
+        if: always() && steps.restore.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.DATA_ROOT }}
+          key: live-poll-v1-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Upload what changed
+        if: steps.poll.outputs.changed == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: poll-bundle
+          path: ${{ env.BUNDLE_DIR }}
+          retention-days: 7
+
+  publish:
+    # Runs no project code, because this is the only job here that can write to the repository.
+    needs: poll
+    if: needs.poll.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: poll-bundle
+          path: ${{ runner.temp }}/bundle
+      - name: Append to the results branch
+        # Copied first, because switching to the results branch removes it from the working tree.
+        run: |
+          cp .github/scripts/publish_results.sh "$RUNNER_TEMP/publish_results.sh"
+          bash "$RUNNER_TEMP/publish_results.sh" "$RUNNER_TEMP/bundle" "Live poll state change"
+
+  prune-cache:
+    needs: poll
+    if: always() && needs.poll.outputs.cache_saved == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      actions: write # to delete this repository's own superseded cache entries
+    steps:
+      - name: Keep only the newest copy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh cache list --repo "$GITHUB_REPOSITORY" --key live-poll-v1- --sort created_at --order desc \
+            --limit 100 --json id --jq '.[1:][].id' |
+            while read -r id; do gh cache delete "$id" --repo "$GITHUB_REPOSITORY"; done

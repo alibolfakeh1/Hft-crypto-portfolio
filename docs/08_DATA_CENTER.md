@@ -68,6 +68,9 @@ approved source.
   and prices differed by up to 0.2 USD. The cause seen in the samples is the minute boundary: a trade stamped a
   few milliseconds before a boundary can sit in the official bar after it. Official bars remain a
   reconciliation check, with these differences as the expected tolerance.
+  Later runs showed that identical daily totals do not hold on every day, because differences near midnight cancel only
+  across two days. So a daily difference must be explained by trades near midnight, or the check fails. This rule was
+  informed by looking at Binance files, so it must be checked again on the approved source (`D-18`).
 - **Bar boundary.** Our bars cover `(open_time, close_time]`, as the timing contract says.
 - **Official candles carry signed volume.** `taker_buy_volume` gives signed flow per bar with a long history at
   very small size.

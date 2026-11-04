@@ -16,6 +16,7 @@ Newest entries go at the bottom of each list. Entries are not rewritten. A chang
 | D-14 | 2026-11-04 | Live services run on an always-on server, not on GitHub Actions | Team | The 6-hour job limit, delayed scheduled runs, and GitHub's terms on using Actions as a service. **Replaced by D-15** |
 | D-15 | 2026-11-04 | Everything runs on GitHub itself. There is no server | Owner | Live positions run on an hourly cycle. No order-level recording and no live book. See section 5 of `docs/08_DATA_CENTER.md` for what this gives up |
 | D-17 | 2026-11-04 | The project may become commercial, so Binance Vision data is not used for project research or results | Owner | The Binance Vision Dataset Terms (2026-08-26) license the data under CC BY-NC-SA 4.0 for non-commercial use, and prohibit live proprietary trading and signal distribution for direct or indirect compensation. Every research source must allow possible commercial use, as far as its terms can be read. See `docs/03_DATA_SOURCES.md`. The research source is still to be chosen, and data downloads wait for that |
+| D-18 | 2026-11-04 | Binance data downloaded before `D-17` is not used in any result | Team | While building and checking the pipeline, before the pause took effect, runs downloaded about 953 MB from Binance Vision. Nothing derived from it is in the repository's outputs, fixtures or test values. The design of the daily reconciliation rule was informed by seeing those files, so that rule must be checked again on the approved source |
 
 ## Waiting for the owner
 

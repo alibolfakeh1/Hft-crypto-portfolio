@@ -274,6 +274,7 @@ def _zip(name: str, text: str) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         info = zipfile.ZipInfo(name, date_time=(2000, 1, 1, 0, 0, 0))
+        info.compress_type = zipfile.ZIP_DEFLATED
         archive.writestr(info, text)
     return buffer.getvalue()
 

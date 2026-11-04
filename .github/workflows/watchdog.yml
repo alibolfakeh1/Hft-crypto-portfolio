@@ -1,0 +1,57 @@
+name: Watchdog
+
+# Checks the age of the last result on the results branch, and alerts the owner through Telegram if it is stale.
+# It alerts only when the Telegram secrets are set. Without them, or before the branch exists, it writes a note to the
+# run summary and succeeds, so it stays harmless and quiet. It never fails the run, to avoid mail about itself.
+# It runs on the same platform as everything else, so a GitHub outage can silence it too.
+
+on:
+  schedule:
+    - cron: "41 7,19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: watchdog
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check the age of the last result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAX_AGE_HOURS: ${{ vars.WATCHDOG_MAX_AGE_HOURS || '48' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_OWNER_IDS: ${{ secrets.TELEGRAM_OWNER_IDS }}
+        run: |
+          note() { echo "$1" >> "$GITHUB_STEP_SUMMARY"; echo "$1"; }
+          generated_at=$(gh api "repos/$GITHUB_REPOSITORY/contents/status.json?ref=results" \
+            -H "Accept: application/vnd.github.raw+json" --jq '.generated_at' 2>/dev/null) || generated_at=""
+          if [ -z "$generated_at" ]; then
+            note "No result on the results branch yet, so there is nothing to check."
+            exit 0
+          fi
+          now=$(date -u +%s)
+          then_s=$(date -u -d "$generated_at" +%s)
+          age_hours=$(( (now - then_s) / 3600 ))
+          note "Last result: $generated_at, $age_hours hours ago. Limit: $MAX_AGE_HOURS hours."
+          if [ "$age_hours" -le "$MAX_AGE_HOURS" ]; then
+            exit 0
+          fi
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_OWNER_IDS" ]; then
+            note "The result is stale. The Telegram secrets are not set, so no alert was sent."
+            exit 0
+          fi
+          text="Watchdog: the last result on the results branch is $age_hours hours old (limit $MAX_AGE_HOURS). Repository: $GITHUB_REPOSITORY"
+          for chat in $(echo "$TELEGRAM_OWNER_IDS" | tr ',' ' '); do
+            curl --silent --show-error --max-time 30 --output /dev/null \
+              --data-urlencode "chat_id=$chat" --data-urlencode "text=$text" \
+              "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+              || note "A Telegram alert could not be sent."
+          done
+          note "The result is stale, and an alert was sent."
