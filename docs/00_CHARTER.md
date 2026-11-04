@@ -83,7 +83,9 @@ Every value has a **knowable time**, the earliest moment a live system could hav
     fitted only on past data and frozen before the block it is applied to. A fixed-window statistic recomputed at
     each step from data at or before that step (`ATR`, a rolling percentile rank) is a causal indicator with no
     fitted state, and needs no freezing. A threshold on such an indicator is still a fitted object.
-11. Parameters are selected on training folds only. Test blocks are never reused for selection.
+11. Parameters are selected on training folds only. Test blocks are never reused for selection. A training setup
+    is removed from selection when its maximum possible hold reaches the test block, using the maximum hold and not
+    the actual exit, so removal does not depend on the outcome.
 12. A stop or target update computed at time `t` applies from `t + latency`. An update computed on a
     bar close applies from the next bar, never to the bar that produced it.
 13. On the hourly live cycle, a decision is made at the time of the run, however much earlier its setup
@@ -177,7 +179,9 @@ Hard rules, for every strategy:
    never widen a stop, extend a time stop or extend a target.
 4. **Position size comes from the initial stop.** The fill is not yet known when size is sent, so size uses the
    distance from the decision price to the initial stop. `R` is the distance from the actual fill to the initial
-   stop, and it never changes afterwards, so trade results stay comparable in `R` multiples.
+   stop, and it never changes afterwards, so trade results stay comparable in `R` multiples. A fill close to the stop
+   makes `R` very small and can inflate a result in `R`. So gates, placebo comparisons and variant comparisons use
+   `Result_B`, money P&L divided by the risk budget, and reports may show `R` beside it.
 5. **Every update is a logged event,** with old and new values, the reason and the knowable time.
 6. **Inside a bar, the stop is applied first.** See items 8 and 12 of the
    [timing contract](#3-timing-contract).
