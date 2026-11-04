@@ -19,13 +19,16 @@ Once its raw data has been deleted, a `DERIVED` dataset can no longer be rebuilt
 
 | Dataset | Size | Status |
 |---|---|---|
-| Bybit linear `BTCUSDT` `ob200`, one day | About 204 MB, zipped | Measured from one file, 2026-10-28 |
-| Bybit spot `BTCUSDT` `ob200`, one day | About 57 MB, zipped | Measured from one file, 2026-10-28 |
-| Binance spot `BTCUSDT` trades, one day | About 19 MB, zipped | Measured from one file, 2026-10-28 |
-| Binance futures `BTCUSDT` `bookDepth`, one day | About 0.56 MB, zipped | Measured from one file, 2026-10-28 |
+| Bybit linear `BTCUSDT` `ob200`, one day | About 228 MB zipped, 1.33 GB uncompressed | Measured from one file, 2026-11-03 |
+| Bybit linear `ETHUSDT` `ob200`, one day | About 200 MB zipped | Measured from one file, 2026-11-03 |
+| Bybit linear `BTCUSDT` trades, one day | About 50 MB gzipped | Measured from one file, 2026-11-03 |
+| Binance futures `BTCUSDT` `aggTrades`, one day | About 12 MB zipped, 65 MB uncompressed | Measured from one file, 2026-11-03 |
+| Binance futures `BTCUSDT` `bookDepth`, one day | About 0.56 MB zipped | Measured from one file, 2026-11-03 |
+| Binance futures `BTCUSDT` 1-minute candles, one day | About 0.06 MB zipped | Measured from one file, 2026-11-03 |
 | Bitstamp `live_orders`, BTC and ETH | About 30 GB per day as raw JSON | **Estimate** from a one-minute rate of about 800 messages per second. Not yet measured over a day |
 
-Rates change with volatility. Budgets must be replaced by measured growth as soon as recording starts.
+Rates change with volatility. Budgets must be replaced by measured growth as soon as recording starts. See
+[the data center document](08_DATA_CENTER.md) for where each dataset lives.
 
 ## 3. Retention defaults
 

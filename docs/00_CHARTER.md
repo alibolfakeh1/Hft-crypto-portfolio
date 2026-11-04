@@ -89,8 +89,8 @@ data they require. A strategy's testable history is limited by the highest tier 
 
 | Source | Result |
 |---|---|
-| Bybit archive, `quote-saver.bycsi.com/orderbook/linear/BTCUSDT/2026-10-28_BTCUSDT_ob200.data.zip` | Exists, about 204 MB. Contents not yet opened. Bybit documents level 200 at 100 ms for linear contracts |
-| Binance archive, `data.binance.vision` | Spot trades exist, about 19 MB for 2026-10-28. Futures `bookDepth` exists, about 0.56 MB. Contents not yet opened |
+| Bybit archive, `quote-saver.bycsi.com/orderbook/linear/BTCUSDT/<date>_BTCUSDT_ob200.data.zip` | Opened and replayed for one day. See [the data center document](08_DATA_CENTER.md#4-rules-learned-from-the-first-real-data) |
+| Binance archive, `data.binance.vision` | Candles, `aggTrades`, `bookDepth` and funding opened for one day or month. Checksum verified on one file |
 | Bitstamp `live_orders` plus REST snapshot | Book rebuilt from events for 60 s with zero differences within 2% of mid. No sequence numbers. Trades carry both order ids |
 | Coinbase Advanced `level2`, `market_trades` | Public. Batches of about 50 ms. No sequence breaks in 1,164 messages |
 | Kraken v2 `book`, `trade` | Public, close to one change per message, level-based |

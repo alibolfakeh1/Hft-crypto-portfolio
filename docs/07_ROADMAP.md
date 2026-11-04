@@ -6,7 +6,7 @@ dates yet, because the server and the reference venue are still open decisions.
 | Phase | Deliverable | Lead | Reviewers | Gate | Status |
 |---|---|---|---|---|---|
 | P0 Foundation | Charter, team, strategy and feature documents, leak audit of documents, output, data and app specifications | `project-manager` | `leak-auditor` | G0 | In progress |
-| P1 Data and recording | Candle and trade pipelines, manifests, retention jobs, **live `T3` recorder running** | `data-steward`, `developer` | `python-reviewer`, `leak-auditor` | G1 | Not started |
+| P1 Data center | Zones and catalog, historical ingest with catch-up, bars from trades, retention job, live recorder, health report, first end-to-end report. See `docs/08_DATA_CENTER.md` | `data-steward`, `developer` | `python-reviewer`, `leak-auditor` | G1 | In progress |
 | P2 Engine | Event-driven simulator, timing contract enforced in code, costs, funding, dynamic stops, trial registry, leak test suite | `developer` | `python-reviewer`, `leak-auditor` | G6 (engine) | Not started |
 | P3 Baselines | All strategies in `V0S` and `V0`, on `T0` and `T1` data | `developer` | `strategy-architect`, `leak-auditor` | G3 | Not started |
 | P4 Portfolio report | Full tear sheets and portfolio report from real baseline results | `developer`, `ui-designer` | `python-reviewer` | G6 | Not started |
@@ -28,5 +28,5 @@ dates yet, because the server and the reference venue are still open decisions.
 
 ## Current status
 
-Updated 2026-11-04. Only documents exist. No code has been written, no strategy has been tested, and there are
-no results of any kind.
+Updated 2026-11-04. Real data has been downloaded and checked for one day. The data center is being built. No
+strategy has been coded or tested, so there are no strategy results of any kind.
