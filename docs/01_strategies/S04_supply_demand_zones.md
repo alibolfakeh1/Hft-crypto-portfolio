@@ -99,7 +99,7 @@ every read is as of a time. A zone is active at `t` when it has no `broken_at`, 
 **Overlap.** If a new zone overlaps an active same-side zone by more than half of its own height, the one with the higher `Q` at the
 new zone's `t_e` stands, and the older zone wins a tie. The loser gets `superseded_at = t_e` of the new zone. An older loser was valid
 until that moment, and stays usable for every read before it. A new loser is registered with its state and is never active. Both stay
-in the register.
+in the register. This rule applies among entry zones only. Stack zones are a separate list, and they neither supersede an entry zone nor are superseded by one.
 
 ## 4. Knowable times
 

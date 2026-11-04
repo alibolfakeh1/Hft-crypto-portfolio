@@ -221,7 +221,7 @@ Total: 4 configurations at `T_d = 1h`. Everything else is frozen. I dropped a 15
 | Weekdays with a macro catalyst in US hours | Should work best | Result by date, reviewed after the fact, with no calendar filter used |
 | Slow range markets | Should fail with false breaks | Many volume-check tightenings and invalidations |
 | Seasonal pattern changes | Should weaken | Compare how `h_s` and `h_peak` move between blocks, and how `SRV` at breaks behaves |
-| Any regime | Should beat its [placebo](00_INDEX.md#c15-placebo-control) | The same rule with the window moved by a random whole number of hours, and `h_end`, `h_peak` and `T_flat` moved with it, so that every schedule step stays defined. If the quiet window adds nothing, the seasonal idea has failed |
+| Any regime | Should beat its [placebo](00_INDEX.md#c15-placebo-control) | The same rule with the window moved by a shift drawn independently for each day, from 1 to 23 hours, so 0 (the real rule) cannot occur and the draws do not repeat a small set of paths. `h_end`, `h_peak` and `T_flat` move with it, so that every schedule step stays defined. If the quiet window adds nothing, the seasonal idea has failed |
 
 ## 11. Flow hooks
 

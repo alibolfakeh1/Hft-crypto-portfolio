@@ -328,8 +328,10 @@ Using the example in 7.12, with `C_k = 66,610`, `S0 = 66,092.5`, `T1 = 67,200`, 
 - `dVAL`, `dVAH` and `dPOC` are computed for each processed 1h close, from trades at or before that close and not from trades up to the run. Late runs therefore produce the same values, and they act from `effective_from`.
 - `q` counts `T_d` closes since the `T1` fill, so the decay in 7.3 does not depend on when runs happen.
 - The prior profile changes when a run first processes the 00:00 close. A late or dropped run around 00:00 delays the roll updates only.
-- If any trades in the span are missing, the run logs `DATA_GAP` for this symbol and computes no partial profile. Touches are still resolved if 1m bars are complete.
+- 1m bars are built from the same trades, so missing trades are a hole in 1m bars, and the gap rules in C17 apply. The run computes no partial profile. A minute with no trades that the completeness check shows is complete is not missing, and adds nothing to the profile.
 - Stops only tighten: the `P_dec` clamp in C17 can reduce a candidate, and the ratchet then keeps the old stop.
 
 **Backtest reproduction.** `CYCLE` under [C17](00_INDEX.md#c17-hourly-live-cycle) at 1h, with `C-LATE` for selection among 1h configurations only, with profiles rebuilt the same way as live and trades cut off at `t_cut`. Report the branches separately, and also show the
 30m `IDEAL` and `IDEAL-1M` results beside the 1h `CYCLE` result, labelled, as a comparison of the classical rule with what can actually run. That comparison is never a selection.
+
+**`PLACEHOLDER`, re-audit condition C-10.** The trade source values for this strategy's `V0` fetch model, meaning page size, rate limit, retention and any fetch offset, are not declared yet. They wait for the source decision and belong in the [C17 constants](00_INDEX.md#c17-hourly-live-cycle). No `CYCLE` run of this strategy may start until they are filled.

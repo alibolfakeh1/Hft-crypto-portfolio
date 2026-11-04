@@ -246,7 +246,7 @@ Total: 4 configurations at `T_d = 1h`. Everything else is frozen.
 | Ranges | Should fail, since the line becomes a midpoint | Many invalidations, with `A` slope near zero |
 | V-shaped moves | Few trades, as the excursion needs a confirmed anchor | Count of triggers per anchor |
 | High-volume shocks | The line jumps, and stops ride up fast | Compare stop exits on days with `VR` above 2 |
-| Any regime | Should beat the [placebo](00_INDEX.md#c15-placebo-control) | The placebo is a random anchor. An anchor bar is drawn uniformly over the block's bars, independently of price, and becomes usable `Rt` bars later, the same lag as a real swing. Its side is random, at the block's real long and short share, and the same rules run from it. A named extra, `AVERAGE-PRICE`, keeps the real anchor and replaces `A` with an unweighted average price from it. A difference from that extra is what shows volume weighting matters. It does not test the anchor |
+| Any regime | Should beat the [placebo](00_INDEX.md#c15-placebo-control) | The placebo is a random anchor. Anchor bars are drawn uniformly over the block's bars, independently of price, with as many anchors per side as the block's real major swings on that side. Each becomes usable `Rt` bars later, the same lag as a real swing, and the same rules run from it. A named extra, `AVERAGE-PRICE`, keeps the real anchor and replaces `A` with an unweighted average price from it. A difference from that extra is what shows volume weighting matters. It does not test the anchor |
 
 ## 11. Flow hooks
 
@@ -307,10 +307,14 @@ the example in 7.12, with `A = 63,800`, `sigma = 520`, `C_k = 64,010`, `S0 = 63,
   run. The result is then the same whether the run was on time or late. New stops and targets act from `effective_from`.
 - A band target between runs stays at the last value set, however far the true band has moved. It does not float between runs.
 - Two closes below `A0` are read at the run that processes the second. The exit fills after that run.
-- If any trades in the span are missing, the run logs `DATA_GAP` for this symbol, and does not compute a partial VWAP. Touches are still resolved from
-  1m bars if those are complete.
+- 1m bars are built from the same trades, so missing trades are a hole in 1m bars, and the gap rules in C17 apply. The run computes no partial VWAP. A minute
+  with no trades that the completeness check shows is complete is not missing, and adds nothing to the totals.
 - Stops only tighten: the `P_dec` clamp in C17 can reduce a candidate, and the ratchet then keeps the old stop.
 
 **Backtest reproduction.** `CYCLE` under [C17](00_INDEX.md#c17-hourly-live-cycle), with `C-LATE` for selection, and running VWAP totals rebuilt in the same
 way as live, so rounding and start-of-sum handling match. `T0-APPROX` is not allowed in `CYCLE`. Report the share of `STALE_SETUP` by reason. A high
 `RR_LATE` share means the strategy depends on entering very close to the line, which an hourly job cannot do reliably.
+
+**`PLACEHOLDER`, re-audit condition C-10.** The trade source values for this strategy's `V0` fetch model, meaning page size, rate limit, retention and any fetch
+offset, are not declared yet. They wait for the source decision and belong in the [C17 constants](00_INDEX.md#c17-hourly-live-cycle). No `CYCLE` run of this strategy may
+start until they are filled.
