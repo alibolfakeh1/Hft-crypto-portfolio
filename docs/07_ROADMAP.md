@@ -27,5 +27,11 @@ dates yet, because the server and the reference venue are still open decisions.
 
 ## Current status
 
-Updated 2026-11-04. Real data has been downloaded and checked for one day. The data center is being built. No
-strategy has been coded or tested, so there are no strategy results of any kind.
+Updated 2026-11-04. The data center is being built, and all data sources are disabled until one is approved.
+
+- **Strategy documents:** leak audit `PASS WITH CONDITIONS`, after fixes and three rechecks. Their text conditions are
+  closed, so the run logic may be coded. Conditions C-3, C-4, C-5, C-7 and C-10 in
+  `docs/reviews/leak/strategies_recheck_2026-11-04.md` fall due before the first run on market data.
+- **Feature documents:** leak audit `FAIL`. They must be corrected to match the final hourly cycle and the approved source,
+  and audited again, before any gate or flow exit is coded.
+- **Results:** no strategy has been coded or tested, so there are no strategy results of any kind.

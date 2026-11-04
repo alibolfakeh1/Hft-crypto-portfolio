@@ -281,3 +281,45 @@ runs, and `CYCLE` placebos. Due before the first `CYCLE` run of any strategy. `d
 ### Re-audit needed
 
 Only the lines that answer C-11, and the C-10 row when it is restated.
+
+## Third recheck
+
+Date: 2026-11-04. Scope: only the lines changed in commit `42fb62b`.
+
+**Overall: `PASS WITH CONDITIONS`. `00_INDEX.md`: `PASS WITH CONDITIONS`. `S01` to `S10`: `PASS`, each, inheriting the index's conditions.** I found no new problem of `MEDIUM` severity or above, so this closes the text conditions. `decide` and `settle` may be coded. What
+remains are decisions and measured values with other owners, each due before a named run. With L-19 now complete, all 37 original findings and all of N-01 to N-20 are met in text, except for the C-10 values below.
+
+| Condition | Status | When any remainder is due |
+|---|---|---|
+| C-1, C-6 | Met earlier | Done |
+| C-2, C-8, C-9 | **Met.** The parts carried into C-11 are done | Done |
+| C-11 (N-16 to N-19) | **Met** | Done |
+| C-10 as restated, with N-20 | **Text met.** The C17 row covers every `CYCLE` run, including selection, controls and placebos. The values stay a marked placeholder | Before the first `CYCLE` run of any strategy |
+| C-3 `RT` and stop slippage | Open, other owner | Before the first run |
+| C-4 measure `A` | Open, other owner. **Now the main remaining protection:** see the probe below | Before the first `CYCLE` run |
+| C-5 record the frozen commit | Open, other owner | Before the first run |
+| C-7 fold plan | Open, other owner | Before the first `V0` run |
+
+| Finding | Result |
+|---|---|
+| N-16 | **Met.** An empty minute needs proof of continuity, and without it counts as missing even after trades resume. A `C-GAP` hole removes the proof, so the hole rules can now fire and L-19 is fixed. S07 and S08 follow it, and a required test is added |
+| N-17 | **Met.** The check is before `decide`, which receives `t_cut` and truncated data. A modelled fetch sees the archive only through the evidence window. A server time counts only from the response delivering the last page, and the share of runs passing on it alone is reported |
+| N-18 | **Met.** Funding follows C10 alone |
+| N-19 | **Met.** `dead_at` is named, in C3 and S05, and the amplitude test is stated |
+| N-20 | **Met as text.** Its value is re-based under C-10 |
+
+**The two choices are accepted.**
+
+- **`fetch` as step 0.** It is the right place, because the evidence has to be read past `t_cut` and `decide` must not be able to. Steps 1 to 6 keep their numbers, and `fetch` has its own truncation test.
+- **Amplitude test with the last defined `ATR`.** The value predates the gap, so it is causal, and the list stays the same for every variant. Ignoring a swing before the first seed only affects the bars at the canonical start, which C3 fixes, so replay and live agree.
+
+**Probe rerun on the new wording.** Synthetic trade times, 200,000 run starts at each of three trade rates. When the feed's real lag is within `A`, the backtest's `t_cut` was never later than live (0.00 percent at every rate), and earlier in 1.7 to 9.3 percent, the safe direction. The old whole-archive reading was later than live in up to 30 percent. When the real lag is 20 s, above `A`, the backtest's `t_cut` is later in 13 to 17 percent of runs, and the server-time branch can leave the last bar partial in about 17 percent. So the text is causal only if `A` is right, and C-4 must be met from real feed logs. On a thin feed of one trade per 30 s, 5 to 6 percent of runs logged `DATA_GAP`, which is worth weighing when the source is chosen.
+
+**`LOW` items for the code review, with no further edit round:**
+
+1. The required test names `t_cut`. Also check that empty-minute marks are unchanged with data after `t_poll - A` removed, since they too read past `t_cut`.
+2. C2 allows overlapping pages as proof, and also says a source with no sequence treats every empty minute as a gap. Code takes the fail-closed reading unless the source's contract proves otherwise.
+3. C17 still says "only `settle` may read past `t_cut`", and `fetch` now does too. Enforce it by interface: `decide` holds no handle to untruncated data.
+4. Funding's `t_poll` still enters the `min` in the run clock, though it takes no completeness check. Exclude it or fetch the trade feed first, or live `t_cut` can fall a minute behind the backtest's.
+5. Step 6 says `effective_from` is the same bar as the fill, which step 5 now defines as the first bar with a price, while the note says it follows from `t_dec` alone. An empty bar can touch nothing, so results agree, but a restarted run must derive the same value.
+6. At G1, report empty minutes with and without proof per source. Each unproven minute blanks `ATR` for 14 bars and blocks setups, which could thin trades in quiet hours for a data reason.
