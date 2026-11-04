@@ -59,7 +59,9 @@ DATA_ROOT/
 
 Measured on 2026-11-04 using files dated 2026-11-03. One day is a first look, not a full audit. Figures about Binance
 files in this section are derived from Binance Vision data, licensed CC BY-NC-SA 4.0. This project is not associated
-with or endorsed by Binance. Whether each source remains in use is an open decision (`D-17`).
+with or endorsed by Binance. By decision `D-17`, Binance Vision data is no longer used for project research or results.
+These figures remain only as a record of how the design was reached, and the same checks must be repeated on the
+approved source.
 
 - **Canonical bars are built from trades.** Rebuilding Binance 1-minute bars from `aggTrades` gave identical
   daily volume and taker-buy volume, but 127 of 1,440 bars differed by more than 0.001 BTC, by up to 1.627 BTC,
