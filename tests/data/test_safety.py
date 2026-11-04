@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 
 from helpers import REPO_ROOT, base_config
-from hft_crypto.config import ConfigError, load_pipeline_config
 from hft_crypto.data.fetch import ALLOWED_HOSTS, ForbiddenHostError, HttpFetcher, check_url
 
 SOURCE = REPO_ROOT / "src"
@@ -36,12 +35,11 @@ def test_there_is_source_to_check() -> None:
 )
 def test_only_https_to_allowed_hosts(url: str) -> None:
     with pytest.raises(ForbiddenHostError):
-        check_url(url)
+        check_url(url, ALLOWED_HOSTS)
 
 
 def test_allowed_hosts_exclude_all_exchange_trading_hosts() -> None:
     assert {
-        "data.binance.vision",
         "public.bybit.com",
         "quote-saver.bycsi.com",
         "api.kraken.com",
@@ -53,7 +51,11 @@ def test_every_configured_source_is_on_the_allowlist() -> None:
     for source in config.sources.values():
         assert source.urls
         for url in source.urls.values():
-            check_url(url)
+            if source.prohibited:
+                with pytest.raises(ForbiddenHostError):
+                    check_url(url, ALLOWED_HOSTS)
+            else:
+                check_url(url, ALLOWED_HOSTS)
 
 
 def test_the_only_kraken_path_is_public() -> None:
@@ -67,19 +69,6 @@ def test_every_source_ships_disabled() -> None:
     assert config.source_state() == "no approved source configured"
     assert config.report.benchmark_venue is None
     assert all(not source.enabled for source in config.sources.values())
-
-
-def test_binance_is_prohibited_and_cannot_be_enabled(tmp_path: Path) -> None:
-    """Decision D-17. Flipping `enabled` alone must fail loudly, not start downloading."""
-    text = (REPO_ROOT / "configs" / "pipeline.toml").read_text(encoding="utf-8")
-    assert base_config().source("binance").prohibited is True
-    flipped = text.replace("[sources.binance]\n", "[sources.binance]\n#\n", 1).replace(
-        "enabled = false\nprohibited = true", "enabled = true\nprohibited = true", 1
-    )
-    assert flipped != text
-    (tmp_path / "pipeline.toml").write_text(flipped, encoding="utf-8")
-    with pytest.raises(ConfigError, match="prohibited"):
-        load_pipeline_config(tmp_path)
 
 
 def test_terms_notes_name_the_decision_and_are_not_stale() -> None:

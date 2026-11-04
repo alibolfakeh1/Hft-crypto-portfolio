@@ -19,7 +19,24 @@ class ConfigError(ValueError):
 
 
 Granularity = Literal["day", "month"]
+Continuity = Literal["trade_id", "none"]
 NO_APPROVED_SOURCE = "no approved source configured"
+# Decision D-17. These hold in code, so no configuration file, environment variable or copied URL can reach
+# them.
+PROHIBITED_SOURCES = frozenset({"binance"})
+PROHIBITED_HOSTS = frozenset({"binance.vision", "binance.com", "binance.us", "binancefuture.com"})
+STAMP_KINDS = frozenset({"exact", "aggregate_one_price", "taker_many_prices", "floored", "batched"})
+# Only these row shapes keep every price in a bar from before its close. See the leak audit, ruling 2.
+IDEAL_STAMP_KINDS = frozenset({"exact", "aggregate_one_price"})
+ACCEPTED_ALLOWANCE_STATES = frozenset({"placeholder", "measured"})
+
+
+def is_prohibited_host(host: str | None) -> bool:
+    """True for a prohibited domain or anything under it, however it is written."""
+    if not host:
+        return False
+    name = host.lower().rstrip(".")
+    return any(name == banned or name.endswith(f".{banned}") for banned in PROHIBITED_HOSTS)
 
 
 @dataclass(frozen=True)
@@ -31,11 +48,24 @@ class SourceSpec:
     prohibited: bool
     urls: dict[str, str]
     terms_note: str
+    stamp_kind: str
+    fill_span_allowance_ms: float
+    allowance_state: str
+    continuity: Continuity
 
     def hosts(self) -> frozenset[str]:
         return frozenset(
             host for host in (urllib.parse.urlsplit(url).hostname for url in self.urls.values()) if host
         )
+
+    @property
+    def fill_span_allowance_us(self) -> int:
+        return round(self.fill_span_allowance_ms * 1000)
+
+    @property
+    def ideal_allowed(self) -> bool:
+        # An allowance nobody has measured cannot say what had printed by a close.
+        return self.stamp_kind in IDEAL_STAMP_KINDS and self.allowance_state == "measured"
 
 
 @dataclass(frozen=True)
@@ -52,13 +82,16 @@ class DatasetSpec:
     light: bool
     opt_in: bool
     priority: int
+    live_eligible: bool
+    max_quiet_s: float | None
 
 
 @dataclass(frozen=True)
 class ReconTolerance:
     daily_total_abs: float
     boundary_window_ms: float
-    bar_price_abs: float
+    bar_price_rel: float
+    fill_count_rel: float
 
 
 @dataclass(frozen=True)
@@ -75,7 +108,10 @@ class PollConfig:
     start_date: dt.date
     page_size: int
     min_interval_s: float
-    bar_grace_s: float
+    allowance_a_s: float
+    nominal_minute: int
+    timeout_s: float
+    attempts: int
     default_time_budget_s: float
     missed_slots_alert: int
     default_quota_gb: float
@@ -115,6 +151,7 @@ class PipelineConfig:
     retry_max_hours: float
     max_book_days_per_run: int
     book_depth_allowance_s: float
+    max_future_skew_s: float
     reconcile: dict[str, ReconTolerance]
     datasets: tuple[DatasetSpec, ...]
     poll: PollConfig
@@ -127,15 +164,21 @@ class PipelineConfig:
         except KeyError as exc:
             raise ConfigError(f"unknown source: {name}") from exc
 
+    def source_usable(self, name: str) -> bool:
+        """Enabled, not prohibited, and not on a prohibited host. A second check, kept after loading."""
+        source = self.sources.get(name)
+        if source is None or not source.enabled or source.prohibited or name in PROHIBITED_SOURCES:
+            return False
+        return not any(is_prohibited_host(host) for host in source.hosts())
+
     def enabled_sources(self) -> tuple[str, ...]:
-        return tuple(sorted(name for name, source in self.sources.items() if source.enabled))
+        return tuple(sorted(name for name in self.sources if self.source_usable(name)))
 
     def enabled_hosts(self) -> frozenset[str]:
         """The only hosts the network client may contact. Empty until a source is approved."""
         hosts: set[str] = set()
-        for source in self.sources.values():
-            if source.enabled:
-                hosts |= source.hosts()
+        for name in self.enabled_sources():
+            hosts |= self.sources[name].hosts()
         return frozenset(hosts)
 
     def source_state(self) -> str:
@@ -143,7 +186,7 @@ class PipelineConfig:
         return ", ".join(enabled) if enabled else NO_APPROVED_SOURCE
 
     def dataset_enabled(self, spec: DatasetSpec) -> bool:
-        return self.source(spec.venue).enabled
+        return self.source_usable(spec.venue)
 
     def has_official_candles(self, venue: str) -> bool:
         return any(spec.venue == venue and spec.curated == "candles_official" for spec in self.datasets)
@@ -208,19 +251,38 @@ IRREPLACEABLE_ZONES = ("raw/live", "ledger", "decisions")
 
 
 def find_config_dir(explicit: str | Path | None = None) -> Path:
-    """Locate configs/: explicit argument, then HFT_CONFIG_DIR, then the working directory, then the repo."""
+    """Locate configs/: explicit argument, then HFT_CONFIG_DIR, then the repository's own."""
     candidates: list[Path] = []
     if explicit:
         candidates.append(Path(explicit))
     env_value = os.environ.get("HFT_CONFIG_DIR")
     if env_value:
         candidates.append(Path(env_value))
-    candidates.append(Path.cwd() / "configs")
+    # Not the working directory: a stray configs/ folder must not be picked up by accident.
     candidates.append(Path(__file__).resolve().parents[2] / "configs")
     for candidate in candidates:
         if (candidate / "pipeline.toml").is_file():
             return candidate
     raise ConfigError("cannot find configs/pipeline.toml. Pass --config-dir or set HFT_CONFIG_DIR.")
+
+
+def _check_keys(raw: dict[str, Any], allowed: frozenset[str], where: str) -> None:
+    """A misspelt key would otherwise read as its default, and a default can be the unsafe value."""
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ConfigError(f"{where}: unknown keys {unknown}")
+
+
+def _bool_key(raw: dict[str, Any], key: str, where: str, *, default: bool | None = None) -> bool:
+    """Read a real TOML boolean. bool("false") is True, so a string here would silently mean the opposite."""
+    if key not in raw:
+        if default is None:
+            raise ConfigError(f"{where}: {key} is required")
+        return default
+    value = raw[key]
+    if not isinstance(value, bool):
+        raise ConfigError(f"{where}: {key} must be true or false, not {value!r}")
+    return value
 
 
 def _read_toml(path: Path) -> dict[str, Any]:
@@ -231,10 +293,49 @@ def _read_toml(path: Path) -> dict[str, Any]:
         raise ConfigError(f"cannot read {path.name}: {exc}") from exc
 
 
+_DATASET_KEYS = frozenset(
+    {
+        "id",
+        "venue",
+        "adapter",
+        "kind",
+        "curated",
+        "tier",
+        "granularity",
+        "start",
+        "overdue_hours",
+        "light",
+        "opt_in",
+        "priority",
+        "live_eligible",
+        "max_quiet_s",
+    }
+)
+_SOURCE_KEYS = frozenset(
+    {
+        "enabled",
+        "prohibited",
+        "terms_note",
+        "stamp_kind",
+        "fill_span_allowance_ms",
+        "allowance_state",
+        "continuity",
+        "archive_base",
+        "trades_base",
+        "book_base",
+        "book_depths",
+        "trades_url",
+    }
+)
+
+
 def _dataset(raw: dict[str, Any]) -> DatasetSpec:
+    where = f"dataset {raw.get('id')}"
+    _check_keys(raw, _DATASET_KEYS, where)
     granularity = raw["granularity"]
     if granularity not in ("day", "month"):
-        raise ConfigError(f"dataset {raw['id']}: bad granularity {granularity}")
+        raise ConfigError(f"{where}: bad granularity {granularity}")
+    quiet = raw["max_quiet_s"]
     return DatasetSpec(
         id=raw["id"],
         venue=raw["venue"],
@@ -245,19 +346,70 @@ def _dataset(raw: dict[str, Any]) -> DatasetSpec:
         granularity=cast(Granularity, granularity),
         start=parse_date(raw["start"]),
         overdue_hours=float(raw["overdue_hours"]),
-        light=bool(raw["light"]),
-        opt_in=bool(raw["opt_in"]),
+        light=_bool_key(raw, "light", where),
+        opt_in=_bool_key(raw, "opt_in", where),
         priority=int(raw["priority"]),
+        live_eligible=_bool_key(raw, "live_eligible", where),
+        # Zero means this dataset has no trades to fall quiet, such as candles or funding.
+        max_quiet_s=None if float(quiet) == 0.0 else float(quiet),
     )
 
 
 def _source(name: str, raw: dict[str, Any]) -> SourceSpec:
-    enabled = bool(raw["enabled"])
-    prohibited = bool(raw.get("prohibited", False))
-    if enabled and prohibited:
-        raise ConfigError(f"source {name} is prohibited by a recorded decision and cannot be enabled")
+    """Read one source. Anything unclear or misspelt is an error, because it must fail closed."""
+    where = f"source {name}"
+    _check_keys(raw, _SOURCE_KEYS, where)
+    enabled = _bool_key(raw, "enabled", where)
+    prohibited = _bool_key(raw, "prohibited", where)
     urls = {key: str(value) for key, value in raw.items() if key.endswith(("_base", "_url"))}
-    return SourceSpec(name, enabled, prohibited, urls, str(raw["terms_note"]))
+    source = SourceSpec(
+        name=name,
+        enabled=enabled,
+        prohibited=prohibited,
+        urls=urls,
+        terms_note=str(raw["terms_note"]),
+        stamp_kind=_choice(raw, "stamp_kind", STAMP_KINDS, where),
+        fill_span_allowance_ms=_non_negative(raw, "fill_span_allowance_ms", where),
+        allowance_state=_choice(raw, "allowance_state", ACCEPTED_ALLOWANCE_STATES, where),
+        continuity=cast(Continuity, _choice(raw, "continuity", frozenset({"trade_id", "none"}), where)),
+    )
+    banned_hosts = sorted(host for host in source.hosts() if is_prohibited_host(host))
+    if name in PROHIBITED_SOURCES and not prohibited:
+        raise ConfigError(f"{where} is prohibited by decision D-17, and the flag cannot be removed")
+    if banned_hosts and not prohibited:
+        raise ConfigError(f"{where} uses a prohibited host: {banned_hosts}")
+    if enabled and (prohibited or banned_hosts or name in PROHIBITED_SOURCES):
+        raise ConfigError(f"{where} is prohibited by a recorded decision and cannot be enabled")
+    return source
+
+
+def _choice(raw: dict[str, Any], key: str, allowed: frozenset[str], where: str) -> str:
+    value = raw.get(key)
+    if value not in allowed:
+        raise ConfigError(f"{where}: {key} must be one of {sorted(allowed)}, not {value!r}")
+    return str(value)
+
+
+def _non_negative(raw: dict[str, Any], key: str, where: str) -> float:
+    value = raw.get(key)
+    if isinstance(value, bool) or not isinstance(value, int | float) or not 0 <= value < float("inf"):
+        raise ConfigError(f"{where}: {key} must be a number at or above zero, not {value!r}")
+    return float(value)
+
+
+def _check_references(config: PipelineConfig) -> None:
+    """Names that point at a source must point at a real one, and a report may use only an approved one."""
+    for spec in config.datasets:
+        if spec.venue not in config.sources:
+            raise ConfigError(f"dataset {spec.id}: unknown source {spec.venue}")
+    if config.poll.venue not in config.sources:
+        raise ConfigError(f"poll: unknown source {config.poll.venue}")
+    venue = config.report.benchmark_venue
+    if venue is not None and not config.source_usable(venue):
+        raise ConfigError(f"report: benchmark venue {venue} is not an enabled, approved source")
+    window = config.source(config.poll.venue).fill_span_allowance_ms
+    if config.poll.allowance_a_s * 1000 < window:
+        raise ConfigError("poll: the allowance A must cover the source's declared fill span")
 
 
 def load_pipeline_config(config_dir: str | Path | None = None) -> PipelineConfig:
@@ -269,7 +421,8 @@ def load_pipeline_config(config_dir: str | Path | None = None) -> PipelineConfig
         for minutes in timeframes:
             if minutes < 2 or 1440 % minutes != 0:
                 raise ConfigError(f"timeframe {minutes}m must be above 1m and divide a UTC day")
-        return PipelineConfig(
+        minute = int(poll["nominal_minute"])
+        config = PipelineConfig(
             symbols=tuple(raw["universe"]["symbols"]),
             timeframes_minutes=timeframes,
             default_quota_gb=float(raw["storage"]["default_quota_gb"]),
@@ -288,11 +441,13 @@ def load_pipeline_config(config_dir: str | Path | None = None) -> PipelineConfig
             retry_max_hours=float(raw["catchup"]["retry_max_hours"]),
             max_book_days_per_run=int(raw["catchup"]["max_book_days_per_run"]),
             book_depth_allowance_s=float(raw["latency"]["book_depth_allowance_s"]),
+            max_future_skew_s=float(raw["latency"]["max_future_skew_s"]),
             reconcile={
                 symbol: ReconTolerance(
                     daily_total_abs=float(values["daily_total_abs"]),
                     boundary_window_ms=float(values["boundary_window_ms"]),
-                    bar_price_abs=float(values["bar_price_abs"]),
+                    bar_price_rel=float(values["bar_price_rel"]),
+                    fill_count_rel=float(values["fill_count_rel"]),
                 )
                 for symbol, values in raw["reconcile"].items()
             },
@@ -303,7 +458,10 @@ def load_pipeline_config(config_dir: str | Path | None = None) -> PipelineConfig
                 start_date=parse_date(poll["start_date"]),
                 page_size=int(poll["page_size"]),
                 min_interval_s=float(poll["min_interval_s"]),
-                bar_grace_s=float(poll["bar_grace_s"]),
+                allowance_a_s=float(poll["allowance_a_s"]),
+                nominal_minute=minute,
+                timeout_s=float(poll["timeout_s"]),
+                attempts=int(poll["attempts"]),
                 default_time_budget_s=float(poll["default_time_budget_s"]),
                 missed_slots_alert=int(poll["missed_slots_alert"]),
                 default_quota_gb=float(poll["default_quota_gb"]),
@@ -321,6 +479,8 @@ def load_pipeline_config(config_dir: str | Path | None = None) -> PipelineConfig
         )
     except KeyError as exc:
         raise ConfigError(f"pipeline.toml is missing {exc}") from exc
+    _check_references(config)
+    return config
 
 
 def _parse_requires(raw: dict[str, Any]) -> dict[str, tuple[tuple[str, frozenset[str]], ...]]:
@@ -336,9 +496,27 @@ def _parse_requires(raw: dict[str, Any]) -> dict[str, tuple[tuple[str, frozenset
     return parsed
 
 
+_RULE_KEYS = frozenset(
+    {
+        "id",
+        "zone",
+        "kinds",
+        "min_age_days",
+        "reviewed",
+        "reviewed_note",
+        "requires",
+        "watermark_bypass_pct",
+        "watermark_min_age_days",
+        "unpublished_only",
+        "rebuildable_from_archive",
+    }
+)
+
+
 def _rule(raw: dict[str, Any]) -> RetentionRule:
-    zone = str(raw["zone"]).strip("/")
     rule_id = raw["id"]
+    _check_keys(raw, _RULE_KEYS, f"rule {rule_id}")
+    zone = str(raw["zone"]).strip("/")
     if any(zone == z or zone.startswith(f"{z}/") for z in FORBIDDEN_RETENTION_ZONES):
         raise ConfigError(f"rule {rule_id}: zone {zone} can never be selected for deletion")
     bypass = raw.get("watermark_bypass_pct")
@@ -349,17 +527,23 @@ def _rule(raw: dict[str, Any]) -> RetentionRule:
     min_age = float(raw["min_age_days"])
     if min_age <= 0 and any(zone == z or zone.startswith(f"{z}/") for z in IRREPLACEABLE_ZONES):
         raise ConfigError(f"rule {rule_id}: IRREPLACEABLE data needs a retention period above zero")
+    requires = _parse_requires(raw.get("requires", {}))
+    if zone == "raw" or zone.startswith("raw/"):
+        # Raw data goes only when its derived data passes, so each kind must say what that derived data is.
+        for kind in raw["kinds"]:
+            if kind not in requires and "*" not in requires:
+                raise ConfigError(f"rule {rule_id}: raw kind {kind} has no derived-data requirement")
     return RetentionRule(
         id=rule_id,
         zone=zone,
         kinds=tuple(raw["kinds"]),
         min_age_days=min_age,
-        reviewed=bool(raw.get("reviewed", False)),
-        requires=_parse_requires(raw.get("requires", {})),
+        reviewed=_bool_key(raw, "reviewed", f"rule {rule_id}", default=False),
+        requires=requires,
         watermark_bypass_pct=None if bypass is None else float(bypass),
         watermark_min_age_days=float(raw.get("watermark_min_age_days", 0.0)),
-        unpublished_only=bool(raw.get("unpublished_only", False)),
-        rebuildable_from_archive=bool(raw.get("rebuildable_from_archive", False)),
+        unpublished_only=_bool_key(raw, "unpublished_only", f"rule {rule_id}", default=False),
+        rebuildable_from_archive=_bool_key(raw, "rebuildable_from_archive", f"rule {rule_id}", default=False),
     )
 
 

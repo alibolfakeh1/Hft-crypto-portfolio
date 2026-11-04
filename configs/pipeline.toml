@@ -12,34 +12,60 @@ symbols = ["BTCUSDT", "ETHUSDT"]
 timeframes_minutes = [5, 15, 30, 60, 120, 240, 1440]
 
 [storage]
-# Measured against DATA_QUOTA_GB. The environment variable wins over this default. The Actions cache
-# limit is 10 GB per repository, and the poll cache needs room beside this one.
-default_quota_gb = 8.0
+# Measured against DATA_QUOTA_GB. The environment variable wins over this default. The Actions cache limit is 10 GB
+# per repository. A new copy is saved before the old one is pruned, so two copies and the poll cache must fit at
+# once, which means under half the limit until measured sizes say otherwise.
+default_quota_gb = 4.0
 # What survives between runs through the Actions cache. raw and quarantine stay on the runner.
 persisted_zones = ["curated", "features", "catalog"]
 
 # Nothing is downloaded from a source unless it is enabled here, and every source starts disabled. With none
 # enabled, the network client refuses every host, and each job reports "no approved source configured".
 # A source is enabled only once it has been named as approved. See docs/03_DATA_SOURCES.md.
+#
+# Every key below is required, and a misspelt or unknown key is an error, so a typo cannot read as a default.
+#   stamp_kind              How a row is stamped. One of: exact, aggregate_one_price, taker_many_prices, floored,
+#                           batched. Only exact and aggregate_one_price may be read in IDEAL mode.
+#   fill_span_allowance_ms  How long after its stamp a row's fills can run, plus the stamp's resolution. A row is
+#                           knowable at its stamp plus this. UNVERIFIED everywhere until measured on the source,
+#                           including stressed days. It also bounds the midnight window of the reconciliation rule.
+#   allowance_state         placeholder or measured. Health raises an alert for an enabled source on a placeholder.
+#   continuity              trade_id if rows carry an id with no skips, which can prove an empty minute. none if
+#                           not, which makes every empty minute a gap, as convention C2 says.
 [sources.binance]
-# Adapter kept and tested on generated files only. Decision D-17 rules this source out for research and results,
-# so enabling it is an error. Changing that needs a new decision and this flag removed on purpose.
+# Adapter kept and tested on generated files only. Decision D-17 rules this source out for research and results.
+# The host and the name are also barred in code, so changing these flags cannot reach it.
 enabled = false
 prohibited = true
 archive_base = "https://data.binance.vision/data/futures/um"
+stamp_kind = "aggregate_one_price"
+fill_span_allowance_ms = 250.0
+allowance_state = "placeholder"
+continuity = "trade_id"
 terms_note = "Binance Vision Dataset Terms (2026-08-26): CC BY-NC-SA 4.0, non-commercial. Not used, by decision D-17."
 
 [sources.bybit]
 enabled = false
+prohibited = false
 trades_base = "https://public.bybit.com/trading"
 book_base = "https://quote-saver.bycsi.com/orderbook/linear"
 # The book file name changed depth at a date we do not hard-code. Every depth is tried, in this order.
 book_depths = [200, 500]
+stamp_kind = "exact"
+fill_span_allowance_ms = 250.0
+allowance_state = "placeholder"
+# Rows carry a random match id, so nothing in a file can prove that no row is missing.
+continuity = "none"
 terms_note = "Terms under review in docs/03_DATA_SOURCES.md. Not approved, so not downloaded."
 
 [sources.kraken]
 enabled = false
+prohibited = false
 trades_url = "https://api.kraken.com/0/public/Trades"
+stamp_kind = "taker_many_prices"
+fill_span_allowance_ms = 250.0
+allowance_state = "placeholder"
+continuity = "trade_id"
 terms_note = "Terms under review in docs/03_DATA_SOURCES.md. Not approved, so not downloaded."
 
 [fetch]
@@ -59,24 +85,35 @@ max_book_days_per_run = 1
 
 [latency]
 # bookDepth stamps are truncated to the second, so a row stamped 00:00:06 may be as late as 00:00:06.999.
-# It is treated as knowable one second after its stamp.
+# It is treated as knowable one second after its stamp. That is all it covers: no publication delay is included.
 book_depth_allowance_s = 1.0
+# A row stamped later than this after we received it is refused, because no clock is that far off.
+max_future_skew_s = 60.0
 
 # Official candles are a reconciliation check, for a venue that publishes them. An aggregate trade file gives
 # each aggregate one timestamp, but official candles count each fill in its own minute, so volume stamped just
 # before a boundary can appear after it. A daily difference must be covered by trades this close to midnight, or
-# it is an error. These values are placeholders: repeat the checks on the approved source and set them from that.
+# it is an error.
+#
+# PLACEHOLDER, frozen under decision D-18. The design of this rule and boundary_window_ms were informed by Binance
+# files, so all of these are rechecked on the approved source. A failed check flags bars and never removes them, so
+# this window does not decide which days exist. Changing it before that recheck is a counted trial under C12.
 [reconcile.BTCUSDT]
 daily_total_abs = 0.000001
 boundary_window_ms = 250.0
-bar_price_abs = 15.0
+bar_price_rel = 0.02
+fill_count_rel = 0.01
 
 [reconcile.ETHUSDT]
 daily_total_abs = 0.000001
 boundary_window_ms = 250.0
-bar_price_abs = 1.5
+bar_price_rel = 0.02
+fill_count_rel = 0.01
 
 # ---- Archive datasets. Lower priority numbers run first on the same date. --------------------------------
+# live_eligible: a live run may read this dataset. A live run sees no book, under C17, so no book dataset is.
+# max_quiet_s: a silence longer than this is recorded as a gap even when ids run on. PLACEHOLDER, UNVERIFIED until
+# measured on the approved source. Zero means the dataset has no trades to fall quiet.
 
 [[datasets]]
 id = "binance.klines"
@@ -91,6 +128,8 @@ overdue_hours = 36.0
 light = true
 opt_in = false
 priority = 0
+live_eligible = false
+max_quiet_s = 0.0
 
 [[datasets]]
 id = "binance.fundingRate"
@@ -105,6 +144,8 @@ overdue_hours = 72.0
 light = true
 opt_in = false
 priority = 1
+live_eligible = false
+max_quiet_s = 0.0
 
 [[datasets]]
 id = "binance.bookDepth"
@@ -119,6 +160,8 @@ overdue_hours = 36.0
 light = true
 opt_in = false
 priority = 2
+live_eligible = false
+max_quiet_s = 0.0
 
 [[datasets]]
 id = "binance.aggTrades"
@@ -133,6 +176,8 @@ overdue_hours = 36.0
 light = true
 opt_in = false
 priority = 3
+live_eligible = false
+max_quiet_s = 900.0
 
 [[datasets]]
 id = "bybit.trades"
@@ -147,6 +192,8 @@ overdue_hours = 36.0
 light = false
 opt_in = false
 priority = 4
+live_eligible = false
+max_quiet_s = 900.0
 
 [[datasets]]
 id = "bybit.orderbook"
@@ -161,8 +208,11 @@ overdue_hours = 36.0
 light = false
 opt_in = true
 priority = 5
+live_eligible = false
+max_quiet_s = 0.0
 
 # ---- Hourly poll of closed trades. Own DATA_ROOT and own cache, so it stays small and fast. ---------------
+# It writes its own _live datasets, so an archive of the same venue cannot overwrite what a run really saw.
 
 [poll]
 venue = "kraken"
@@ -170,8 +220,12 @@ venue = "kraken"
 start_date = "2026-10-25"
 page_size = 1000
 min_interval_s = 1.1
-# A minute is emitted as a bar only once it closed this long before the fetch ended.
-bar_grace_s = 60.0
+# Declared run constants from convention C17. A change is a counted trial. A is UNVERIFIED until measured.
+allowance_a_s = 10.0
+nominal_minute = 7
+# One slow page must not exceed the run's own budget.
+timeout_s = 15.0
+attempts = 2
 default_time_budget_s = 120.0
 # Consecutive missed hourly slots that count as a state change worth a commit.
 missed_slots_alert = 6

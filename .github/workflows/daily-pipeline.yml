@@ -30,7 +30,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  DATA_QUOTA_GB: "8"
+  DATA_QUOTA_GB: "4"
   TIME_BUDGET: ${{ inputs.time_budget || '50m' }}
 
 jobs:
@@ -46,6 +46,7 @@ jobs:
       - name: Choose paths outside the repository
         run: |
           {
+            echo "JOB_STARTED_AT=$(date -u +%FT%TZ)"
             echo "DATA_ROOT=$RUNNER_TEMP/data_root"
             echo "LIVE_ROOT=$RUNNER_TEMP/live_root"
             echo "OUT_DIR=$RUNNER_TEMP/output"
@@ -56,6 +57,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
+          version: "0.11.24"
           enable-cache: false
       - name: Install
         run: uv sync --frozen --no-dev --python 3.12
@@ -84,10 +86,16 @@ jobs:
             -H "Accept: application/vnd.github.raw+json" > "$RESULTS_DIR/run_log/poll_runs.jsonl" \
             || echo "No poll log on the results branch yet."
       - name: Catch up on what the catalog says is missing
+        env:
+          INCLUDE_BOOK: ${{ inputs.include_book }}
+          SCHEDULE: ${{ github.event.schedule }}
+          EVENT: ${{ github.event_name }}
         run: |
           book=""
-          if [ "${{ inputs.include_book }}" = "true" ]; then book="--include-book"; fi
-          uv run --frozen --no-dev hft-crypto ingest --light $book --time-budget "$TIME_BUDGET" --delete-raw-after-curated
+          if [ "$INCLUDE_BOOK" = "true" ]; then book="--include-book"; fi
+          uv run --frozen --no-dev hft-crypto ingest --light $book --time-budget "$TIME_BUDGET" \
+            --delete-raw-after-curated \
+            --scheduled-cron "$SCHEDULE" --job-started-at "$JOB_STARTED_AT" --event "$EVENT"
       - name: Check polled bars
         run: uv run --frozen --no-dev hft-crypto reconcile-live --live-root "$LIVE_ROOT"
       - name: Plan retention, without deleting
@@ -130,6 +138,7 @@ jobs:
 
   deploy-pages:
     needs: pipeline
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -146,6 +155,7 @@ jobs:
   publish-results:
     # Runs no project code, because this is the only job here that can write to the repository.
     needs: pipeline
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -166,7 +176,8 @@ jobs:
 
   prune-cache:
     needs: pipeline
-    if: always() && needs.pipeline.outputs.cache_saved == 'success'
+    # Only the default branch prunes. A run from another branch must never delete the copy the schedule depends on.
+    if: always() && needs.pipeline.outputs.cache_saved == 'success' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -175,7 +186,8 @@ jobs:
       - name: Keep only the newest copy
         env:
           GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          gh cache list --repo "$GITHUB_REPOSITORY" --key data-center-v1- --sort created_at --order desc \
-            --limit 100 --json id --jq '.[1:][].id' |
+          gh cache list --repo "$GITHUB_REPOSITORY" --key data-center-v1- --ref "refs/heads/$DEFAULT_BRANCH" \
+            --sort created_at --order desc --limit 100 --json id --jq '.[1:][].id' |
             while read -r id; do gh cache delete "$id" --repo "$GITHUB_REPOSITORY"; done

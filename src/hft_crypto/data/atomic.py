@@ -18,7 +18,7 @@ from typing import Any
 
 import polars as pl
 
-from hft_crypto.data.guard import PathGuard
+from hft_crypto.data.guard import PathGuard, is_link
 
 TEMP_MARKER = ".tmp-"
 _TEMP_NAME = re.compile(r"^\..*\.tmp-\d+-[0-9a-f]+$")
@@ -147,7 +147,7 @@ def sweep_temp_files(guard: PathGuard, zones: tuple[str, ...]) -> list[str]:
         if not zone_path.is_dir():
             continue
         for current, directories, files in os.walk(zone_path, followlinks=False):
-            directories[:] = [d for d in directories if not Path(current, d).is_symlink()]
+            directories[:] = [d for d in directories if not is_link(Path(current, d))]
             for name in files:
                 candidate = Path(current, name)
                 if is_temp_file(candidate):

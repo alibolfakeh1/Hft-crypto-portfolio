@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import posixpath
 import stat
 from pathlib import Path
 
@@ -11,7 +12,27 @@ class PathGuardError(Exception):
     """A path resolves outside DATA_ROOT or passes through a symbolic link or junction."""
 
 
-def _is_link(path: str) -> bool:
+class NonCanonicalPathError(PathGuardError):
+    """A stored path is not in its one canonical form, so what it names cannot be read from its text."""
+
+
+def canonical_rel_path(path: str) -> str:
+    """Return a stored path unchanged, or refuse it.
+
+    The class of a file is read from the text of its path, so the text and the file must be the same thing.
+    `raw/archive/../../ledger/x` starts with an archive prefix and names the ledger, so it must never get as
+    far as being classified. The catalog travels through a cache, so its rows are input and are not trusted.
+    """
+    if not path or not isinstance(path, str):
+        raise NonCanonicalPathError(f"empty catalog path: {path!r}")
+    if "\\" in path or "\x00" in path or path.startswith("/") or ":" in path:
+        raise NonCanonicalPathError(f"catalog path is not a relative forward-slash path: {path!r}")
+    if posixpath.normpath(path) != path or path == "." or ".." in path.split("/"):
+        raise NonCanonicalPathError(f"catalog path is not canonical: {path!r}")
+    return path
+
+
+def is_link(path: str | Path) -> bool:
     """True for a symbolic link, a Windows junction, or any other reparse point."""
     try:
         info = os.lstat(path)
@@ -54,7 +75,7 @@ class PathGuard:
             if part == os.curdir:
                 continue
             current = str(Path(current, part))
-            if _is_link(current):
+            if is_link(current):
                 raise PathGuardError(f"path passes through a link: {current}")
         return Path(normal)
 

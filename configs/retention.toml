@@ -1,8 +1,8 @@
 # Retention policy, enforced by `hft-crypto retention` and by raw deletion during ingest.
 # Owned by data-steward. See docs/05_DATA_LIFECYCLE.md.
 #
-# A real delete needs the explicit --execute flag and a rule marked reviewed. Developers do not mark rules
-# reviewed. The one exception below is called out on the rule itself.
+# A real delete needs the explicit --execute flag and a rule marked reviewed. Only data-steward marks a rule
+# reviewed, and no rule is reviewed yet.
 #
 # Age is measured from when our file was created, not from the date of the data inside it, so a backfilled
 # file is never deleted early because its data is old.
@@ -25,24 +25,24 @@ day_of_month = 1
 kinds = ["trades", "book_depth"]
 protect_raw = false
 
-# Required by the owner's GitHub-only decision of 2026-11-04: raw is transient and goes as soon as its curated
-# data passes. It is marked reviewed because the workflow cannot run without it. data-steward has not confirmed
-# it yet, and python-reviewer should look at it first.
+# Raw is transient under D-15 and goes as soon as its curated data passes. Until data-steward marks this reviewed,
+# ingest keeps the files, and on a runner they disappear with the runner.
 [[rules]]
 id = "raw-archive-after-curated"
 zone = "raw/archive"
 kinds = ["klines", "aggTrades", "trades", "bookDepth", "fundingRate", "orderbook"]
 min_age_days = 0.0
-reviewed = true
-reviewed_note = "Owner decision of 2026-11-04, carried by the P1 brief. Awaiting data-steward confirmation."
+reviewed = false
+reviewed_note = "Awaiting data-steward confirmation, after the code review of 2026-11-04 (F-01, F-02, F-11)."
 watermark_bypass_pct = 85.0
 # Each entry is <derived kind>:<accepted check statuses>. All must exist among the file's descendants.
 [rules.requires]
 klines = ["candles_official:pass"]
 fundingRate = ["funding:pass"]
 bookDepth = ["book_depth:pass"]
-aggTrades = ["trades:pass", "bars_1m:pass,warn,provisional"]
-trades = ["trades:pass", "bars_1m:pass,warn,provisional"]
+# provisional stays accepted: the curated trades remain, and a later failure fetches the file again.
+aggTrades = ["trades:pass", "bars_1m:pass,provisional"]
+trades = ["trades:pass", "bars_1m:pass,provisional"]
 orderbook = ["book_replay:pass"]
 
 # Bars and other flow data stay. This limits the trades behind them, which take most of the cache. Without it
@@ -57,7 +57,7 @@ min_age_days = 90.0
 reviewed = false
 rebuildable_from_archive = true
 [rules.requires]
-trades = ["bars_1m:pass,warn"]
+trades = ["bars_1m:pass"]
 
 [[rules]]
 id = "raw-live-after-retention"
@@ -66,7 +66,7 @@ kinds = ["*"]
 min_age_days = 90.0
 reviewed = false
 [rules.requires]
-"*" = ["bars_1m:pass,warn"]
+"*" = ["bars_1m:pass"]
 
 [[rules]]
 id = "runs-unpublished-expired"

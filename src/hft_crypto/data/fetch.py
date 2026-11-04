@@ -16,11 +16,11 @@ from pathlib import Path
 from typing import Protocol
 
 from hft_crypto import __version__
-from hft_crypto.config import FetchConfig
+from hft_crypto.config import FetchConfig, is_prohibited_host
 
+# The outer limit, whatever a configuration says. A prohibited host is refused separately, and first.
 ALLOWED_HOSTS = frozenset(
     {
-        "data.binance.vision",
         "public.bybit.com",
         "quote-saver.bycsi.com",
         "api.kraken.com",
@@ -54,8 +54,22 @@ class Fetcher(Protocol):
         ...
 
 
-def check_url(url: str, allowed: frozenset[str] = ALLOWED_HOSTS) -> None:
+def check_url(url: str, allowed: frozenset[str]) -> None:
+    """Refuse anything but plain HTTPS to an allowed host. There is no way to widen this for a prohibited
+    host."""
+    if "\\" in url or any(ord(character) < 33 for character in url):
+        raise ForbiddenHostError("refused URL: it holds a backslash, a space or a control character")
     parsed = urllib.parse.urlsplit(url)
+    if "@" in parsed.netloc:
+        raise ForbiddenHostError("refused URL: it names a user")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ForbiddenHostError("refused URL: bad port") from exc
+    if port is not None:
+        raise ForbiddenHostError("refused URL: it names a port")
+    if is_prohibited_host(parsed.hostname):
+        raise ForbiddenHostError(f"refused URL: {parsed.hostname} is prohibited")
     if parsed.scheme != "https" or parsed.hostname not in allowed:
         raise ForbiddenHostError(f"refused URL: {parsed.scheme}://{parsed.hostname}")
 
@@ -111,7 +125,12 @@ class HttpFetcher:
                 if exc.code in (403, 451):
                     raise FetchError(f"HTTP {exc.code} from {_host(url)}") from exc
                 last_error = exc
-            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+            except (ForbiddenHostError, FetchError):
+                raise
+            except Exception as exc:
+                # A broken response raises from several families, some with no base but Exception: an
+                # incomplete read, a bad status line, a Content-Length that is not a number. All are one more
+                # failed attempt.
                 last_error = exc
         raise FetchError(f"{_host(url)}: {last_error}") from last_error
 
@@ -126,7 +145,7 @@ class HttpFetcher:
                         raise FetchError(f"{_host(url)}: response exceeds {max_bytes} bytes")
                     output.write(chunk)
             if declared is not None and int(declared) != total:
-                raise FetchError(f"{_host(url)}: got {total} of {declared} bytes")
+                raise OSError(f"got {total} of {declared} bytes")
             return total
 
         return self._attempt(url, action)
@@ -134,9 +153,12 @@ class HttpFetcher:
     def get_bytes(self, url: str, max_bytes: int) -> bytes:
         def action() -> bytes:
             with self._open(url) as response:  # type: ignore[attr-defined]
+                declared = response.headers.get("Content-Length")
                 body: bytes = response.read(max_bytes + 1)
             if len(body) > max_bytes:
                 raise FetchError(f"{_host(url)}: response exceeds {max_bytes} bytes")
+            if declared is not None and int(declared) != len(body):
+                raise OSError(f"got {len(body)} of {declared} bytes")
             return body
 
         return self._attempt(url, action)

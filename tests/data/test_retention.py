@@ -11,14 +11,15 @@ from typing import Any
 
 import pytest
 
-from helpers import base_policy, make_context, policy_with_rules
-from hft_crypto.config import ConfigError, RetentionPolicy
+from helpers import base_policy, make_context, poison_parent, poison_row, policy_with_rules
+from hft_crypto.config import ConfigError
 from hft_crypto.data.atomic import sha256_file
 from hft_crypto.data.catalog import FileRecord
 from hft_crypto.data.context import JobContext
-from hft_crypto.data.guard import PathGuardError
+from hft_crypto.data.guard import NonCanonicalPathError
 from hft_crypto.data.retention import (
     DeletionRefused,
+    PlanItem,
     RetentionPlan,
     WatermarkState,
     build_plan,
@@ -27,6 +28,7 @@ from hft_crypto.data.retention import (
     evaluate_watermarks,
     execute_plan,
 )
+from hft_crypto.data.zones import classify, measure_zones
 
 NOW = dt.datetime(2026, 11, 4, 12, 0, tzinfo=dt.UTC)
 OLD = "2026-01-01T00:00:00Z"
@@ -177,8 +179,9 @@ def test_a_rule_not_marked_reviewed_cannot_delete(tmp_path: Path) -> None:
     assert "not marked reviewed" in reason
 
 
-def test_the_shipped_policy_marks_only_the_raw_rule_reviewed() -> None:
-    assert [rule.id for rule in base_policy().rules if rule.reviewed] == ["raw-archive-after-curated"]
+def test_no_shipped_rule_is_marked_reviewed() -> None:
+    """A writer does not approve its own rule. data-steward confirms after the code review's fixes (F-11)."""
+    assert [rule.id for rule in base_policy().rules if rule.reviewed] == []
 
 
 # ---- outside DATA_ROOT and links ---------------------------------------------------------------------------
@@ -191,39 +194,21 @@ def test_the_shipped_policy_marks_only_the_raw_rule_reviewed() -> None:
 def test_catalog_paths_outside_the_root_are_refused(tmp_path: Path, escape: str) -> None:
     outside = tmp_path / "outside.txt"
     outside.write_text("keep me")
-    rule = raw_rule(zone="raw/archive", requires={})
-    ctx = make_context(tmp_path / "a" / "b" / "root", now=NOW, policy=policy_with_rules([rule]))
-    ctx.catalog.register_file(
-        FileRecord(
-            rel_path=escape,
-            dataset_id="d",
-            kind="aggTrades",
-            partition_key="2026-11-02",
-            date_start=None,
-            date_end=None,
-            size_bytes=7,
-            sha256=sha256_file(outside),
-            row_count=None,
-            source_url="https://archive/x",
-            created_at=OLD,
-            code_version="t",
-            check_status="pass",
-        )
-    )
+    ctx = make_context(tmp_path / "a" / "b" / "root", now=NOW, policy=policy_with_rules([raw_rule()]))
+    poison_row(ctx, escape, kind="aggTrades", file=outside)
     plan = plan_for(ctx)
-    for item in plan.deletable:
-        pytest.fail(f"planned deletion of {item.rel_path}")
-    with pytest.raises(PathGuardError):
-        delete_file(ctx, escape, ctx.policy.rule("raw"), data_class="RE-DOWNLOADABLE")
+    assert plan.deletable == []
+    with pytest.raises(DeletionRefused):
+        delete_file(ctx, escape, ctx.policy.rule("raw"))
     assert outside.read_text() == "keep me"
 
 
 def test_absolute_paths_outside_the_root_are_refused(tmp_path: Path) -> None:
     outside = tmp_path / "outside.txt"
     outside.write_text("keep me")
-    ctx = make_context(tmp_path / "root", now=NOW, policy=policy_with_rules([raw_rule(requires={})]))
-    with pytest.raises((PathGuardError, DeletionRefused)):
-        delete_file(ctx, str(outside), ctx.policy.rule("raw"), data_class="RE-DOWNLOADABLE")
+    ctx = make_context(tmp_path / "root", now=NOW, policy=policy_with_rules([raw_rule()]))
+    with pytest.raises(DeletionRefused):
+        delete_file(ctx, str(outside), ctx.policy.rule("raw"))
     assert outside.read_text() == "keep me"
 
 
@@ -231,7 +216,7 @@ def test_files_behind_a_link_are_refused(tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "x.zip").write_text("keep me")
-    ctx = make_context(tmp_path / "root", now=NOW, policy=policy_with_rules([raw_rule(requires={})]))
+    ctx = make_context(tmp_path / "root", now=NOW, policy=policy_with_rules([raw_rule()]))
     link = ctx.root.path / "raw" / "archive" / "link"
     if os.name == "nt":
         done = subprocess.run(
@@ -262,8 +247,8 @@ def test_files_behind_a_link_are_refused(tmp_path: Path) -> None:
     plan = plan_for(ctx)
     assert plan.deletable == []
     assert "link" in plan.blocked[0].reason
-    with pytest.raises(PathGuardError):
-        delete_file(ctx, rel, ctx.policy.rule("raw"), data_class="RE-DOWNLOADABLE")
+    with pytest.raises(DeletionRefused, match="link"):
+        delete_file(ctx, rel, ctx.policy.rule("raw"))
     assert (outside / "x.zip").read_text() == "keep me"
 
 
@@ -297,7 +282,9 @@ def test_irreplaceable_inside_retention_is_never_deleted_at_any_watermark(tmp_pa
     assert plan.deletable == []
     assert plan.blocked[0].data_class == "IRREPLACEABLE"
     assert "inside its retention period" in plan.blocked[0].reason
-    assert execute_plan(ctx, plan).deleted_files == 0
+    # And a forged plan for the same file, at the same watermark, gets nowhere either.
+    with pytest.raises(DeletionRefused, match="inside its retention period"):
+        delete_file(ctx, LIVE, ctx.policy.rule("live"), used_pct=pct)
     assert (ctx.root.path / LIVE).is_file()
 
 
@@ -340,12 +327,19 @@ def test_a_rule_cannot_give_irreplaceable_data_no_retention() -> None:
         policy_with_rules([live_rule(min_age_days=0.0)])
 
 
-def test_ledger_files_survive_even_if_catalogued(tmp_path: Path) -> None:
-    policy = policy_with_rules([raw_rule(zone="raw/archive", kinds=["*"], requires={})])
-    ctx = make_context(tmp_path / "r", now=NOW, policy=policy)
+def test_ledger_files_survive_a_rule_that_really_selects_their_zone(tmp_path: Path) -> None:
+    """The rule's zone matches here, so this reaches the class logic and not just the zone filter."""
+    from dataclasses import replace
+
+    ctx = make_context(tmp_path / "r", now=NOW, policy=policy_with_rules([raw_rule()]))
     add_file(ctx, "ledger/events.jsonl", kind="aggTrades", partition=None)
+    hostile = replace(ctx.policy.rule("raw"), zone="ledger", kinds=("*",), requires={})
+    ctx.policy = replace(ctx.policy, rules=(hostile,))
     plan = plan_for(ctx, pct=200.0)
     assert plan.deletable == []
+    assert plan.blocked[0].reason == "this zone is never deleted"
+    with pytest.raises(DeletionRefused, match="never deleted"):
+        delete_file(ctx, "ledger/events.jsonl", hostile)
     assert (ctx.root.path / "ledger/events.jsonl").is_file()
 
 
@@ -426,11 +420,11 @@ def test_sample_days_are_kept_as_curated_data(tmp_path: Path) -> None:
 
 def test_raw_sample_days_can_be_protected_by_policy(tmp_path: Path) -> None:
     policy = policy_with_rules(
-        [raw_rule(requires={})],
+        [raw_rule()],
         sample_days={"day_of_month": 2, "kinds": ["trades"], "protect_raw": True},
     )
     ctx = make_context(tmp_path / "r", now=NOW, policy=policy)
-    add_file(ctx, RAW, kind="aggTrades", source="https://archive/x.zip")
+    add_raw_with_children(ctx)
     plan = plan_for(ctx)
     assert plan.deletable == []
     assert plan.blocked[0].data_class == "IRREPLACEABLE"
@@ -605,27 +599,45 @@ def test_warning_reports_days_until_full() -> None:
     assert any("12 days" in alert for alert in result.alerts)
 
 
-@pytest.mark.parametrize(("growth", "alerts"), [(GB / 2.0, 0), (GB * 2.0, 1), (None, 0), (0.0, 0)])
-def test_recording_headroom_alert_fires_whatever_the_percentage(growth: float | None, alerts: int) -> None:
-    # 10% of 8 GB used leaves 7.2 GB: 14.4 days at 0.5 GB a day, 3.6 at 2 GB, and under 3 at 3 GB.
-    used = int(QUOTA * 0.10)
+@pytest.mark.parametrize(
+    ("gb_per_day", "days_left", "alerts"),
+    [
+        # 10% of 8 GB used leaves 7.2 GB.
+        (0.5, 14.4, 0),
+        (2.0, 3.6, 0),
+        (3.0, 2.4, 1),
+    ],
+)
+def test_recording_headroom_alert_fires_whatever_the_percentage(
+    gb_per_day: float, days_left: float, alerts: int
+) -> None:
     result = evaluate_watermarks(
-        used,
-        QUOTA,
-        base_policy().watermarks,
-        live_growth_bytes_per_day=growth if growth != GB * 2.0 else GB * 3.0,
+        int(QUOTA * 0.10), QUOTA, base_policy().watermarks, live_growth_bytes_per_day=gb_per_day * GB
     )
+    assert result.level == "normal"
+    assert result.headroom_days == days_left
     assert sum("headroom" in alert for alert in result.alerts) == alerts
 
 
+@pytest.mark.parametrize("growth", [None, 0.0])
+def test_recording_headroom_is_silent_when_nothing_records(growth: float | None) -> None:
+    result = evaluate_watermarks(
+        int(QUOTA * 0.10), QUOTA, base_policy().watermarks, live_growth_bytes_per_day=growth
+    )
+    assert result.headroom_days is None
+    assert result.alerts == ()
+
+
 def test_85_percent_frees_oldest_first_and_stops_at_the_target(tmp_path: Path) -> None:
-    rule = raw_rule(min_age_days=30.0, requires={}, kinds=["aggTrades"], watermark_bypass_pct=85.0)
+    rule = raw_rule(min_age_days=30.0, requires={"aggTrades": ["trades:pass"]}, watermark_bypass_pct=85.0)
     ctx = make_context(tmp_path / "r", now=NOW, policy=policy_with_rules([rule]))
     paths = []
     for index in range(4):
         rel = f"raw/archive/binance/aggTrades/BTCUSDT/date=2026-11-0{index + 1}/x{index}.zip"
         created = f"2026-11-0{index + 1}T00:00:00Z"
         add_file(ctx, rel, kind="aggTrades", created=created, source="https://a/x", partition=None)
+        child = f"curated/trades/venue=binance/symbol=BTCUSDT/month=2026-11/part-2026-11-0{index + 1}.parquet"
+        add_file(ctx, child, kind="trades", parents=(rel,))
         paths.append(rel)
     size = (ctx.root.path / paths[0]).stat().st_size
     # Quota small enough that one file is about 1%: 86% used needs two files gone to fall below 85%.
@@ -636,10 +648,11 @@ def test_85_percent_frees_oldest_first_and_stops_at_the_target(tmp_path: Path) -
 
 
 def test_below_the_watermark_age_still_rules(tmp_path: Path) -> None:
-    rule = raw_rule(min_age_days=30.0, requires={}, watermark_bypass_pct=85.0)
+    rule = raw_rule(min_age_days=30.0, watermark_bypass_pct=85.0)
     ctx = make_context(tmp_path / "r", now=NOW, policy=policy_with_rules([rule]))
-    add_file(ctx, RAW, kind="aggTrades", created=RECENT, source="https://a/x")
+    add_raw_with_children(ctx, created=RECENT)
     assert plan_for(ctx, pct=84.0).deletable == []
+    assert [item.rel_path for item in plan_for(ctx, pct=85.0).deletable] == [RAW]
 
 
 # ---- raw deletion during ingest ----------------------------------------------------------------------------
@@ -676,5 +689,298 @@ def test_empty_partition_folders_are_cleaned_but_zones_stay(ctx: JobContext) -> 
     assert (ctx.root.path / "raw/archive").is_dir()
 
 
-def test_policy_type_is_what_the_shipped_file_parses_to() -> None:
-    assert isinstance(base_policy(), RetentionPolicy)
+# ---- F-01: the class and the file must come from the same path ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "raw/archive/../../ledger/events.jsonl",
+        "raw/archive/binance/klines/BTCUSDT/date=2026-11-02/../../../../../../ledger/events.jsonl",
+        "raw/archive/./x.zip",
+        "raw//archive/x.zip",
+        "raw/archive/x.zip/",
+        "/raw/archive/x.zip",
+        "C:/raw/archive/x.zip",
+        "raw\\archive\\x.zip",
+        "raw/archive/x\x00.zip",
+        ".",
+        "",
+    ],
+)
+def test_a_path_that_is_not_canonical_is_refused_at_every_door(tmp_path: Path, path: str) -> None:
+    ctx = make_context(tmp_path / "r", now=NOW, policy=policy_with_rules([raw_rule()]))
+    with pytest.raises(NonCanonicalPathError):
+        classify(path)
+    with pytest.raises(NonCanonicalPathError):
+        ctx.catalog.register_file(_record(path))
+    with pytest.raises(NonCanonicalPathError):
+        ctx.catalog.register_file(_record(RAW), [path])
+    with pytest.raises(DeletionRefused):
+        delete_file(ctx, path, ctx.policy.rule("raw"))
+
+
+@pytest.mark.parametrize("zone", ["ledger", "decisions", "raw/live", "curated", "catalog"])
+@pytest.mark.parametrize(
+    "prefix",
+    ["raw/archive/../../", "raw/archive/binance/klines/BTCUSDT/date=2026-11-02/../../../../../../"],
+    ids=["short", "ingest-prefix"],
+)
+def test_a_traversal_row_cannot_delete_another_zone(tmp_path: Path, zone: str, prefix: str) -> None:
+    """The review's probe: correct checksum, a passing child, the shipped kind, and class text that lies."""
+    ctx = make_context(
+        tmp_path / "r",
+        now=NOW,
+        policy=policy_with_rules([raw_rule(kinds=["klines"], requires={"klines": ["trades:pass"]})]),
+    )
+    victim = ctx.root.path / zone / "events.jsonl"
+    victim.parent.mkdir(parents=True, exist_ok=True)
+    victim.write_text("keep me")
+    forged = f"{prefix}{zone}/events.jsonl"
+    poison_row(ctx, forged, kind="klines", file=victim)
+    add_file(ctx, TRADES, kind="trades")
+    poison_parent(ctx, TRADES, forged)
+    plan = plan_for(ctx)
+    assert plan.deletable == []
+    assert "not canonical" in plan.blocked[0].reason
+    assert plan.blocked[0].data_class == "UNKNOWN"
+    assert execute_plan(ctx, _forged_plan(forged, "raw")).deleted_files == 0
+    deleted, _ = delete_raw_if_allowed(ctx, forged, "raw")
+    assert deleted is False
+    assert victim.read_text() == "keep me"
+    assert not ctx.root.deletions_log.exists()
+
+
+def test_a_traversal_row_cannot_stop_ingest_from_finding_real_raw_files(tmp_path: Path) -> None:
+    """Prefix search still returns the row, and the protocol refuses it without an exception."""
+    ctx = make_context(tmp_path / "r", now=NOW, policy=policy_with_rules([raw_rule()]))
+    victim = ctx.root.path / "ledger" / "events.jsonl"
+    victim.write_text("keep me")
+    forged = "raw/archive/binance/aggTrades/BTCUSDT/date=2026-11-02/../../../../../../ledger/events.jsonl"
+    poison_row(ctx, forged, kind="aggTrades", file=victim)
+    add_raw_with_children(ctx)
+    rows = ctx.catalog.files(prefix="raw/archive/binance/aggTrades/BTCUSDT/date=2026-11-02/")
+    assert {row.rel_path for row in rows} == {forged, RAW}
+    results = {row.rel_path: delete_raw_if_allowed(ctx, row.rel_path, "raw")[0] for row in rows}
+    assert results == {forged: False, RAW: True}
+    assert victim.read_text() == "keep me"
+
+
+# ---- F-02: nothing is taken on trust at the moment of deletion
+# ----------------------------------------------
+
+
+def _record(path: str) -> FileRecord:
+    return FileRecord(
+        rel_path=path,
+        dataset_id="d",
+        kind="aggTrades",
+        partition_key="2026-11-02",
+        date_start=None,
+        date_end=None,
+        size_bytes=1,
+        sha256="0" * 64,
+        row_count=None,
+        source_url="https://archive/x",
+        created_at=OLD,
+        code_version="t",
+        check_status="pass",
+    )
+
+
+def _forged_plan(path: str, rule_id: str, data_class: str = "RE-DOWNLOADABLE") -> RetentionPlan:
+    plan = RetentionPlan(
+        generated_at="2026-11-04T00:00:00Z",
+        policy_version="x",
+        used_bytes=0,
+        quota_bytes=QUOTA,
+        watermark_level="normal",
+        alerts=[],
+    )
+    plan.deletable.append(
+        PlanItem(
+            rel_path=path,
+            data_class=data_class,
+            size_bytes=1,
+            rule_id=rule_id,
+            action="delete",
+            reason="age",
+            reviewed=True,
+            created_at=OLD,
+        )
+    )
+    return plan
+
+
+def test_a_forged_plan_item_for_the_ledger_deletes_nothing(tmp_path: Path) -> None:
+    ctx = make_context(tmp_path / "r", now=NOW, policy=policy_with_rules([raw_rule()]))
+    add_file(ctx, "ledger/events.jsonl", kind="aggTrades", partition=None, source="https://a/x")
+    result = execute_plan(ctx, _forged_plan("ledger/events.jsonl", "raw"))
+    assert result.deleted_files == 0
+    assert "does not cover" in result.refused[0]["reason"]
+    assert (ctx.root.path / "ledger/events.jsonl").is_file()
+
+
+def test_the_review_call_to_delete_the_ledger_directly_is_refused(tmp_path: Path) -> None:
+    ctx = make_context(tmp_path / "r", now=NOW, policy=policy_with_rules([raw_rule()]))
+    add_file(ctx, "ledger/e2.jsonl", kind="aggTrades", partition=None, source="https://a/x")
+    with pytest.raises(DeletionRefused, match="does not cover"):
+        delete_file(ctx, "ledger/e2.jsonl", ctx.policy.rule("raw"))
+    assert (ctx.root.path / "ledger/e2.jsonl").is_file()
+
+
+def test_a_stale_plan_is_refused_when_its_derived_data_has_gone(tmp_path: Path) -> None:
+    ctx = make_context(tmp_path / "r", now=NOW, policy=policy_with_rules([raw_rule()]))
+    add_raw_with_children(ctx)
+    plan = plan_for(ctx)
+    assert [item.rel_path for item in plan.deletable] == [RAW]
+    # Between the plan and its execution, the bars leave.
+    ctx.catalog.set_file_status(BARS, "quarantined", "2026-11-04T11:30:00Z")
+    result = execute_plan(ctx, plan)
+    assert result.deleted_files == 0
+    assert "derived data missing: bars_1m" in result.refused[0]["reason"]
+    assert (ctx.root.path / RAW).is_file()
+
+
+def test_a_stale_plan_is_refused_when_its_derived_data_has_started_failing(tmp_path: Path) -> None:
+    ctx = make_context(tmp_path / "r", now=NOW, policy=policy_with_rules([raw_rule()]))
+    add_raw_with_children(ctx)
+    plan = plan_for(ctx)
+    add_file(ctx, TRADES, kind="trades", parents=(RAW,), status="fail")
+    assert execute_plan(ctx, plan).deleted_files == 0
+    assert (ctx.root.path / RAW).is_file()
+
+
+def test_a_plan_cannot_claim_a_watermark_that_is_not_real(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The plan says 99% full. The disk says otherwise, so a young file keeps its retention period."""
+    monkeypatch.setenv("DATA_QUOTA_GB", "8")
+    rule = raw_rule(min_age_days=30.0, watermark_bypass_pct=85.0)
+    ctx = make_context(tmp_path / "r", now=NOW, policy=policy_with_rules([rule]))
+    add_raw_with_children(ctx, created=RECENT)
+    plan = plan_for(ctx, pct=99.0)
+    assert [item.rel_path for item in plan.deletable] == [RAW]
+    result = execute_plan(ctx, plan)
+    assert result.deleted_files == 0
+    assert "below 30" in result.refused[0]["reason"]
+    assert (ctx.root.path / RAW).is_file()
+
+
+def test_a_real_watermark_does_allow_it_and_stops_at_the_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rule = raw_rule(min_age_days=30.0, watermark_bypass_pct=85.0)
+    ctx = make_context(tmp_path / "r", now=NOW, policy=policy_with_rules([rule]))
+    add_raw_with_children(ctx, created=RECENT)
+    used = sum(measure_zones(ctx.root).values())
+    # Quota chosen so that today's real use is above 85%.
+    monkeypatch.setenv("DATA_QUOTA_GB", str(used / 0.90 / 1_000_000_000))
+    plan = plan_for(ctx, pct=90.0, quota=int(used / 0.90))
+    assert execute_plan(ctx, plan).deleted_files == 1
+    assert not (ctx.root.path / RAW).exists()
+
+
+def test_a_plan_naming_an_unknown_rule_is_refused(tmp_path: Path) -> None:
+    ctx = make_context(tmp_path / "r", now=NOW, policy=policy_with_rules([raw_rule()]))
+    add_raw_with_children(ctx)
+    result = execute_plan(ctx, _forged_plan(RAW, "no-such-rule"))
+    assert result.deleted_files == 0
+    assert "unknown retention rule" in result.refused[0]["reason"]
+
+
+def test_the_deletion_log_records_the_class_found_and_not_the_class_claimed(tmp_path: Path) -> None:
+    ctx = make_context(tmp_path / "r", now=NOW, policy=policy_with_rules([raw_rule()]))
+    add_raw_with_children(ctx)
+    assert execute_plan(ctx, _forged_plan(RAW, "raw", data_class="SOMETHING ELSE")).deleted_files == 1
+    line = json.loads(ctx.root.deletions_log.read_text(encoding="utf-8").splitlines()[0])
+    assert line["class"] == "RE-DOWNLOADABLE"
+
+
+def test_a_file_in_two_rules_counts_once_in_the_space_freed(tmp_path: Path) -> None:
+    second = raw_rule(id="raw2")
+    ctx = make_context(tmp_path / "r", now=NOW, policy=policy_with_rules([raw_rule(), second]))
+    add_raw_with_children(ctx)
+    plan = plan_for(ctx)
+    assert len(plan.deletable) == 2
+    assert plan.bytes_freed_if_run == (ctx.root.path / RAW).stat().st_size
+
+
+# ---- F-11: retention fails closed
+# ----------------------------------------------------------------------------
+
+
+def test_a_raw_rule_with_a_kind_that_has_no_requirement_is_refused_at_load() -> None:
+    with pytest.raises(ConfigError, match="no derived-data requirement"):
+        policy_with_rules([raw_rule(kinds=["aggTrades", "newKind"], requires={"aggTrades": ["trades:pass"]})])
+
+
+def test_a_raw_live_rule_with_no_requirement_is_refused_at_load() -> None:
+    with pytest.raises(ConfigError, match="no derived-data requirement"):
+        policy_with_rules([live_rule(requires={})])
+
+
+def test_a_row_with_no_stated_requirement_is_kept_even_past_load(tmp_path: Path) -> None:
+    """If a rule object somehow has no requirement, the file is refused rather than deleted."""
+    from dataclasses import replace
+
+    ctx = make_context(tmp_path / "r", now=NOW, policy=policy_with_rules([raw_rule()]))
+    add_file(ctx, RAW, kind="aggTrades", source="https://a/x")
+    hollow = replace(ctx.policy.rule("raw"), requires={})
+    with pytest.raises(DeletionRefused, match="no derived-data requirement"):
+        delete_file(ctx, RAW, hollow)
+    assert (ctx.root.path / RAW).is_file()
+
+
+def test_irreplaceable_past_retention_with_no_requirement_is_kept(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    ctx = make_context(tmp_path / "r", now=NOW, policy=policy_with_rules([live_rule()]))
+    add_file(ctx, LIVE, kind="book", created=OLD)
+    hollow = replace(ctx.policy.rule("live"), requires={})
+    with pytest.raises(DeletionRefused, match="no derived-data requirement"):
+        delete_file(ctx, LIVE, hollow)
+    assert (ctx.root.path / LIVE).is_file()
+
+
+def test_raw_with_no_source_url_is_kept_because_nothing_could_fetch_it_again(tmp_path: Path) -> None:
+    ctx = make_context(tmp_path / "r", now=NOW, policy=policy_with_rules([raw_rule()]))
+    add_raw_with_children(ctx)
+    add_file(ctx, RAW, kind="aggTrades", source=None)
+    plan = plan_for(ctx)
+    assert plan.deletable == []
+    assert "no source URL" in plan.blocked[0].reason
+
+
+@pytest.mark.parametrize("value", ["false", "true", "", 0, 1])
+def test_reviewed_must_be_a_real_boolean(value: object) -> None:
+    with pytest.raises(ConfigError, match="must be true or false"):
+        policy_with_rules([raw_rule(reviewed=value)])
+
+
+def test_a_misspelt_rule_key_is_refused_instead_of_read_as_its_default() -> None:
+    rule = raw_rule()
+    rule["reviewd"] = False
+    with pytest.raises(ConfigError, match="unknown keys"):
+        policy_with_rules([rule])
+
+
+def test_a_catalog_row_with_a_broken_date_is_refused_not_crashed_on(tmp_path: Path) -> None:
+    ctx = make_context(tmp_path / "r", now=NOW, policy=policy_with_rules([raw_rule()]))
+    add_raw_with_children(ctx, created="not a date")
+    plan = plan_for(ctx)
+    assert plan.deletable == []
+    assert "cannot be read" in plan.blocked[0].reason
+
+
+def test_the_shipped_raw_rule_asks_for_a_passing_day_and_is_not_reviewed() -> None:
+    """F-23 and F-11. `warn` is no longer enough, and a writer does not approve its own rule."""
+    rule = base_policy().rule("raw-archive-after-curated")
+    assert rule.reviewed is False
+    for kind in ("aggTrades", "trades"):
+        assert ("trades", frozenset({"pass"})) in rule.requires[kind]
+        assert ("bars_1m", frozenset({"pass", "provisional"})) in rule.requires[kind]
+    assert base_policy().rule("curated-trades-window").requires["trades"] == (
+        ("bars_1m", frozenset({"pass"})),
+    )
+    assert base_policy().rule("raw-live-after-retention").requires["*"] == (("bars_1m", frozenset({"pass"})),)

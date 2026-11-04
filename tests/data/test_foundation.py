@@ -24,7 +24,15 @@ from hft_crypto.data.atomic import (
 )
 from hft_crypto.data.catalog import Catalog, FileRecord
 from hft_crypto.data.guard import PathGuard, PathGuardError
-from hft_crypto.data.zones import ZONE_DIRS, DataClass, DataRoot, DataRootError, classify, resolve_data_root
+from hft_crypto.data.zones import (
+    ZONE_DIRS,
+    DataClass,
+    DataRoot,
+    DataRootError,
+    classify,
+    measure_zones,
+    resolve_data_root,
+)
 
 
 def make_junction(link: Path, target: Path) -> bool:
@@ -392,3 +400,34 @@ def test_prefix_search_treats_wildcards_literally(tmp_path: Path) -> None:
         catalog.register_file(record("raw/a_b/x"))
         catalog.register_file(record("raw/aXb/x"))
         assert [f.rel_path for f in catalog.files(prefix="raw/a_b/")] == ["raw/a_b/x"]
+
+
+def test_a_data_root_through_a_link_into_a_repository_is_refused(tmp_path: Path) -> None:
+    """F-23. The path as written looked clean, because `.absolute()` does not resolve links."""
+    repository = tmp_path / "repository"
+    (repository / ".git").mkdir(parents=True)
+    if not make_junction(tmp_path / "via", repository):
+        pytest.skip("cannot create a directory link")
+    with pytest.raises(DataRootError, match="outside the repository"):
+        DataRoot(tmp_path / "via" / "data")
+    assert not (repository / "data").exists()
+
+
+def test_a_link_inside_a_zone_stops_nothing_and_its_target_is_not_counted(tmp_path: Path) -> None:
+    """F-23. `os.walk` enters a junction, so the sweep raised and stopped ingest, and disk use counted the
+    target."""
+    from hft_crypto.data.atomic import temp_path_for
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "big.bin").write_bytes(b"x" * 5000)
+    leftover = temp_path_for(outside / "keep.parquet")
+    leftover.write_bytes(b"y")
+    root = DataRoot(tmp_path / "root")
+    if not make_junction(root.path / "curated" / "link", outside):
+        pytest.skip("cannot create a directory link")
+    (root.path / "curated" / "real.bin").write_bytes(b"z" * 7)
+    assert measure_zones(root)["curated"] == 7
+    assert sweep_temp_files(root.guard, ("curated",)) == []
+    assert (outside / "big.bin").is_file()
+    assert leftover.is_file()

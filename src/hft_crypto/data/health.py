@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import os
-from pathlib import Path
 from typing import Any
 
 from hft_crypto.config import NO_APPROVED_SOURCE, DatasetSpec, PipelineConfig, RetentionPolicy, quota_bytes
@@ -17,39 +15,8 @@ from hft_crypto.data.atomic import is_temp_file
 from hft_crypto.data.catalog import Catalog
 from hft_crypto.data.retention import evaluate_watermarks
 from hft_crypto.data.sources import expected_partitions
-from hft_crypto.data.zones import DataRoot
+from hft_crypto.data.zones import DataRoot, measure_zones
 from hft_crypto.timeutil import iso, parse_iso
-
-_MEASURED_ZONES = (
-    "raw/archive",
-    "raw/live",
-    "curated",
-    "features",
-    "results",
-    "ledger",
-    "decisions",
-    "quarantine",
-    "catalog",
-)
-
-
-def _directory_size(path: Path) -> int:
-    total = 0
-    for current, directories, files in os.walk(path, followlinks=False):
-        directories[:] = [d for d in directories if not Path(current, d).is_symlink()]
-        for name in files:
-            candidate = Path(current, name)
-            try:
-                if not candidate.is_symlink():
-                    total += candidate.stat().st_size
-            except OSError:
-                continue
-    return total
-
-
-def measure_zones(root: DataRoot) -> dict[str, int]:
-    """Bytes in each zone."""
-    return {zone: _directory_size(root.guard.check(zone)) for zone in _MEASURED_ZONES}
 
 
 def persisted_bytes(zones: dict[str, int], config: PipelineConfig) -> int:
@@ -196,10 +163,8 @@ def build_health(
         if spec.opt_in or not config.dataset_enabled(spec):
             continue
         for symbol in config.symbols:
+            # An enabled dataset that nothing has started is a coverage problem, and it shows here.
             item = coverage_for_dataset(catalog, spec, symbol, now)
-            # Bybit trades are opted into by naming them. Unstarted ones are not a coverage problem.
-            if not spec.light and item["done"] == 0:
-                continue
             coverage.append(item)
             if spec.curated == "trades":
                 bars.append(_bars_coverage(catalog, spec.venue, symbol, spec, now))
@@ -213,6 +178,23 @@ def build_health(
         alerts.append(f"{overdue} archive partitions are overdue.")
     if failed:
         alerts.append(f"{failed} archive partitions failed and are waiting to retry.")
+    for name in config.enabled_sources():
+        specs = [spec for spec in config.datasets if spec.venue == name and not spec.opt_in]
+        if specs and not any(spec.light for spec in specs):
+            alerts.append(
+                f"Approved source {name} has no dataset the daily job selects, so it fetches nothing."
+            )
+    for name in config.enabled_sources():
+        if config.source(name).allowance_state != "measured":
+            alerts.append(
+                f"Source {name} runs on a placeholder fill span allowance. It has not been measured."
+            )
+    changed = catalog.changed_files("raw/archive/")
+    if changed:
+        alerts.append(f"{len(changed)} delivered files changed after they were recorded.")
+    exclusions = catalog.exclusions()
+    if exclusions:
+        alerts.append(f"{len(exclusions)} symbol-days are left out of results, each with a logged reason.")
     partial = any(item["coverage_pct"] < 100.0 for item in coverage)
     last_runs = {}
     for kind, rows in catalog.last_runs().items():
@@ -239,6 +221,8 @@ def build_health(
         "coverage": coverage,
         "bars_coverage": bars,
         "gaps": catalog.gaps(),
+        "exclusions": exclusions,
+        "changed_delivered_files": changed,
         "disk": {
             "zones_bytes": zones,
             "total_bytes": total,

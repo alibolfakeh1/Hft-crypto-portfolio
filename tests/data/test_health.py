@@ -8,11 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from helpers import FakeFetcher, base_config, make_context, publish_binance_day, with_sources_enabled
+from helpers import FakeFetcher, base_config, make_context, publish_generated_day, with_sources_enabled
 from hft_crypto.config import ConfigError, PipelineConfig, load_pipeline_config, quota_bytes
 from hft_crypto.data.context import write_heartbeat
-from hft_crypto.data.health import build_health, measure_zones
+from hft_crypto.data.health import build_health
 from hft_crypto.data.ingest import IngestOptions, run_ingest
+from hft_crypto.data.zones import measure_zones
 from hft_crypto.timeutil import iso
 
 NOW = dt.datetime(2026, 3, 4, 10, tzinfo=dt.UTC)
@@ -32,9 +33,12 @@ def _config() -> PipelineConfig:
     )
 
 
-def test_quota_defaults_to_8_gb_and_the_variable_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_quota_defaults_to_under_half_of_the_cache_limit_and_the_variable_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-17. Each save makes a new copy before the old one is pruned, so two copies must fit in 10 GB."""
     monkeypatch.delenv("DATA_QUOTA_GB", raising=False)
-    assert quota_bytes(base_config().default_quota_gb) == 8_000_000_000
+    assert quota_bytes(base_config().default_quota_gb) == 4_000_000_000
     monkeypatch.setenv("DATA_QUOTA_GB", "2.5")
     assert quota_bytes(8.0) == 2_500_000_000
     monkeypatch.setenv("DATA_QUOTA_GB", "lots")
@@ -61,16 +65,16 @@ def test_zone_sizes_are_measured(tmp_path: Path) -> None:
 
 def test_partial_coverage_is_reported_with_missing_ranges(tmp_path: Path) -> None:
     fetcher = FakeFetcher()
-    publish_binance_day(fetcher, BTC, dt.date(2026, 3, 3))
+    publish_generated_day(fetcher, BTC, dt.date(2026, 3, 3))
     ctx = make_context(tmp_path / "r", now=NOW, config=_config())
     run_ingest(
         ctx,
         fetcher,
-        IngestOptions(dataset_ids=("binance.klines", "binance.aggTrades"), symbols=(BTC,)),
+        IngestOptions(dataset_ids=("generated.klines", "generated.aggTrades"), symbols=(BTC,)),
     )
     report = build_health(ctx.root, ctx.catalog, ctx.config, ctx.policy, NOW)
     assert report["partial_coverage"] is True
-    item = next(c for c in report["coverage"] if c["dataset"] == "binance.aggTrades")
+    item = next(c for c in report["coverage"] if c["dataset"] == "generated.aggTrades")
     assert item["expected"] == 3
     assert item["done"] == 1
     assert item["coverage_pct"] == 33.33
@@ -79,7 +83,7 @@ def test_partial_coverage_is_reported_with_missing_ranges(tmp_path: Path) -> Non
     # Day 1 is past its 36 hours at this moment. Day 2 ends at 03-03 00:00, so it is not, until 12:00 today.
     assert item["overdue"] == 1
     assert item["pending"] == 1
-    bars = next(b for b in report["bars_coverage"] if b["dataset"] == "bars_1m.binance")
+    bars = next(b for b in report["bars_coverage"] if b["dataset"] == "bars_1m.generated")
     assert bars["provisional"] == 1
     assert bars["expected"] == 3
 
@@ -88,7 +92,24 @@ def test_opt_in_datasets_do_not_count_against_coverage(tmp_path: Path) -> None:
     ctx = make_context(tmp_path / "r", now=NOW, config=_config())
     report = build_health(ctx.root, ctx.catalog, ctx.config, ctx.policy, NOW)
     assert not any(c["dataset"] == "bybit.orderbook" for c in report["coverage"])
-    assert not any(c["dataset"] == "bybit.trades" for c in report["coverage"])
+
+
+def test_an_enabled_dataset_nothing_has_started_shows_as_a_coverage_problem(tmp_path: Path) -> None:
+    """F-16. Health used to skip it, so approving a source could look like a healthy job with no data."""
+    ctx = make_context(tmp_path / "r", now=NOW, config=_config())
+    report = build_health(ctx.root, ctx.catalog, ctx.config, ctx.policy, NOW)
+    item = next(c for c in report["coverage"] if c["dataset"] == "bybit.trades")
+    assert item["done"] == 0
+    assert report["partial_coverage"] is True
+    assert any("bybit" in alert and "selects" in alert for alert in report["alerts"])
+
+
+def test_exclusions_and_changed_files_reach_the_alerts(tmp_path: Path) -> None:
+    ctx = make_context(tmp_path / "r", now=NOW, config=_config())
+    ctx.catalog.add_exclusion("generated", BTC, "2026-03-01", "because", 250.0, now=iso(NOW))
+    report = build_health(ctx.root, ctx.catalog, ctx.config, ctx.policy, NOW)
+    assert any("left out of results" in alert for alert in report["alerts"])
+    assert report["exclusions"][0]["date"] == "2026-03-01"
 
 
 def test_growth_and_days_until_full_come_from_measurement(
@@ -174,3 +195,12 @@ def test_deletions_of_the_last_day_are_summarised(tmp_path: Path) -> None:
         "bytes": 100,
         "by_rule": {"raw-archive-after-curated": 1},
     }
+
+
+def test_an_enabled_source_on_a_placeholder_allowance_raises_an_alert(tmp_path: Path) -> None:
+    ctx = make_context(tmp_path / "r", now=NOW, config=_config())
+    report = build_health(ctx.root, ctx.catalog, ctx.config, ctx.policy, NOW)
+    assert any("generated" in alert and "placeholder" in alert for alert in report["alerts"])
+    shipped = make_context(tmp_path / "s", now=NOW)
+    plain = build_health(shipped.root, shipped.catalog, shipped.config, shipped.policy, NOW)
+    assert not any("placeholder" in alert for alert in plain["alerts"])

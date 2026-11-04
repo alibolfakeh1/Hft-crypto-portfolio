@@ -9,17 +9,30 @@ that fact. How it treats the API, which must be checked again against the source
   share one timestamp, so rows are deduplicated on trade id. Trade ids are expected to run without gaps.
 - A lost cache rebuilds by starting the cursor over from the configured start date.
 
-Bars use the same code as the historical path, with two differences that keep the timing contract honest:
+The `fetch` stage of C17 lives here. A run records `t_poll` when its fetch attempt starts, sets `t_cut` from
+it, and must hold a record stamped after `t_cut`, or it steps back one minute and asks again, and otherwise
+logs `DATA_GAP`. A source that gives a server time could also pass on that. No adapter here reads one yet, so
+it is logged as absent.
+
+The rules for what comes out, which keep the timing contract honest:
+- This job writes its own datasets, `trades_live` and `bars_*_live`. Archive code has no name that reaches
+  them, so an archive of the same venue can never replace what a run saw.
+- A minute is emitted only through the earlier of `t_cut` and the minute before the newest trade held, because
+  only a later record shows a minute is over. A short page or an empty answer says nothing about the market.
+- An empty minute needs proof under C2. Trades on both sides with consecutive ids are proof. Anything else is
+  a gap.
 - A bar is knowable when this job received it, not when it closed, because this job is the only way a paper
   engine on GitHub could have it. That is usually about an hour after the close.
-- A bar, once emitted, is never rewritten. A trade arriving after its minute was emitted is counted as late,
-  and the daily check against a rebuild from all stored trades reports the difference.
+- A bar, once emitted, is never rewritten. A trade arriving after its minute was emitted goes in a corrections
+  log, and the daily check against a rebuild from all stored trades reports the difference.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
+import math
 import re
 import time
 import urllib.parse
@@ -30,16 +43,16 @@ from typing import Any
 
 import polars as pl
 
-from hft_crypto.bars.core import UTC_TIME, aggregate_bars, build_bars_1m
-from hft_crypto.config import PollConfig, PollPair, quota_bytes
+from hft_crypto.bars.core import UTC_TIME, aggregate_bars, build_bars_1m, closes_between
+from hft_crypto.config import ConfigError, PollConfig, PollPair, quota_bytes
 from hft_crypto.data.atomic import append_jsonl, atomic_write_json, atomic_write_parquet, read_parquet
 from hft_crypto.data.catalog import PollState
 from hft_crypto.data.context import JobContext, write_heartbeat
-from hft_crypto.data.derive import BARS_1M, TRADES, timeframe_dataset
+from hft_crypto.data.derive import timeframe_dataset
 from hft_crypto.data.fetch import Fetcher, FetchError
-from hft_crypto.data.health import measure_zones
 from hft_crypto.data.parsers import TRADE_SCHEMA, ValidationError
 from hft_crypto.data.retention import evaluate_watermarks
+from hft_crypto.data.zones import measure_zones
 from hft_crypto.timeutil import (
     MICROS_PER_DAY,
     MICROS_PER_MINUTE,
@@ -53,6 +66,21 @@ from hft_crypto.timeutil import (
     to_us,
 )
 from hft_crypto.versioning import code_version
+
+TRADES_LIVE = "trades_live"
+BARS_1M_LIVE = "bars_1m_live"
+EMISSION_FIRST = "first"
+EMISSION_REBUILD = "rebuild"
+_CORRECTIONS = "catalog/bar_corrections.jsonl"
+# Stamps outside this range cannot be real, and would overflow the date arithmetic further on.
+_MIN_STAMP_US = day_start_us(dt.date(2000, 1, 1))
+_MAX_STAMP_US = day_start_us(dt.date(2100, 1, 1))
+
+
+def live_dataset(minutes: int) -> str:
+    """The poll's dataset for a timeframe. It has its own names, so no archive code can write to it."""
+    return f"{timeframe_dataset(minutes)}_live"
+
 
 _MAX_RESPONSE_BYTES = 8_000_000
 _CRON_FIELD = re.compile(r"^(\*|\d+|\*/\d+)$")
@@ -93,16 +121,21 @@ def _parse_row(row: Any) -> KrakenTrade:
             raise ValidationError(f"unexpected Kraken side: {side!r}")
         price = float(row[0])
         qty = float(row[1])
+        if not (math.isfinite(price) and math.isfinite(qty)):
+            raise ValidationError("a Kraken price or volume is not a finite number")
         if price <= 0 or qty <= 0:
             raise ValidationError("non-positive Kraken price or volume")
+        ts_us = decimal_seconds_to_us(str(row[2]))
+        if not _MIN_STAMP_US <= ts_us < _MAX_STAMP_US:
+            raise ValidationError(f"a Kraken stamp is out of range: {str(row[2])[:30]}")
         return KrakenTrade(
             trade_id=int(row[6]),
-            ts_us=decimal_seconds_to_us(str(row[2])),
+            ts_us=ts_us,
             price=price,
             qty=qty,
             is_taker_buy=side == "b",
         )
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValidationError(f"bad Kraken trade row: {exc}") from exc
 
 
@@ -228,44 +261,66 @@ class SymbolResult:
     data_age_s: float | None = None
     gaps: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
+    t_poll: str | None = None
+    t_cut: str | None = None
+    stepped_back: bool = False
+    evidence: str | None = None
+    data_gap: bool = False
+    # No adapter here reads a source's server time, so these say so rather than leave it to be assumed.
+    skew_s: float | None = None
+    passed_on_server_time: bool = False
+    emitted_hash: str | None = None
+    bars_left_by_budget: bool = False
+    rebuilding: bool = False
 
 
-def _trades_frame(trades: list[KrakenTrade], venue: str, symbol: str) -> pl.DataFrame:
-    ts = pl.Series("ts", [t.ts_us for t in trades], dtype=pl.Int64).cast(UTC_TIME)
+def _floor_minute(value_us: int) -> int:
+    return (value_us // MICROS_PER_MINUTE) * MICROS_PER_MINUTE
+
+
+def _trades_frame(trades: list[KrakenTrade], venue: str, symbol: str, allowance_us: int) -> pl.DataFrame:
     frame = pl.DataFrame(
         [
             pl.repeat(venue, len(trades), eager=True, dtype=pl.String).alias("venue"),
             pl.repeat(symbol, len(trades), eager=True, dtype=pl.String).alias("symbol"),
-            ts,
+            pl.Series("ts", [t.ts_us for t in trades], dtype=pl.Int64).cast(UTC_TIME),
             pl.Series("price", [t.price for t in trades], dtype=pl.Float64),
             pl.Series("qty", [t.qty for t in trades], dtype=pl.Float64),
             pl.Series("is_taker_buy", [t.is_taker_buy for t in trades], dtype=pl.Boolean),
             pl.Series("trade_id", [t.trade_id for t in trades], dtype=pl.Int64),
+            pl.Series("file_row", [t.trade_id for t in trades], dtype=pl.Int64),
             pl.repeat(1, len(trades), eager=True, dtype=pl.Int32).alias("n_fills"),
             pl.repeat(False, len(trades), eager=True, dtype=pl.Boolean).alias("is_rpi"),
             # This job can only have known a trade when it received it, usually long after the trade.
-            pl.Series("knowable_time", [t.received_us for t in trades], dtype=pl.Int64).cast(UTC_TIME),
+            pl.Series(
+                "knowable_time",
+                [max(t.ts_us + allowance_us, t.received_us) for t in trades],
+                dtype=pl.Int64,
+            ).cast(UTC_TIME),
         ]
     )
     return frame.select(list(TRADE_SCHEMA))
 
 
-def _write_trades(ctx: JobContext, poll: PollConfig, symbol: str, trades: list[KrakenTrade]) -> set[dt.date]:
-    """Merge new trades into their day parts. Safe to repeat: rows are unique on trade id."""
+def _write_trades(
+    ctx: JobContext, poll: PollConfig, symbol: str, trades: list[KrakenTrade], allowance_us: int
+) -> set[dt.date]:
+    """Merge new trades into their day parts. Safe to repeat: rows are unique on trade id, and first receipt
+    stands."""
     by_day: dict[dt.date, list[KrakenTrade]] = {}
     for trade in trades:
         by_day.setdefault(date_of_us(trade.ts_us), []).append(trade)
     for day, rows in by_day.items():
-        part = ctx.root.curated_part(TRADES, poll.venue, symbol, day)
-        frame = _trades_frame(rows, poll.venue, symbol)
+        part = ctx.root.curated_part(TRADES_LIVE, poll.venue, symbol, day)
+        frame = _trades_frame(rows, poll.venue, symbol, allowance_us)
         if part.is_file():
             frame = pl.concat([read_parquet(part), frame])
-        merged = frame.unique(subset=["trade_id"], keep="first").sort(["ts", "trade_id"])
+        merged = frame.unique(subset=["trade_id"], keep="first", maintain_order=True).sort(["ts", "trade_id"])
         atomic_write_parquet(part, merged, guard=ctx.root.guard)
         ctx.register_output(
             part,
-            dataset_id=f"curated.{TRADES}.{poll.venue}.{symbol}",
-            kind=TRADES,
+            dataset_id=f"curated.{TRADES_LIVE}.{poll.venue}.{symbol}",
+            kind=TRADES_LIVE,
             zone="curated",
             partition_key=day.isoformat(),
             date_start=day.isoformat(),
@@ -281,31 +336,89 @@ def _write_trades(ctx: JobContext, poll: PollConfig, symbol: str, trades: list[K
 
 
 def _window_trades(ctx: JobContext, poll: PollConfig, symbol: str, day: dt.date) -> pl.DataFrame:
-    """Trades in the (day 00:00, next day 00:00] bar window, from the day's part and the next one."""
-    low = day_start_us(day)
-    high = low + MICROS_PER_DAY
-    low_time = pl.lit(low, dtype=pl.Int64).cast(UTC_TIME)
-    high_time = pl.lit(high, dtype=pl.Int64).cast(UTC_TIME)
-    frames = []
-    for candidate in (day, day + dt.timedelta(days=1)):
-        part = ctx.root.curated_part(TRADES, poll.venue, symbol, candidate)
-        if part.is_file():
-            frames.append(read_parquet(part).filter((pl.col("ts") > low_time) & (pl.col("ts") <= high_time)))
+    """Trades for the bars of one day, with the rows that prove continuity at its edges.
+
+    A day's first minute can be proved empty only by the last row before it, and its last by the first row
+    after it, however many days away those are. A trade stamped exactly at midnight belongs to the bar ending
+    there.
+    """
+    parts = {
+        dt.date.fromisoformat(path.stem.removeprefix("part-")): path
+        for path in ctx.root.curated_parts(TRADES_LIVE, poll.venue, symbol)
+    }
+    high = pl.lit(day_start_us(day) + MICROS_PER_DAY, dtype=pl.Int64).cast(UTC_TIME)
+    frames: list[pl.DataFrame] = []
+    earlier = [item for item in parts if item < day]
+    later = [item for item in parts if item > day]
+    if earlier:
+        frames.append(read_parquet(parts[max(earlier)]).sort(["ts", "trade_id"]).tail(1))
+    if day in parts:
+        frames.append(read_parquet(parts[day]))
+    if later:
+        rows = read_parquet(parts[min(later)]).sort(["ts", "trade_id"])
+        frames.extend([rows.filter(pl.col("ts") <= high), rows.head(1)])
     if not frames:
         return pl.DataFrame(schema=TRADE_SCHEMA)
-    return pl.concat(frames)
+    return pl.concat(frames).unique(subset=["trade_id"], keep="first", maintain_order=True)
 
 
-def rebuild_day_bars(ctx: JobContext, poll: PollConfig, symbol: str, day: dt.date) -> pl.DataFrame:
-    """All bars of a day rebuilt from stored trades. Used by the daily check against the emitted ones."""
-    low = day_start_us(day)
+def _build_day(
+    ctx: JobContext,
+    poll: PollConfig,
+    symbol: str,
+    day: dt.date,
+    first_close: int,
+    last_close: int,
+    received_us: int | None,
+    gap_closes: set[int],
+) -> pl.DataFrame:
+    source = ctx.config.source(poll.venue)
     return build_bars_1m(
         _window_trades(ctx, poll, symbol, day),
         venue=poll.venue,
         symbol=symbol,
-        first_close_us=low + MICROS_PER_MINUTE,
-        last_close_us=low + MICROS_PER_DAY,
+        first_close_us=first_close,
+        last_close_us=last_close,
+        continuity=source.continuity,
+        fill_span_allowance_us=source.fill_span_allowance_us,
+        received_at_us=received_us,
+        gap_close_us=gap_closes,
     )
+
+
+def rebuild_day_bars(ctx: JobContext, poll: PollConfig, symbol: str, day: dt.date) -> pl.DataFrame:
+    """All bars of a day from every stored trade, for comparison with what was emitted.
+
+    It has no knowable_time column, because nobody knew these values at any one time. A bar that says when it
+    could be known has to come from the emitted dataset.
+    """
+    low = day_start_us(day)
+    return _build_day(
+        ctx,
+        poll,
+        symbol,
+        day,
+        low + MICROS_PER_MINUTE,
+        low + MICROS_PER_DAY,
+        None,
+        _stored_gap_closes(ctx, poll, symbol),
+    ).drop("knowable_time")
+
+
+def _stored_gap_closes(ctx: JobContext, poll: PollConfig, symbol: str) -> set[int]:
+    """Every minute touched by a recorded hole. The catalog outlives a pass, so a flag does too."""
+    closes: set[int] = set()
+    for gap in ctx.catalog.gaps(f"curated.{TRADES_LIVE}.{poll.venue}.{symbol}"):
+        closes |= closes_between(to_us(parse_iso(gap["start_time"])), to_us(parse_iso(gap["end_time"])))
+    return closes
+
+
+@dataclass(frozen=True)
+class _Emission:
+    bars: int
+    end_us: int
+    digest: str | None
+    left_by_budget: bool
 
 
 def _emit_bars(
@@ -315,27 +428,35 @@ def _emit_bars(
     after_us: int,
     through_us: int,
     received_us: int,
-    gap_closes: set[int],
-) -> int:
-    """Append newly closed minutes to their day parts. Existing rows are never changed."""
+    *,
+    emission: str,
+    deadline: float,
+    clock: Callable[[], float],
+) -> _Emission:
+    """Append newly closed minutes to their day parts. Existing rows are never changed.
+
+    It stops between days when the budget ends, always getting through at least one. The rest wait for the
+    next pass, which marks them knowable when that pass received them.
+    """
+    gap_closes = _stored_gap_closes(ctx, poll, symbol)
+    digest = hashlib.sha256()
     emitted = 0
+    end_us = after_us
     first_close = after_us + MICROS_PER_MINUTE
     day = date_of_us(first_close - 1)
+    started = False
     while day_start_us(day) < through_us:
+        if started and clock() >= deadline:
+            return _Emission(emitted, end_us, digest.hexdigest() if emitted else None, True)
+        started = True
         low = day_start_us(day)
         start = max(first_close, low + MICROS_PER_MINUTE)
         stop = min(through_us, low + MICROS_PER_DAY)
         if start <= stop:
-            new = build_bars_1m(
-                _window_trades(ctx, poll, symbol, day),
-                venue=poll.venue,
-                symbol=symbol,
-                first_close_us=start,
-                last_close_us=stop,
-                knowable_at_us=received_us,
-                gap_close_us=gap_closes,
+            new = _build_day(ctx, poll, symbol, day, start, stop, received_us, gap_closes).with_columns(
+                pl.lit(emission).alias("emission")
             )
-            part = ctx.root.curated_part(BARS_1M, poll.venue, symbol, day)
+            part = ctx.root.curated_part(BARS_1M_LIVE, poll.venue, symbol, day)
             if part.is_file():
                 existing = read_parquet(part)
                 new = new.join(existing.select("close_time"), on="close_time", how="anti")
@@ -344,17 +465,19 @@ def _emit_bars(
                 combined = new
             atomic_write_parquet(part, combined, guard=ctx.root.guard)
             emitted += new.height
-            parents = [ctx.relative(ctx.root.curated_part(TRADES, poll.venue, symbol, day))]
-            _register_bars(ctx, poll, symbol, day, part, BARS_1M, combined.height, parents)
+            digest.update(new.write_csv().encode("utf-8"))
+            parents = [ctx.relative(ctx.root.curated_part(TRADES_LIVE, poll.venue, symbol, day))]
+            _register_bars(ctx, poll, symbol, day, part, BARS_1M_LIVE, combined.height, parents)
             bars_rel = ctx.relative(part)
             for minutes in ctx.config.timeframes_minutes:
-                higher = aggregate_bars(combined, minutes)
-                dataset = timeframe_dataset(minutes)
+                higher = aggregate_bars(combined, minutes, through_close_us=stop)
+                dataset = live_dataset(minutes)
                 higher_part = ctx.root.curated_part(dataset, poll.venue, symbol, day)
                 atomic_write_parquet(higher_part, higher, guard=ctx.root.guard)
                 _register_bars(ctx, poll, symbol, day, higher_part, dataset, higher.height, [bars_rel])
+            end_us = stop
         day += dt.timedelta(days=1)
-    return emitted
+    return _Emission(emitted, end_us, digest.hexdigest() if emitted else None, False)
 
 
 def _register_bars(
@@ -383,6 +506,49 @@ def _register_bars(
     )
 
 
+def _record_gap(
+    ctx: JobContext,
+    poll: PollConfig,
+    symbol: str,
+    result: SymbolResult,
+    start_us: int,
+    end_us: int,
+    reason: str,
+    **detail: Any,
+) -> None:
+    result.gaps.append(
+        {"event": "DATA_GAP", "from": iso_us(start_us), "to": iso_us(end_us), "reason": reason, **detail}
+    )
+    ctx.catalog.add_gap(
+        f"curated.{TRADES_LIVE}.{poll.venue}.{symbol}",
+        iso_us(start_us),
+        iso_us(end_us),
+        reason,
+        now=ctx.now_iso(),
+        run_id=ctx.run_id,
+    )
+
+
+def _record_correction(ctx: JobContext, symbol: str, trade: KrakenTrade, close_us: int) -> None:
+    """A trade received after its minute was emitted. C17's "bars that arrive later" reads this, and no bar
+    changes."""
+    append_jsonl(
+        ctx.root.guard.check(_CORRECTIONS),
+        {
+            "symbol": symbol,
+            "bar_close": iso_us(close_us),
+            "trade_id": trade.trade_id,
+            "ts": iso_us(trade.ts_us),
+            "price": trade.price,
+            "qty": trade.qty,
+            "is_taker_buy": trade.is_taker_buy,
+            "received_at": iso_us(trade.received_us),
+            "run_id": ctx.run_id,
+        },
+        guard=ctx.root.guard,
+    )
+
+
 def poll_symbol(
     ctx: JobContext,
     poll: PollConfig,
@@ -390,66 +556,79 @@ def poll_symbol(
     client: KrakenClient,
     deadline: float,
     clock: Callable[[], float],
+    *,
+    published_before: bool = False,
 ) -> SymbolResult:
-    """Fetch trades since the cursor, store them, then emit the minutes that have closed."""
+    """Fetch trades since the cursor, store them, then emit the minutes that are shown to be over."""
     result = SymbolResult(symbol=pair.symbol)
+    source = ctx.config.source(poll.venue)
+    allowance_us = source.fill_span_allowance_us
+    by_ids = source.continuity == "trade_id"
+    skew_us = round(ctx.config.max_future_skew_s * MICROS_PER_SECOND)
     state = ctx.catalog.get_poll_state(pair.symbol)
     start_us = day_start_us(poll.start_date)
     cursor_ns = state.cursor_ns if state else start_us * 1000
     last_id = state.last_trade_id if state else None
     emitted_end = state.emitted_end_us if state and state.emitted_end_us is not None else start_us
     last_trade_us = state.last_trade_us if state else None
+    # The cache is gone and this has been seen before: what comes out now is not what the runs saw.
+    rebuilding = state.rebuilding if state else published_before
+    result.rebuilding = rebuilding
 
+    # C17: the clock at the start of the attempt that delivers the data, whatever the attempt then takes.
+    t_poll_us = to_us(ctx.now())
+    result.t_poll = iso_us(t_poll_us)
+    page_received_us = t_poll_us
+    now_clock = clock()
+    fetch_deadline = now_clock + (deadline - now_clock) * 0.75
     new_trades: list[KrakenTrade] = []
-    gap_closes: set[int] = set()
+    short_page = False
     try:
-        while clock() < deadline:
+        while clock() < fetch_deadline:
             page = client.page(pair.pair, cursor_ns)
             page_received_us = to_us(ctx.now())
             result.pages += 1
-            fresh = [
-                replace(t, received_us=page_received_us)
-                for t in page.trades
-                if last_id is None or t.trade_id > last_id
-            ]
-            result.repeated_rows += len(page.trades) - len(fresh)
-            for trade in fresh:
-                if last_id is not None and trade.trade_id != last_id + 1:
-                    gap_to = iso_us(trade.ts_us)
-                    gap_from = iso_us(last_trade_us) if last_trade_us else gap_to
-                    result.gaps.append(
-                        {
-                            "event": "DATA_GAP",
-                            "after_trade_id": last_id,
-                            "next_trade_id": trade.trade_id,
-                            "from": gap_from,
-                            "to": gap_to,
-                        }
-                    )
-                    ctx.catalog.add_gap(
-                        f"curated.{TRADES}.{poll.venue}.{pair.symbol}",
-                        gap_from,
-                        gap_to,
+            for row in page.trades:
+                # A stamp ahead of the clock cannot be real, and would claim minutes that have not happened.
+                if row.ts_us > page_received_us + skew_us:
+                    raise ValidationError(f"a trade is stamped {iso_us(row.ts_us)}, ahead of the clock")
+            fresh = 0
+            for row in page.trades:
+                if last_id is not None and row.trade_id <= last_id:
+                    result.repeated_rows += 1
+                    continue
+                trade = replace(row, received_us=page_received_us)
+                if by_ids and last_id is not None and trade.trade_id != last_id + 1:
+                    _record_gap(
+                        ctx,
+                        poll,
+                        pair.symbol,
+                        result,
+                        last_trade_us if last_trade_us is not None else trade.ts_us,
+                        trade.ts_us,
                         f"trade ids jump from {last_id} to {trade.trade_id}",
-                        now=ctx.now_iso(),
-                        run_id=ctx.run_id,
+                        after_trade_id=last_id,
+                        next_trade_id=trade.trade_id,
                     )
-                    low = last_trade_us if last_trade_us is not None else trade.ts_us
-                    close = ((low - 1) // MICROS_PER_MINUTE + 1) * MICROS_PER_MINUTE
-                    while close <= ((trade.ts_us - 1) // MICROS_PER_MINUTE + 1) * MICROS_PER_MINUTE:
-                        gap_closes.add(close)
-                        close += MICROS_PER_MINUTE
+                if last_id is None and trade.ts_us > start_us:
+                    # Nothing says what happened between the start date and the first row anyone can reach.
+                    _record_gap(
+                        ctx, poll, pair.symbol, result, start_us, trade.ts_us, "no rows before the first"
+                    )
                 if trade.ts_us <= emitted_end:
                     result.late_trades += 1
+                    close_us = ((trade.ts_us - 1) // MICROS_PER_MINUTE + 1) * MICROS_PER_MINUTE
+                    _record_correction(ctx, pair.symbol, trade, close_us)
                 last_id = trade.trade_id
-                last_trade_us = trade.ts_us
-            new_trades.extend(fresh)
+                last_trade_us = max(trade.ts_us, last_trade_us or trade.ts_us)
+                new_trades.append(trade)
+                fresh += 1
             if page.raw_rows and not fresh and page.raw_rows >= poll.page_size:
                 raise ValidationError("the cursor made no progress on a full page")
             if page.raw_rows:
                 cursor_ns = max(cursor_ns, page.cursor_ns)
             if page.raw_rows < poll.page_size:
-                result.caught_up = True
+                short_page = True
                 break
     except FetchError as exc:
         result.status = "failed"
@@ -459,30 +638,53 @@ def poll_symbol(
         result.error = f"validation: {exc}"
 
     if new_trades:
-        _write_trades(ctx, poll, pair.symbol, new_trades)
-    received_us = to_us(ctx.now())
+        _write_trades(ctx, poll, pair.symbol, new_trades, allowance_us)
     result.new_trades = len(new_trades)
 
-    if result.caught_up:
-        grace_us = int(poll.bar_grace_s * MICROS_PER_SECOND)
-        safe_end = ((received_us - grace_us) // MICROS_PER_MINUTE) * MICROS_PER_MINUTE
-    elif last_trade_us is not None:
-        # Not caught up: only minutes that end before the newest trade we hold are known to be complete.
-        safe_end = ((last_trade_us - 1) // MICROS_PER_MINUTE) * MICROS_PER_MINUTE
-    else:
-        safe_end = emitted_end
-    if result.status == "ok" and safe_end > emitted_end:
-        result.new_bars = _emit_bars(ctx, poll, pair.symbol, emitted_end, safe_end, received_us, gap_closes)
-        emitted_end = safe_end
+    # Completeness check of C17. Only a record stamped after the cut shows the data runs through it.
+    a_us = round(poll.allowance_a_s * MICROS_PER_SECOND)
+    t_cut = _floor_minute(t_poll_us - a_us)
+    has_evidence = last_trade_us is not None and last_trade_us > t_cut
+    if not has_evidence:
+        t_cut -= MICROS_PER_MINUTE
+        result.stepped_back = True
+        has_evidence = last_trade_us is not None and last_trade_us > t_cut
+    result.t_cut = iso_us(t_cut)
+    result.evidence = "record" if has_evidence else None
+    result.data_gap = not has_evidence
+    result.caught_up = short_page and has_evidence
 
+    # A minute is over only if a later record is held. So this can never be past the newest trade.
+    through = emitted_end if last_trade_us is None else min(t_cut, _floor_minute(last_trade_us - 1))
+    if result.status == "ok" and through > emitted_end:
+        emission = _emit_bars(
+            ctx,
+            poll,
+            pair.symbol,
+            emitted_end,
+            through,
+            page_received_us,
+            emission=EMISSION_REBUILD if rebuilding else EMISSION_FIRST,
+            deadline=deadline,
+            clock=clock,
+        )
+        result.new_bars = emission.bars
+        result.emitted_hash = emission.digest
+        result.bars_left_by_budget = emission.left_by_budget
+        emitted_end = emission.end_us
+        if emission.left_by_budget:
+            result.caught_up = False
+    # Once a run has its data through the cut, what comes after it is what the runs see.
+    still_rebuilding = rebuilding and not (result.caught_up and result.status == "ok")
     ctx.catalog.set_poll_state(
-        PollState(pair.symbol, cursor_ns, last_id, emitted_end, last_trade_us), now=ctx.now_iso()
+        PollState(pair.symbol, cursor_ns, last_id, emitted_end, last_trade_us, still_rebuilding),
+        now=ctx.now_iso(),
     )
     if last_trade_us is not None:
         result.last_trade_time = iso_us(last_trade_us)
     if emitted_end > start_us:
         result.last_bar_close = iso_us(emitted_end)
-        result.data_age_s = round((received_us - emitted_end) / MICROS_PER_SECOND, 1)
+        result.data_age_s = round((page_received_us - emitted_end) / MICROS_PER_SECOND, 1)
     return result
 
 
@@ -518,6 +720,14 @@ def _state_changes(
             changes.append("caught_up" if current["caught_up"] else "fell_behind")
     if current["gaps"]:
         changes.append("gap_found")
+    if current["watermark_level"] == "critical" and (previous or {}).get("watermark_level") != "critical":
+        changes.append("storage_critical")
+    before = set((previous or {}).get("data_gap_symbols") or [])
+    now_gap = set(current["data_gap_symbols"])
+    if now_gap - before:
+        changes.append("data_gap_started")
+    if before - now_gap:
+        changes.append("data_gap_ended")
     if (current.get("missed_slots") or 0) >= missed_alert:
         changes.append("many_slots_missed")
     return changes
@@ -537,7 +747,10 @@ def run_poll(
     """One pass. Logs its timing, so we can measure how late GitHub's schedule really is."""
     poll = ctx.config.poll
     started_at = ctx.now()
-    approved = ctx.config.source(poll.venue).enabled
+    approved = ctx.config.source_usable(poll.venue)
+    # A shorter wait than the span would let a run read a bar whose fills are not all in yet.
+    if approved and poll.allowance_a_s * 1000.0 < ctx.config.source(poll.venue).fill_span_allowance_ms:
+        raise ConfigError("poll.allowance_a_s is shorter than the source's fill span allowance")
     started_clock = clock()
     budget = poll.default_time_budget_s if time_budget_s is None else time_budget_s
     ctx.catalog.start_run(
@@ -565,15 +778,20 @@ def run_poll(
     used = sum(measure_zones(ctx.root).values())
     watermark = evaluate_watermarks(used, quota, ctx.policy.watermarks)
     results: list[SymbolResult] = []
-    blocked = watermark.level == "critical"
-    if approved and not blocked:
+    # Under the lifecycle, the live record keeps running when storage is short, and the owner is told.
+    alerts = list(watermark.alerts)
+    if approved:
         for index, pair in enumerate(poll.pairs):
             remaining = budget - (clock() - started_clock)
             share = max(0.0, remaining) / (len(poll.pairs) - index)
-            results.append(poll_symbol(ctx, poll, pair, client, clock() + share, clock))
+            results.append(
+                poll_symbol(
+                    ctx, poll, pair, client, clock() + share, clock, published_before=published_before
+                )
+            )
 
     failed = [r for r in results if r.status != "ok"]
-    status = "no_approved_source" if not approved else "blocked" if blocked else "failed" if failed else "ok"
+    status = "no_approved_source" if not approved else "failed" if failed else "ok"
     caught_up = bool(results) and all(r.caught_up for r in results)
     gaps = [gap for r in results for gap in r.gaps]
     finished_at = ctx.now()
@@ -591,11 +809,16 @@ def run_poll(
         "missed_slots": missed_slots,
         "duration_s": round((finished_at - started_at).total_seconds(), 1),
         "status": status,
+        "data_kind": "SYNTHETIC" if ctx.root.is_synthetic else "MARKET" if approved else "NONE",
         "source_state": ctx.config.source_state(),
         "caught_up": caught_up,
         "gaps": gaps,
+        # DATA_GAP in the sense of C17: this run has no evidence its data is complete through its cut.
+        "data_gap_symbols": [r.symbol for r in results if r.data_gap],
         "symbols": {r.symbol: asdict(r) for r in results},
         "storage_used_pct": watermark.used_pct,
+        "watermark_level": watermark.level,
+        "alerts": alerts,
         "code_version": code_version(),
     }
     record["state_changes"] = _state_changes(record, previous, published_before, poll.missed_slots_alert)
@@ -607,7 +830,8 @@ def run_poll(
     ctx.catalog.finish_run(
         ctx.run_id,
         now=iso(finished_at),
-        status="ok" if status == "ok" else "failed",
+        # With nothing approved, nothing was tried, so nothing failed.
+        status=status,
         summary={"status": status, "caught_up": caught_up},
     )
     return record
@@ -619,6 +843,7 @@ def _live_state(record: dict[str, Any]) -> dict[str, Any]:
         "updated_at": record["finished_at"],
         "run_id": record["run_id"],
         "status": record["status"],
+        "data_kind": record["data_kind"],
         "caught_up": record["caught_up"],
         "state_changes": record["state_changes"],
         "symbols": {

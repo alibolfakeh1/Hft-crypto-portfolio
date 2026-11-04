@@ -22,7 +22,7 @@ class BenchmarkStats:
     cagr: float
     annualised_volatility: float | None
     sharpe: float | None
-    max_drawdown: float
+    max_drawdown: float | None
     days: float
     daily_returns: int
     equity_marks: int

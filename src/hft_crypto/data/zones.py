@@ -8,7 +8,7 @@ import re
 from enum import StrEnum
 from pathlib import Path
 
-from hft_crypto.data.guard import PathGuard
+from hft_crypto.data.guard import PathGuard, canonical_rel_path, is_link
 from hft_crypto.timeutil import month_key
 
 ZONE_DIRS = (
@@ -40,8 +40,9 @@ def classify(rel_path: str) -> DataClass | None:
     """Return the class given by the zone. None means the zone's class depends on the source.
 
     The class comes from the location, never from a catalog column, so that a bad catalog row cannot make
-    irreplaceable data look deletable.
+    irreplaceable data look deletable. A path that is not canonical is refused, not classified.
     """
+    canonical_rel_path(rel_path)
     if rel_path.startswith(("raw/live/", "ledger/", "decisions/")):
         return DataClass.IRREPLACEABLE
     if rel_path.startswith("raw/archive/"):
@@ -49,6 +50,39 @@ def classify(rel_path: str) -> DataClass | None:
     if rel_path.startswith(("curated/", "features/", "results/")):
         return DataClass.DERIVED
     return None
+
+
+MEASURED_ZONES = (
+    "raw/archive",
+    "raw/live",
+    "curated",
+    "features",
+    "results",
+    "ledger",
+    "decisions",
+    "quarantine",
+    "catalog",
+)
+
+
+def _directory_size(path: Path) -> int:
+    total = 0
+    for current, directories, files in os.walk(path, followlinks=False):
+        # os.walk enters a Windows junction, so links are removed by hand. Their targets are not ours.
+        directories[:] = [d for d in directories if not is_link(Path(current, d))]
+        for name in files:
+            candidate = Path(current, name)
+            try:
+                if not is_link(candidate):
+                    total += candidate.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def measure_zones(root: DataRoot) -> dict[str, int]:
+    """Bytes in each zone."""
+    return {zone: _directory_size(root.guard.check(zone)) for zone in MEASURED_ZONES}
 
 
 def _safe(component: str) -> str:
@@ -129,14 +163,21 @@ class DataRoot:
 
 def _refuse_inside_repository(path: Path) -> None:
     """Refuse a DATA_ROOT inside a git work tree, because market data must never get near a commit."""
-    current = Path(os.path.normpath(path.absolute()))
-    for candidate in (current, *current.parents):
-        if (candidate / ".git").exists():
-            raise DataRootError("DATA_ROOT must be outside the repository, because the repository is public.")
+    # Both the path as written and where it really leads, so a link into a work tree cannot get past this.
+    for start in (Path(os.path.normpath(path.absolute())), Path(os.path.realpath(path))):
+        for candidate in (start, *start.parents):
+            if (candidate / ".git").exists():
+                raise DataRootError(
+                    "DATA_ROOT must be outside the repository, because the repository is public."
+                )
 
 
-def resolve_data_root(explicit: str | None = None) -> DataRoot:
+def resolve_data_root(explicit: str | None = None, *, create: bool = True) -> DataRoot:
+    """create=False is for commands that only look, so a mistyped path is an error and not a new data
+    center."""
     value = explicit or os.environ.get("DATA_ROOT", "").strip()
     if not value:
         raise DataRootError("DATA_ROOT is not set. Set the environment variable or pass --data-root.")
-    return DataRoot(value)
+    if not create and not Path(value).is_dir():
+        raise DataRootError("DATA_ROOT does not exist. Run `init` or `ingest` first, or check the path.")
+    return DataRoot(value, create=create)

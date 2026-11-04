@@ -16,12 +16,19 @@ import datetime as dt
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from hft_crypto.config import RetentionPolicy, RetentionRule, Watermarks
+from hft_crypto.config import (
+    FORBIDDEN_RETENTION_ZONES,
+    ConfigError,
+    RetentionPolicy,
+    RetentionRule,
+    Watermarks,
+    quota_bytes,
+)
 from hft_crypto.data.atomic import append_jsonl, sha256_file
 from hft_crypto.data.catalog import Catalog, FileRecord
 from hft_crypto.data.context import JobContext
-from hft_crypto.data.guard import PathGuardError
-from hft_crypto.data.zones import DataClass, DataRoot, classify
+from hft_crypto.data.guard import PathGuardError, canonical_rel_path
+from hft_crypto.data.zones import DataClass, DataRoot, classify, measure_zones
 from hft_crypto.timeutil import iso, parse_iso
 from hft_crypto.versioning import code_version
 
@@ -116,7 +123,9 @@ class RetentionPlan:
 
     @property
     def bytes_freed_if_run(self) -> int:
-        return sum(item.size_bytes for item in self.deletable if item.reviewed)
+        # A file selected by two rules still frees its bytes only once.
+        sizes = {item.rel_path: item.size_bytes for item in self.deletable if item.reviewed}
+        return sum(sizes.values())
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -194,6 +203,12 @@ def check_preconditions(
 ) -> str | None:
     """Step 2 of the protocol. Return why a deletion must not happen, or None if it may."""
     required = rule.requires.get(record.kind) or rule.requires.get("*") or ()
+    if record.rel_path.startswith("raw/"):
+        # Fail closed: raw data with no stated requirement has no evidence that anything replaced it.
+        if not required:
+            return f"no derived-data requirement is declared for kind {record.kind}"
+        if record.rel_path.startswith("raw/archive/") and not record.source_url:
+            return "no source URL is recorded, so nothing could fetch this file again"
     if required:
         descendants = catalog.descendants_of(record.rel_path)
         for kind, accepted in required:
@@ -204,6 +219,7 @@ def check_preconditions(
                 if child.check_status not in accepted:
                     return f"derived data not passing: {kind} is {child.check_status}"
                 try:
+                    canonical_rel_path(child.rel_path)
                     if not root.guard.check(child.rel_path).is_file():
                         return f"derived file missing from disk: {child.rel_path}"
                 except PathGuardError as exc:
@@ -221,6 +237,10 @@ def check_preconditions(
     return None
 
 
+def _in_forbidden_zone(rel_path: str) -> bool:
+    return any(rel_path == z or rel_path.startswith(f"{z}/") for z in FORBIDDEN_RETENTION_ZONES)
+
+
 def _evaluate(
     root: DataRoot,
     catalog: Catalog,
@@ -232,13 +252,20 @@ def _evaluate(
 ) -> tuple[str, str, bool, DataClass | None]:
     """Decide one file for one rule. Return action, reason, whether only a watermark allowed it, class."""
     try:
-        root.guard.check(record.rel_path)
+        canonical_rel_path(record.rel_path)
+        if root.guard.relative(record.rel_path) != record.rel_path:
+            return "blocked", "path refused: it does not name itself", False, None
     except PathGuardError as exc:
         return "blocked", f"path refused: {exc}", False, None
-    data_class = effective_class(catalog, record, policy, rule)
+    if _in_forbidden_zone(record.rel_path):
+        return "blocked", "this zone is never deleted", False, None
+    try:
+        data_class = effective_class(catalog, record, policy, rule)
+        age = _age_days(record, now)
+    except ValueError as exc:
+        return "blocked", f"catalog row cannot be read: {exc}", False, None
     if data_class is None:
         return "blocked", "unknown class, so it is not deleted", False, None
-    age = _age_days(record, now)
     old_enough = age >= rule.min_age_days
     if data_class is DataClass.IRREPLACEABLE:
         if not rule.zone.startswith("raw/live"):
@@ -251,7 +278,6 @@ def _evaluate(
         and rule.watermark_bypass_pct is not None
         and used_pct >= rule.watermark_bypass_pct
         and age >= rule.watermark_min_age_days
-        and data_class is not DataClass.IRREPLACEABLE
     )
     if not old_enough and not bypass:
         return "blocked", f"age {age:.1f} days is below {rule.min_age_days:g}", False, data_class
@@ -330,13 +356,29 @@ class DeletionRefused(Exception):
     """The protocol stopped a deletion."""
 
 
-def delete_file(ctx: JobContext, rel_path: str, rule: RetentionRule, *, data_class: str) -> int:
-    """Steps 3 to 5 of the protocol for one file. Return the bytes freed."""
+def delete_file(ctx: JobContext, rel_path: str, rule: RetentionRule, *, used_pct: float = 0.0) -> int:
+    """The only way to delete a file. Runs the whole protocol again and returns the bytes freed.
+
+    Nothing about the file is taken from the caller: not its class, and not that a plan once allowed it. A
+    plan can be stale or forged, and deletion cannot be undone. used_pct should be the storage use measured
+    now, because it decides whether a watermark may shorten a retention period.
+    """
+    try:
+        canonical_rel_path(rel_path)
+    except PathGuardError as exc:
+        raise DeletionRefused(str(exc)) from exc
     if not rule.reviewed:
         raise DeletionRefused(f"rule {rule.id} is not marked reviewed")
     record = ctx.catalog.get_file(rel_path)
     if record is None or record.status != "present":
         raise DeletionRefused(f"not a present catalog file: {rel_path}")
+    if not _rule_applies(rule, record):
+        raise DeletionRefused(f"rule {rule.id} does not cover this file: {rel_path}")
+    action, reason, _, data_class = _evaluate(
+        ctx.root, ctx.catalog, ctx.policy, rule, record, ctx.now(), used_pct
+    )
+    if action != "delete" or data_class is None:
+        raise DeletionRefused(f"{rel_path}: {reason}")
     path = ctx.root.guard.check(rel_path)
     if not path.is_file():
         raise DeletionRefused(f"file is not on disk: {rel_path}")
@@ -354,7 +396,8 @@ def delete_file(ctx: JobContext, rel_path: str, rule: RetentionRule, *, data_cla
             "size": size,
             "checksum": checksum,
             "rule": rule.id,
-            "class": data_class,
+            "class": data_class.value,
+            "data_kind": "SYNTHETIC" if ctx.root.is_synthetic else "MARKET",
             "code_version": code_version(),
             "run_id": ctx.run_id,
         },
@@ -367,7 +410,7 @@ def delete_file(ctx: JobContext, rel_path: str, rule: RetentionRule, *, data_cla
         size_bytes=size,
         sha256=checksum,
         rule_id=rule.id,
-        data_class=data_class,
+        data_class=data_class.value,
         code_version=code_version(),
         run_id=ctx.run_id,
     )
@@ -377,19 +420,8 @@ def delete_file(ctx: JobContext, rel_path: str, rule: RetentionRule, *, data_cla
 
 def delete_raw_if_allowed(ctx: JobContext, rel_path: str, rule_id: str) -> tuple[bool, str]:
     """Used by ingest when raw data is transient: delete now if, and only if, the protocol allows it."""
-    rule = ctx.policy.rule(rule_id)
-    record = ctx.catalog.get_file(rel_path)
-    if record is None:
-        return False, "not in the catalog"
-    if not _rule_applies(rule, record):
-        return False, f"rule {rule.id} does not cover this file"
-    if not rule.reviewed:
-        return False, f"rule {rule.id} is not marked reviewed"
-    action, reason, _, data_class = _evaluate(ctx.root, ctx.catalog, ctx.policy, rule, record, ctx.now(), 0.0)
-    if action != "delete" or data_class is None:
-        return False, reason
     try:
-        delete_file(ctx, rel_path, rule, data_class=data_class.value)
+        delete_file(ctx, rel_path, ctx.policy.rule(rule_id))
     except (DeletionRefused, PathGuardError, OSError) as exc:
         return False, str(exc)
     return True, "deleted"
@@ -403,13 +435,22 @@ class ExecutionResult:
 
 
 def execute_plan(ctx: JobContext, plan: RetentionPlan) -> ExecutionResult:
-    """Run a plan for real. Every item goes back through the protocol at the moment of deletion."""
+    """Run a plan for real. Each item goes back through the whole protocol at the moment of deletion.
+
+    A plan says what someone wanted. It grants nothing, so its class, size and reason are not used, and the
+    storage use comes from the disk now, not from the plan.
+    """
     result = ExecutionResult()
+    quota = quota_bytes(ctx.config.default_quota_gb)
+    used = sum(measure_zones(ctx.root).values())
     for item in plan.deletable:
-        rule = ctx.policy.rule(item.rule_id)
         try:
-            result.deleted_bytes += delete_file(ctx, item.rel_path, rule, data_class=item.data_class)
-            result.deleted_files += 1
-        except (DeletionRefused, PathGuardError, OSError) as exc:
+            rule = ctx.policy.rule(item.rule_id)
+            freed = delete_file(ctx, item.rel_path, rule, used_pct=100.0 * used / quota)
+        except (DeletionRefused, PathGuardError, ConfigError, OSError) as exc:
             result.refused.append({"path": item.rel_path, "reason": str(exc)})
+            continue
+        used -= freed
+        result.deleted_bytes += freed
+        result.deleted_files += 1
     return result

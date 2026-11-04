@@ -9,7 +9,7 @@ import os
 import sys
 import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -21,22 +21,28 @@ from hft_crypto.config import (
     load_retention_policy,
     quota_bytes,
 )
-from hft_crypto.data.atomic import atomic_write_json, canonical_json_bytes
+from hft_crypto.data.atomic import append_jsonl, atomic_write_json, canonical_json_bytes
 from hft_crypto.data.book_replay import replay_zip
 from hft_crypto.data.catalog import Catalog
 from hft_crypto.data.context import JobContext
 from hft_crypto.data.fetch import HttpFetcher
 from hft_crypto.data.guard import PathGuardError
-from hft_crypto.data.health import build_health, measure_zones
+from hft_crypto.data.health import build_health
 from hft_crypto.data.ingest import IngestOptions, run_ingest
 from hft_crypto.data.live_checks import run_live_checks
 from hft_crypto.data.parsers import ValidationError
-from hft_crypto.data.poll import KrakenClient, run_poll
+from hft_crypto.data.poll import KrakenClient, run_poll, scheduled_time
 from hft_crypto.data.retention import build_plan, evaluate_watermarks, execute_plan
-from hft_crypto.data.zones import DataRoot, DataRootError, resolve_data_root
+from hft_crypto.data.zones import (
+    SYNTHETIC_MARKER,
+    DataRoot,
+    DataRootError,
+    measure_zones,
+    resolve_data_root,
+)
 from hft_crypto.reports.report import write_report
 from hft_crypto.synthetic import DEFAULT_SEED, run_synthetic
-from hft_crypto.timeutil import parse_date, parse_duration, parse_iso, utcnow
+from hft_crypto.timeutil import iso, parse_date, parse_duration, parse_iso, utcnow
 
 
 def _print_json(value: Any) -> None:
@@ -58,8 +64,10 @@ def _run_id() -> str:
     return f"{github}-{attempt}" if github else uuid.uuid4().hex[:16]
 
 
-def _context(args: argparse.Namespace, config: PipelineConfig, policy: RetentionPolicy) -> JobContext:
-    root = resolve_data_root(args.data_root)
+def _context(
+    args: argparse.Namespace, config: PipelineConfig, policy: RetentionPolicy, *, create: bool = True
+) -> JobContext:
+    root = resolve_data_root(args.data_root, create=create)
     return JobContext(
         root=root,
         catalog=Catalog(root.catalog_path),
@@ -74,6 +82,20 @@ def _refuse_synthetic(root: DataRoot) -> None:
     """Real jobs never run on a root of generated data, so the two can never mix."""
     if root.is_synthetic:
         raise ConfigError("this DATA_ROOT holds SYNTHETIC data, so a real job is refused here")
+
+
+def _refuse_mixed_roots(root: DataRoot, live_root: str | None) -> None:
+    """Generated poll runs must never show up in a report on real data."""
+    if live_root and not root.is_synthetic and (Path(live_root) / SYNTHETIC_MARKER).is_file():
+        raise ConfigError(
+            "the live root holds SYNTHETIC data and DATA_ROOT does not, so they cannot be mixed"
+        )
+
+
+def _refuse_fixed_clock(args: argparse.Namespace) -> None:
+    """These jobs stamp when they received data, so a fixed clock would write a false receipt."""
+    if getattr(args, "now", None):
+        raise ConfigError("--now is refused here, because this job records real receive times")
 
 
 def _cmd_synthetic_run(args: argparse.Namespace, config: PipelineConfig, policy: RetentionPolicy) -> int:
@@ -117,7 +139,36 @@ def _selected_datasets(args: argparse.Namespace, config: PipelineConfig) -> tupl
     return None
 
 
+def _log_daily_lateness(ctx: JobContext, args: argparse.Namespace, status: str) -> None:
+    """Each scheduled job logs how late it ran, and the daily job is one of them."""
+    started = parse_iso(args.job_started_at) if args.job_started_at else ctx.now()
+    slot = scheduled_time(args.scheduled_cron or None, started)
+    append_jsonl(
+        ctx.root.pipeline_log,
+        {
+            "run_id": ctx.run_id,
+            "kind": "ingest",
+            "data_kind": "SYNTHETIC"
+            if ctx.root.is_synthetic
+            else "MARKET"
+            if config_has_source(ctx)
+            else "NONE",
+            "event": args.event or None,
+            "job_started_at": iso(started),
+            "scheduled_time": None if slot is None else iso(slot),
+            "delay_s": None if slot is None else round((started - slot).total_seconds(), 1),
+            "status": status,
+        },
+        guard=ctx.root.guard,
+    )
+
+
+def config_has_source(ctx: JobContext) -> bool:
+    return bool(ctx.config.enabled_sources())
+
+
 def _cmd_ingest(args: argparse.Namespace, config: PipelineConfig, policy: RetentionPolicy) -> int:
+    _refuse_fixed_clock(args)
     ctx = _context(args, config, policy)
     _refuse_synthetic(ctx.root)
     options = IngestOptions(
@@ -131,6 +182,7 @@ def _cmd_ingest(args: argparse.Namespace, config: PipelineConfig, policy: Retent
     )
     fetcher = HttpFetcher(config.fetch, allowed_hosts=config.enabled_hosts())
     summary = run_ingest(ctx, fetcher, options)
+    _log_daily_lateness(ctx, args, summary.status)
     ctx.catalog.close()
     _print_json(asdict(summary))
     return 0
@@ -144,7 +196,7 @@ def _cmd_validate_book(args: argparse.Namespace, config: PipelineConfig, policy:
 
 
 def _cmd_retention(args: argparse.Namespace, config: PipelineConfig, policy: RetentionPolicy) -> int:
-    ctx = _context(args, config, policy)
+    ctx = _context(args, config, policy, create=False)
     used = sum(measure_zones(ctx.root).values())
     state = evaluate_watermarks(used, quota_bytes(config.default_quota_gb), policy.watermarks)
     plan = build_plan(ctx.root, ctx.catalog, policy, state, ctx.now())
@@ -172,7 +224,7 @@ def _count_reasons(items: Sequence[Any]) -> dict[str, int]:
 
 
 def _cmd_health(args: argparse.Namespace, config: PipelineConfig, policy: RetentionPolicy) -> int:
-    ctx = _context(args, config, policy)
+    ctx = _context(args, config, policy, create=False)
     report = build_health(
         ctx.root,
         ctx.catalog,
@@ -201,9 +253,12 @@ def _read_cache_usage(path: str | None) -> dict[str, Any] | None:
 
 
 def _cmd_poll(args: argparse.Namespace, config: PipelineConfig, policy: RetentionPolicy) -> int:
+    _refuse_fixed_clock(args)
     ctx = _context(args, config, policy)
     _refuse_synthetic(ctx.root)
-    client = KrakenClient(HttpFetcher(config.fetch, allowed_hosts=config.enabled_hosts()), config.poll)
+    # Its own limits, so that one page cannot take a whole run's time budget.
+    limits = replace(config.fetch, timeout_s=config.poll.timeout_s, attempts=config.poll.attempts)
+    client = KrakenClient(HttpFetcher(limits, allowed_hosts=config.enabled_hosts()), config.poll)
     record = run_poll(
         ctx,
         client,
@@ -238,7 +293,7 @@ def _poll_context(
 ) -> JobContext | None:
     if not args.live_root or not Path(args.live_root).is_dir():
         return None
-    root = DataRoot(args.live_root)
+    root = DataRoot(args.live_root, create=False)
     return JobContext(
         root=root,
         catalog=Catalog(root.catalog_path),
@@ -250,7 +305,8 @@ def _poll_context(
 
 
 def _cmd_reconcile_live(args: argparse.Namespace, config: PipelineConfig, policy: RetentionPolicy) -> int:
-    ctx = _context(args, config, policy)
+    ctx = _context(args, config, policy, create=False)
+    _refuse_mixed_roots(ctx.root, args.live_root)
     poll_ctx = _poll_context(args, config, policy)
     if poll_ctx is None:
         ctx.catalog.close()
@@ -264,7 +320,8 @@ def _cmd_reconcile_live(args: argparse.Namespace, config: PipelineConfig, policy
 
 
 def _cmd_report(args: argparse.Namespace, config: PipelineConfig, policy: RetentionPolicy) -> int:
-    ctx = _context(args, config, policy)
+    ctx = _context(args, config, policy, create=False)
+    _refuse_mixed_roots(ctx.root, args.live_root)
     live_log = Path(args.live_root) / "catalog" / "poll_runs.jsonl" if args.live_root else None
     branch_log = Path(args.results_dir) / "run_log" / "poll_runs.jsonl" if args.results_dir else None
     status = write_report(
@@ -318,6 +375,9 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also process order book files, which are large, at one day per run",
     )
+    ingest.add_argument("--scheduled-cron", help="the cron expression that started this run")
+    ingest.add_argument("--job-started-at", help="UTC time the job's first step began")
+    ingest.add_argument("--event", help="what started the run, such as schedule")
     ingest.set_defaults(func=_cmd_ingest)
 
     book = commands.add_parser("validate-book", help="replay one Bybit order book zip and check it")

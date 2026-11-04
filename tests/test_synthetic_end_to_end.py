@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import re
 import socket
@@ -18,10 +19,15 @@ from hft_crypto.config import ConfigError
 from hft_crypto.data.catalog import Catalog
 from hft_crypto.data.zones import DataRoot
 from hft_crypto.reports.report import SYNTHETIC_LABEL
-from hft_crypto.synthetic import FIRST_DAY, SYMBOLS, SyntheticMarket, run_synthetic
+from hft_crypto.synthetic import _FAULT_DAY_INDEX, FIRST_DAY, SYMBOLS, SyntheticMarket, run_synthetic
 
 DAYS = 7
 SEED = 11
+# The generator spills one aggregate on this symbol further than the window explains, so the failing path
+# always runs.
+FAULT_SYMBOL = SYMBOLS[0]
+CLEAN_SYMBOL = SYMBOLS[1]
+FAULT_DAY = FIRST_DAY + dt.timedelta(days=_FAULT_DAY_INDEX)
 
 
 @pytest.fixture(autouse=True)
@@ -109,16 +115,24 @@ def test_the_whole_path_ran(run: dict[str, Any]) -> None:
     summary = run["summary"]
     # One day of three daily datasets for two symbols is held back at first, and arrives on the next run.
     assert summary["first_pass"]["pending"] == 6
-    assert summary["first_pass"]["status"] == "ok"
     assert summary["second_pass"]["pending"] == 0
-    assert summary["second_pass"]["errors"] == []
-    assert summary["second_pass"]["status"] == "ok"
-    # Raw is transient, and every file went through the deletion protocol.
-    assert summary["raw_files_left"] == 0
+    # Only the injected fault is an error, and its day is fetched again later, so the run says partial and not
+    # ok.
+    errors = summary["second_pass"]["errors"]
+    assert errors
+    assert all(FAULT_DAY.isoformat() in message and FAULT_SYMBOL in message for message in errors)
+    assert summary["second_pass"]["status"] == "partial"
+    # Raw is transient, and every file went through the deletion protocol. The failed day's trades stay.
+    root = run["base"] / "root"
+    left = [path.name for path in (root / "raw").rglob("*") if path.is_file()]
+    assert summary["raw_files_left"] == len(left)
+    assert left
+    assert all(FAULT_DAY.isoformat() in name and FAULT_SYMBOL in name for name in left)
     assert summary["second_pass"]["raw_deleted_files"] > 0
-    log = (run["base"] / "root" / "catalog" / "deletions.jsonl").read_text(encoding="utf-8").splitlines()
+    log = (root / "catalog" / "deletions.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(log) == summary["second_pass"]["raw_deleted_files"]
-    assert run["status"]["partial_coverage"] is False
+    assert all(json.loads(line)["data_kind"] == "SYNTHETIC" for line in log)
+    assert run["status"]["partial_coverage"] is True
 
 
 def test_bars_and_higher_timeframes_exist_with_their_knowable_times(run: dict[str, Any]) -> None:
@@ -129,55 +143,103 @@ def test_bars_and_higher_timeframes_exist_with_their_knowable_times(run: dict[st
     bars = pl.concat(
         [
             pl.read_parquet(p, hive_partitioning=False)
-            for p in root.curated_parts("bars_1m", "synthetic", SYMBOLS[0])
+            for p in root.curated_parts("bars_1m", "synthetic", CLEAN_SYMBOL)
         ]
     )
     assert bars.height == DAYS * 1440
-    assert (bars["knowable_time"] == bars["close_time"]).all()
-    # Some minutes have no trades, and they stay as rows with no price.
-    assert bars["close"].null_count() > 0
-    assert bars.filter(pl.col("close").is_null())["volume"].sum() == 0.0
+    # A minute with trades is known at its close plus the declared allowance.
+    traded = bars.filter(pl.col("trade_count") > 0)
+    spread = traded["knowable_time"].dt.timestamp("us") - traded["close_time"].dt.timestamp("us")
+    assert spread.unique().to_list() == [250_000]
+    # Some minutes have no trades. They stay as rows with no price, and consecutive ids prove them.
+    empty = bars.filter(pl.col("close").is_null())
+    assert empty.height > 0
+    assert empty["volume"].sum() == 0.0
+    # The last minute of the last day has no row after it, so it alone can be unproven.
+    assert empty["empty_proof"].unique().sort().to_list() in (["id_run"], ["id_run", "none"])
+    assert (empty["knowable_time"] > empty["close_time"]).all()
     daily = pl.concat(
         [
             pl.read_parquet(p, hive_partitioning=False)
-            for p in root.curated_parts("bars_1d", "synthetic", SYMBOLS[0])
+            for p in root.curated_parts("bars_1d", "synthetic", CLEAN_SYMBOL)
         ]
     )
     assert daily.height == DAYS
-    assert daily["complete"].all()
+    # Every day but the last, whose next file has not come.
+    assert daily["complete"].to_list() == [True] * (DAYS - 1) + [False]
 
 
-def test_reconciliation_passes_and_really_saw_the_straddling_volume(run: dict[str, Any]) -> None:
+def test_reconciliation_sees_the_spills_it_should_explain_and_fails_the_one_it_should_not(
+    run: dict[str, Any],
+) -> None:
+    """The generator implements the rule's own hypothesis, so a run that always passed would say nothing about
+    the rule."""
     official = run["status"]["reconciliation"]["official_candles"]
     assert official["days"] == DAYS * 2
-    assert official["fail"] == 0
-    assert official["pass"] == DAYS * 2
+    assert official["fail"] == 1
+    assert official["pass"] + official["warn"] == DAYS * 2 - 1
     with Catalog(run["base"] / "root" / "catalog" / "catalog.sqlite") as catalog:
         rows = catalog.reconciliations("official_candles")
-    details = [row["detail"] for row in rows]
+        excluded = catalog.exclusions()
+    failed = [row for row in rows if row["status"] == "fail"]
+    assert [(row["symbol"], row["date"]) for row in failed] == [(FAULT_SYMBOL, FAULT_DAY.isoformat())]
+    assert [(row["symbol"], row["date"]) for row in excluded] == [(FAULT_SYMBOL, FAULT_DAY.isoformat())]
+    assert run["status"]["reconciliation"]["exclusions"] == 1
+    details = [row["detail"] for row in rows if row["status"] != "fail"]
     # The generator spills volume over some midnights, and the checks must find it and account for it.
     assert any(detail["volume_diff"] > 0 for detail in details)
-    assert any(detail["implied_carry_in"] > 0 for detail in details)
+    assert any(detail["carry_in"] > 0 for detail in details)
     assert all(detail["boundaries_unexplained"] == 0 for detail in details)
     assert any(detail["bars_volume_diff_over_0_001"] > 0 for detail in details)
     assert all(detail["largest_window_needed_ms"] <= 250.0 for detail in details)
+    assert failed[0]["detail"]["boundaries_unexplained"] == 1
+
+
+def test_a_failed_day_keeps_its_bars_and_only_the_minute_it_cannot_explain_is_flagged(
+    run: dict[str, Any],
+) -> None:
+    """DC-08, through the whole path: an aggregate 400 ms before a minute's end, against a window of 250
+    ms."""
+    import polars as pl
+
+    root = DataRoot(run["base"] / "root", create=False)
+    bars = pl.read_parquet(
+        root.curated_part("bars_1m", "synthetic", FAULT_SYMBOL, FAULT_DAY), hive_partitioning=False
+    )
+    assert bars.height == 1440
+    flagged = bars.filter(pl.col("gap"))
+    assert flagged.height > 0
+    first_flag = flagged["close_time"].to_list()[0]
+    # 10:00 on that day: the bar holding the spill closes at 10:01. Everything before it stands.
+    assert first_flag.isoformat().startswith(f"{FAULT_DAY.isoformat()}T10:01:00")
+    assert bars.filter(pl.col("close_time") < first_flag)["gap"].sum() == 0
 
 
 def test_benchmark_equals_a_calculation_made_directly_from_the_generator(run: dict[str, Any]) -> None:
+    """Only whole, passing days count, so the last day and the failed day do not."""
     market = SyntheticMarket(SEED, FIRST_DAY, DAYS)
-    symbol = SYMBOLS[0]
     start_ms = market.day_range_ms(market.first_day)[0]
-    end_ms = market.day_range_ms(market.last_day())[1]
+    end_ms = market.day_range_ms(market.last_day() - dt.timedelta(days=1))[1]
     # Bars cover (open, close], so a trade exactly at the first midnight belongs to the bar before the period,
-    # and one exactly at the last midnight is beyond the data.
-    inside = [t for t in market.trades[symbol] if start_ms < t.stamp_ms <= end_ms]
-    item = run["status"]["benchmarks"][symbol]
+    # and one exactly at the last midnight belongs to its last bar.
+    inside = [t for t in market.trades[CLEAN_SYMBOL] if start_ms < t.stamp_ms <= end_ms]
+    item = run["status"]["benchmarks"][CLEAN_SYMBOL]
+    days = DAYS - 1
     expected = inside[-1].price / inside[0].price - 1.0
     assert item["total_return"] == pytest.approx(expected)
-    assert item["days"] == float(DAYS)
-    assert item["daily_returns"] == DAYS
-    assert item["cagr"] == pytest.approx((1.0 + expected) ** (365.0 / DAYS) - 1.0)
+    assert item["days"] == float(days)
+    assert item["daily_returns"] == days
+    assert item["cagr"] == pytest.approx((1.0 + expected) ** (365.0 / days) - 1.0)
     assert item["max_drawdown"] <= 0.0
+    assert item["max_drawdown_note"] is None
+
+
+def test_results_leave_out_the_failed_day_and_start_after_it(run: dict[str, Any]) -> None:
+    item = run["status"]["benchmarks"][FAULT_SYMBOL]
+    assert item["start"].startswith((FAULT_DAY + dt.timedelta(days=1)).isoformat())
+    assert item["days"] == float(DAYS - 2 - _FAULT_DAY_INDEX)
+    assert item["missing_days_before_start"] is True
+    assert "left out of results: 1" in run["html"]
 
 
 def test_the_hourly_poll_ran_with_its_lateness_measured(run: dict[str, Any]) -> None:
@@ -188,9 +250,13 @@ def test_the_hourly_poll_ran_with_its_lateness_measured(run: dict[str, Any]) -> 
     assert poll["scheduled_runs"] == poll["runs"]
     assert poll["delay_median_s"] > 0
     assert poll["delay_max_s"] >= poll["delay_p90_s"] >= poll["delay_median_s"]
-    assert poll["gaps"] == 0
+    # One per symbol: what happened between the start date and the first row is not known.
+    assert poll["gaps"] == 2
     assert poll["failed_runs"] == 0
-    assert poll["caught_up"] is True
+    assert poll["last_status"] == "ok"
+    # At this trade rate some hours hold no record close enough to the cut. They say so, and most do not.
+    assert 0 <= poll["data_gap_runs"] < poll["runs"]
+    assert poll["server_time_share"] == 0.0
     assert set(poll["symbols"]) == set(SYMBOLS)
     assert "how late is the schedule" in run["html"]
 
@@ -213,7 +279,7 @@ def test_polled_bars_were_only_knowable_when_received(run: dict[str, Any]) -> No
     bars = pl.concat(
         [
             pl.read_parquet(p, hive_partitioning=False)
-            for p in root.curated_parts("bars_1m", "synthetic-poll", SYMBOLS[0])
+            for p in root.curated_parts("bars_1m_live", "synthetic-poll", SYMBOLS[0])
         ]
     )
     assert bars.height > 0
@@ -234,8 +300,9 @@ def test_opt_in_book_day_went_through_the_validator_and_only_statistics_are_kept
 
 def test_retention_plan_is_sensible_after_the_run(run: dict[str, Any]) -> None:
     plan = run["summary"]["retention_plan"]
-    # Raw is already gone. What is left is curated data, too young for the unreviewed window rule.
-    assert plan.get("raw-archive-after-curated", {"deletable_files": 0})["deletable_files"] == 0
+    # What raw is left failed its check, so nothing allows it to go. Curated data is too young for the window
+    # rule.
+    assert plan["raw-archive-after-curated"]["deletable_files"] == 0
     window = plan["curated-trades-window"]
     assert window["deletable_files"] == 0
     assert window["blocked_files"] == DAYS * 2
@@ -284,6 +351,40 @@ def test_another_seed_gives_other_numbers(run: dict[str, Any], tmp_path: Path) -
         other["benchmarks"][SYMBOLS[0]]["total_return"]
         != run["status"]["benchmarks"][SYMBOLS[0]]["total_return"]
     )
+
+
+def test_a_real_job_refuses_a_marked_live_root(
+    run: dict[str, Any], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F-13. A real root with a generated live root showed 43 generated poll runs, with no label."""
+    real = DataRoot(tmp_path / "real")
+    Catalog(real.catalog_path).close()
+    args = [*_configs_args(), "--data-root", str(tmp_path / "real")]
+    live = str(run["base"] / "live")
+    assert main([*args, "report", "--published", "--out-dir", str(tmp_path / "x"), "--live-root", live]) == 2
+    assert "SYNTHETIC" in capsys.readouterr().err
+    assert not (tmp_path / "x").exists()
+    assert main([*args, "reconcile-live", "--live-root", live]) == 2
+    assert "SYNTHETIC" in capsys.readouterr().err
+
+
+def test_a_generated_root_that_lost_its_marker_cannot_become_market_data(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F-13. Refusal to publish used to go with the marker."""
+    run_synthetic(
+        tmp_path / "root",
+        tmp_path / "live",
+        tmp_path / "out",
+        base_config=base_config(),
+        policy=base_policy(),
+        days=2,
+    )
+    (tmp_path / "root" / "catalog" / "SYNTHETIC").unlink()
+    args = [*_configs_args(), "--data-root", str(tmp_path / "root")]
+    assert main([*args, "report", "--published", "--out-dir", str(tmp_path / "x")]) == 2
+    assert "SYNTHETIC" in capsys.readouterr().err
+    assert not (tmp_path / "x").exists()
 
 
 def test_a_synthetic_run_refuses_a_root_holding_other_data(tmp_path: Path) -> None:
@@ -390,10 +491,64 @@ def test_daily_workflow_steps_with_no_approved_source(
 
 def test_poll_command_with_no_approved_source(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     args = [*_configs_args(), "--data-root", str(tmp_path / "live")]
-    assert main([*args, "poll", "--event", "schedule", "--scheduled-cron", "23 * * * *"]) == 0
+    assert main([*args, "poll", "--event", "schedule", "--scheduled-cron", "7 * * * *"]) == 0
     record = json.loads(capsys.readouterr().out)
     assert record["status"] == "no_approved_source"
     assert record["symbols"] == {}
+
+
+@pytest.mark.parametrize("command", ["ingest", "poll"])
+def test_jobs_that_record_receipts_refuse_a_fixed_clock(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: str
+) -> None:
+    """DC-05. A run with a fixed clock stamped its receipts at that time."""
+    args = [*_configs_args(), "--data-root", str(tmp_path / "r"), "--now", "2026-03-01T00:00:00Z", command]
+    assert main(args) == 2
+    assert "--now" in capsys.readouterr().err
+    assert not (tmp_path / "r").exists()
+
+
+@pytest.mark.parametrize("command", [["retention"], ["health"], ["report"], ["reconcile-live"]])
+def test_commands_that_only_look_do_not_create_a_mistyped_root(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: list[str]
+) -> None:
+    """F-23. A dry run on a mistyped DATA_ROOT used to create it, with zones and a catalog."""
+    missing = tmp_path / "mistyped"
+    assert main([*_configs_args(), "--data-root", str(missing), *command]) == 2
+    assert "does not exist" in capsys.readouterr().err
+    assert not missing.exists()
+
+
+def test_the_daily_job_logs_how_late_it_ran(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """F-22. Each run logs how late it was. The poll did, and the daily job did not."""
+    root = tmp_path / "r"
+    args = [*_configs_args(), "--data-root", str(root)]
+    started = "2026-03-01T03:20:00Z"
+    command = [
+        "ingest",
+        "--light",
+        "--scheduled-cron",
+        "17 3 * * *",
+        "--job-started-at",
+        started,
+        "--event",
+        "schedule",
+    ]
+    assert main([*args, *command]) == 0
+    capsys.readouterr()
+    logged = json.loads(
+        (root / "catalog" / "pipeline_runs.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert logged["scheduled_time"] == "2026-03-01T03:17:00Z"
+    assert logged["delay_s"] == 180.0
+    assert logged["data_kind"] == "NONE"
+    out = tmp_path / "out"
+    assert main([*args, "report", "--out-dir", str(out)]) == 0
+    capsys.readouterr()
+    line = json.loads(
+        (out / "results" / "run_log" / "pipeline_runs.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert line["lateness"]["delay_s"] == 180.0
 
 
 def test_asking_for_a_disabled_dataset_on_the_command_line_fails_clearly(

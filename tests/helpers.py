@@ -7,6 +7,7 @@ import gzip
 import hashlib
 import io
 import json
+import sqlite3
 import zipfile
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
@@ -17,12 +18,14 @@ import polars as pl
 
 from hft_crypto.bars.core import UTC_TIME
 from hft_crypto.config import (
+    PROHIBITED_SOURCES,
     PipelineConfig,
     RetentionPolicy,
     load_pipeline_config,
     load_retention_policy,
     parse_retention_policy,
 )
+from hft_crypto.data.atomic import sha256_file
 from hft_crypto.data.catalog import Catalog
 from hft_crypto.data.context import JobContext
 from hft_crypto.data.fetch import FetchError, NotPublishedError
@@ -30,6 +33,7 @@ from hft_crypto.data.zones import DataRoot
 from hft_crypto.timeutil import day_start_us
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+VENUE = "generated"
 MINUTE = 60_000_000
 DAY = 86_400_000_000
 
@@ -41,8 +45,10 @@ def us(text: str) -> int:
     return (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
 
 
-def trades_frame(rows: Sequence[tuple[int, float, float, bool]], *, first_id: int = 1) -> pl.DataFrame:
-    """Trades from (ts_us, price, qty, is_taker_buy)."""
+def trades_frame(
+    rows: Sequence[tuple[int, float, float, bool]], *, first_id: int = 1, allowance_us: int = 0
+) -> pl.DataFrame:
+    """Trades from (ts_us, price, qty, is_taker_buy), with ids that run on and one fill per row."""
     return pl.DataFrame(
         {
             "ts": pl.Series([r[0] for r in rows], dtype=pl.Int64).cast(UTC_TIME),
@@ -50,7 +56,9 @@ def trades_frame(rows: Sequence[tuple[int, float, float, bool]], *, first_id: in
             "qty": pl.Series([r[2] for r in rows], dtype=pl.Float64),
             "is_taker_buy": pl.Series([r[3] for r in rows], dtype=pl.Boolean),
             "trade_id": pl.Series(list(range(first_id, first_id + len(rows))), dtype=pl.Int64),
+            "file_row": pl.Series(list(range(len(rows))), dtype=pl.Int64),
             "n_fills": pl.Series([1] * len(rows), dtype=pl.Int32),
+            "knowable_time": pl.Series([r[0] + allowance_us for r in rows], dtype=pl.Int64).cast(UTC_TIME),
         }
     )
 
@@ -89,6 +97,11 @@ def klines_csv(rows: Iterable[tuple[int, float, float, float, float, float, floa
     return "\n".join(lines) + "\n"
 
 
+def day_first_id(day: dt.date) -> int:
+    """The first id of a day of one trade a minute, so that ids run on from one day's file to the next."""
+    return (day.toordinal() - 730_000) * 1440
+
+
 def make_day_files(day: dt.date, price: float = 100.0, qty: float = 1.0) -> tuple[str, str]:
     """A consistent aggTrades and klines pair: one taker buy in the middle of each minute of a day."""
     start_ms = day_start_us(day) // 1000
@@ -98,7 +111,7 @@ def make_day_files(day: dt.date, price: float = 100.0, qty: float = 1.0) -> tupl
         open_ms = start_ms + minute * 60_000
         trades.append((open_ms + 30_000, price, qty, True))
         candles.append((open_ms, price, price, price, price, qty, qty))
-    return agg_trades_csv(trades), klines_csv(candles)
+    return agg_trades_csv(trades, first_id=day_first_id(day)), klines_csv(candles)
 
 
 @dataclass
@@ -137,10 +150,10 @@ class FakeFetcher:
             self.files[f"{url}.CHECKSUM"] = f"{digest}  {name}\n".encode()
 
 
-BINANCE = "https://data.binance.vision/data/futures/um"
+GENERATED = "https://generated.invalid/data"
 
 
-def publish_binance_day(
+def publish_generated_day(
     fetcher: FakeFetcher,
     symbol: str,
     day: dt.date,
@@ -151,12 +164,12 @@ def publish_binance_day(
     trades_name = f"{symbol}-aggTrades-{day.isoformat()}"
     candles_name = f"{symbol}-1m-{day.isoformat()}"
     fetcher.publish(
-        f"{BINANCE}/daily/aggTrades/{symbol}/{trades_name}.zip",
+        f"{GENERATED}/daily/aggTrades/{symbol}/{trades_name}.zip",
         zip_bytes(f"{trades_name}.csv", trades_csv or default_trades),
         name=f"{trades_name}.zip",
     )
     fetcher.publish(
-        f"{BINANCE}/daily/klines/{symbol}/1m/{candles_name}.zip",
+        f"{GENERATED}/daily/klines/{symbol}/1m/{candles_name}.zip",
         zip_bytes(f"{candles_name}.csv", candles_csv or default_candles),
         name=f"{candles_name}.zip",
     )
@@ -199,17 +212,49 @@ def base_config() -> PipelineConfig:
 
 
 def with_sources_enabled(config: PipelineConfig) -> PipelineConfig:
-    """Every source switched on, for tests of the adapters. These only ever see generated files."""
-    return replace(
-        config,
-        sources={
-            name: replace(source, enabled=True, prohibited=False) for name, source in config.sources.items()
-        },
+    """Adapters switched on for tests, on generated files only.
+
+    The aggregate-trade adapter's venue is prohibited, and the code refuses it by name and by host. So its
+    adapters run here under a generated venue on an address that cannot resolve. The other sources keep their
+    names, and only ever see a fake fetcher.
+    """
+    generated = replace(
+        config.sources["binance"],
+        name=VENUE,
+        enabled=True,
+        prohibited=False,
+        urls={"archive_base": GENERATED},
     )
+    sources = {
+        name: replace(source, enabled=True)
+        for name, source in config.sources.items()
+        if name not in PROHIBITED_SOURCES
+    }
+    datasets = tuple(
+        replace(spec, id=spec.id.replace("binance.", f"{VENUE}."), venue=VENUE)
+        if spec.venue == "binance"
+        else spec
+        for spec in config.datasets
+    )
+    return replace(config, sources={**sources, VENUE: generated}, datasets=datasets)
 
 
 def base_policy() -> RetentionPolicy:
     return load_retention_policy(REPO_ROOT / "configs")
+
+
+def policy_with_raw_reviewed() -> RetentionPolicy:
+    """The shipped rules, with the raw deletion rule treated as reviewed, in memory, for tests of what it
+    does.
+
+    The shipped file keeps it unreviewed until data-steward confirms it, and a test holds it to that.
+    """
+    policy = base_policy()
+    rules = tuple(
+        replace(rule, reviewed=True) if rule.id == "raw-archive-after-curated" else rule
+        for rule in policy.rules
+    )
+    return replace(policy, rules=rules)
 
 
 def policy_with_rules(rules: list[dict[str, Any]], **overrides: Any) -> RetentionPolicy:
@@ -247,3 +292,43 @@ def make_context(
         now=lambda: now,
         run_id="testrun",
     )
+
+
+def poison_row(
+    ctx: JobContext, rel_path: str, *, kind: str, file: Path, created: str = "2026-01-01T00:00:00Z"
+) -> None:
+    """Write a catalog row the way a damaged or hostile cache could, past every check in the code."""
+    db = sqlite3.connect(ctx.root.catalog_path)
+    with db:
+        db.execute(
+            """INSERT OR REPLACE INTO files
+               (rel_path, dataset_id, kind, partition_key, date_start, date_end, size_bytes, sha256,
+                row_count, source_url, created_at, code_version, check_status, status)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                rel_path,
+                "d",
+                kind,
+                "2026-11-02",
+                None,
+                None,
+                file.stat().st_size,
+                sha256_file(file),
+                None,
+                "https://archive/x",
+                created,
+                "test",
+                "pass",
+                "present",
+            ),
+        )
+    db.close()
+
+
+def poison_parent(ctx: JobContext, child: str, parent: str) -> None:
+    db = sqlite3.connect(ctx.root.catalog_path)
+    with db:
+        db.execute(
+            "INSERT OR IGNORE INTO file_parents (child_path, parent_path) VALUES (?,?)", (child, parent)
+        )
+    db.close()

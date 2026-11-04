@@ -13,7 +13,7 @@ name: Live poll
 
 on:
   schedule:
-    - cron: "23 * * * *"
+    - cron: "7 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -48,6 +48,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
+          version: "0.11.24"
           enable-cache: false
       - name: Install
         run: uv sync --frozen --no-dev --python 3.12
@@ -95,7 +96,7 @@ jobs:
   publish:
     # Runs no project code, because this is the only job here that can write to the repository.
     needs: poll
-    if: needs.poll.outputs.changed == 'true'
+    if: needs.poll.outputs.changed == 'true' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -116,7 +117,8 @@ jobs:
 
   prune-cache:
     needs: poll
-    if: always() && needs.poll.outputs.cache_saved == 'success'
+    # Only the default branch prunes. A run from another branch must never delete the copy the schedule depends on.
+    if: always() && needs.poll.outputs.cache_saved == 'success' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     permissions:
@@ -125,7 +127,8 @@ jobs:
       - name: Keep only the newest copy
         env:
           GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          gh cache list --repo "$GITHUB_REPOSITORY" --key live-poll-v1- --sort created_at --order desc \
-            --limit 100 --json id --jq '.[1:][].id' |
+          gh cache list --repo "$GITHUB_REPOSITORY" --key live-poll-v1- --ref "refs/heads/$DEFAULT_BRANCH" \
+            --sort created_at --order desc --limit 100 --json id --jq '.[1:][].id' |
             while read -r id; do gh cache delete "$id" --repo "$GITHUB_REPOSITORY"; done

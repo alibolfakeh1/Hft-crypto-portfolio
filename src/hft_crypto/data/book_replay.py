@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import zipfile
 from bisect import bisect_left, insort
 from dataclasses import asdict, dataclass, field
@@ -44,6 +45,7 @@ class BookReplayResult:
         return (
             self.lines > 0
             and self.snapshots > 0
+            and self.crossed_checks > 0
             and self.update_id_breaks == 0
             and self.crossed == 0
             and self.snapshot_mismatches == 0
@@ -84,7 +86,11 @@ class _Side:
 
 
 def _parse_levels(rows: list[list[str]]) -> list[tuple[float, float]]:
-    return [(float(price), float(qty)) for price, qty in rows]
+    levels = [(float(price), float(qty)) for price, qty in rows]
+    for price, qty in levels:
+        if not (math.isfinite(price) and math.isfinite(qty)) or price <= 0 or qty < 0:
+            raise ValueError("a level is negative or not a finite number")
+    return levels
 
 
 def replay_stream(stream: BinaryIO) -> BookReplayResult:
@@ -121,15 +127,17 @@ def replay_stream(stream: BinaryIO) -> BookReplayResult:
 
         if kind == "snapshot":
             result.snapshots += 1
-            if update_id == 1 and previous_u is not None:
-                # Bybit restarts its counter on a service restart and sends a snapshot.
+            is_reset = update_id == 1 and previous_u is not None
+            if is_reset:
+                # A service restart: the counter starts again and a new book replaces the old one.
                 result.update_id_resets += 1
             elif previous_u is not None and update_id not in (previous_u, previous_u + 1):
                 # A periodic snapshot restates the book at the id of the delta before it, so the same
                 # id is continuous, and the comparison below still checks that the book agrees.
                 result.update_id_breaks += 1
                 _note_break(result, previous_u, update_id)
-            if bids.levels or asks.levels:
+            # After a restart the new book owes nothing to the old one, so comparing them proves nothing.
+            if (bids.levels or asks.levels) and not is_reset:
                 result.snapshot_comparisons += 1
                 wanted_bids = dict(bid_rows)
                 wanted_asks = dict(ask_rows)

@@ -36,12 +36,11 @@ from hft_crypto.config import (
 from hft_crypto.data.catalog import Catalog
 from hft_crypto.data.context import JobContext
 from hft_crypto.data.fetch import NotPublishedError
-from hft_crypto.data.health import measure_zones
 from hft_crypto.data.ingest import IngestOptions, run_ingest
 from hft_crypto.data.live_checks import run_live_checks
 from hft_crypto.data.poll import KrakenClient, read_poll_log, run_poll
 from hft_crypto.data.retention import build_plan, evaluate_watermarks
-from hft_crypto.data.zones import SYNTHETIC_MARKER, DataRoot
+from hft_crypto.data.zones import SYNTHETIC_MARKER, DataRoot, measure_zones
 from hft_crypto.reports.report import write_report
 from hft_crypto.timeutil import day_start_us, iso, month_key, next_month, to_us
 
@@ -59,6 +58,11 @@ _TRADES_PER_MINUTE = 1.2
 _DAILY_VOLATILITY = 0.03
 _POLL_DAYS = 3
 _POLL_HOURS = 48
+# One aggregate on one day spills further than the placeholder window explains, so a run always exercises the
+# failing path: the day fails, its bars stay, it is logged as excluded, and results leave it out.
+_FAULT_DAY_INDEX = 3
+_FAULT_MINUTE = 600
+_FAULT_SPILL_MS = 400
 
 
 @dataclass(frozen=True)
@@ -82,7 +86,9 @@ class SyntheticMarket:
         self.seed = seed
         self.trades: dict[str, list[GeneratedTrade]] = {}
         for index, symbol in enumerate(SYMBOLS):
-            self.trades[symbol] = self._generate(random.Random(seed + index), START_PRICES[symbol])  # noqa: S311
+            generator = random.Random(seed + index)  # noqa: S311
+            with_fault = index == 0 and days > _FAULT_DAY_INDEX + 2
+            self.trades[symbol] = self._generate(generator, START_PRICES[symbol], with_fault=with_fault)
 
     def day_range_ms(self, day: dt.date) -> tuple[int, int]:
         start = day_start_us(day) // 1000
@@ -91,7 +97,7 @@ class SyntheticMarket:
     def last_day(self) -> dt.date:
         return self.first_day + dt.timedelta(days=self.days - 1)
 
-    def _generate(self, rng: random.Random, start_price: float) -> list[GeneratedTrade]:
+    def _generate(self, rng: random.Random, start_price: float, *, with_fault: bool) -> list[GeneratedTrade]:
         first_ms = day_start_us(self.first_day) // 1000
         total_minutes = self.days * 1440
         step = _DAILY_VOLATILITY / (_TRADES_PER_MINUTE * 1440) ** 0.5
@@ -101,6 +107,9 @@ class SyntheticMarket:
         for minute in range(total_minutes):
             minute_start = first_ms + minute * _MINUTE_MS
             stamps = sorted(rng.randrange(1, _MINUTE_MS) for _ in range(_poisson(rng, _TRADES_PER_MINUTE)))
+            # The dataset's first minute has a trade, because nothing before it could prove that minute empty.
+            if minute == 0 and not stamps:
+                stamps = [rng.randrange(1, _MINUTE_MS)]
             # Now and then a trade lands exactly on the boundary, which is where a bar could go wrong.
             if rng.random() < 0.03:
                 stamps.insert(0, minute_start)
@@ -118,12 +127,15 @@ class SyntheticMarket:
                 next_id += 1
             # Close some minutes with an aggregate that spills past the boundary, including some midnights.
             spills = rng.random() < 0.02 or (minute % 1440 == 1439 and (minute // 1440) % 3 == 1)
-            if spills:
+            fault = with_fault and minute == _FAULT_DAY_INDEX * 1440 + _FAULT_MINUTE
+            if spills or fault:
                 price *= 1.0 + rng.gauss(0.0, step)
                 qty = rng.randint(100, 3000)
                 trades.append(
                     GeneratedTrade(
-                        stamp_ms=minute_start + _MINUTE_MS - rng.randint(1, 80),
+                        stamp_ms=minute_start
+                        + _MINUTE_MS
+                        - (_FAULT_SPILL_MS if fault else rng.randint(1, 80)),
                         price=round(price, 2),
                         qty_thousandths=qty,
                         taker_buy=rng.random() < 0.5,
@@ -160,28 +172,30 @@ class SyntheticMarket:
         counts: dict[int, int] = {}
         prices: dict[int, list[float]] = {}
 
-        def add(minute_ms: int, qty: int, taker_buy: bool, price: float) -> None:
+        def add(minute_ms: int, qty: int, taker_buy: bool, price: float, fills: int) -> None:
             volume[minute_ms] = volume.get(minute_ms, 0) + qty
             if taker_buy:
                 buys[minute_ms] = buys.get(minute_ms, 0) + qty
-            counts[minute_ms] = counts.get(minute_ms, 0) + 3
+            counts[minute_ms] = counts.get(minute_ms, 0) + fills
             prices.setdefault(minute_ms, []).append(price)
 
         last_price = START_PRICES[symbol]
         for t in self.trades[symbol]:
             minute_ms = t.stamp_ms - t.stamp_ms % _MINUTE_MS
             if t.stamp_ms < start and minute_ms + _MINUTE_MS == start and t.spills_next_minute:
-                add(start, t.spills_next_minute, t.taker_buy, t.price)
+                add(start, t.spills_next_minute, t.taker_buy, t.price, 1)
             if t.stamp_ms < start:
                 last_price = t.price
                 continue
             if t.stamp_ms >= end:
                 break
+            # Every row is three fills. A spilling row has one of them in the next minute, so none counts
+            # twice.
             kept = t.qty_thousandths - t.spills_next_minute
-            add(minute_ms, kept, t.taker_buy, t.price)
+            add(minute_ms, kept, t.taker_buy, t.price, 2 if t.spills_next_minute else 3)
             spill_minute = minute_ms + _MINUTE_MS
             if t.spills_next_minute and spill_minute < end:
-                add(spill_minute, t.spills_next_minute, t.taker_buy, t.price)
+                add(spill_minute, t.spills_next_minute, t.taker_buy, t.price, 1)
         header = (
             "open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,"
             "taker_buy_quote_volume,ignore"
@@ -406,9 +420,21 @@ def synthetic_config(base: PipelineConfig, *, first_day: dt.date, days: int) -> 
             False,
             {"archive_base": f"{_BASE_URL}/archive", "book_base": f"{_BASE_URL}/book"},
             note,
+            stamp_kind="aggregate_one_price",
+            fill_span_allowance_ms=250.0,
+            allowance_state="placeholder",
+            continuity="trade_id",
         ),
         SYNTHETIC_POLL_VENUE: SourceSpec(
-            SYNTHETIC_POLL_VENUE, True, False, {"trades_url": f"{_BASE_URL}/poll"}, note
+            SYNTHETIC_POLL_VENUE,
+            True,
+            False,
+            {"trades_url": f"{_BASE_URL}/poll"},
+            note,
+            stamp_kind="exact",
+            fill_span_allowance_ms=250.0,
+            allowance_state="placeholder",
+            continuity="trade_id",
         ),
     }
     # The adapters are the real ones, reading the delivered formats. Only the data behind them is generated.
@@ -430,7 +456,9 @@ def synthetic_config(base: PipelineConfig, *, first_day: dt.date, days: int) -> 
         for spec in base.datasets
         if spec.adapter in keep
     ]
-    tolerance = ReconTolerance(daily_total_abs=1e-6, boundary_window_ms=250.0, bar_price_abs=50.0)
+    tolerance = ReconTolerance(
+        daily_total_abs=1e-6, boundary_window_ms=250.0, bar_price_rel=0.02, fill_count_rel=0.01
+    )
     return replace(
         base,
         symbols=SYMBOLS,
@@ -456,7 +484,24 @@ def _prepare_root(path: Path) -> DataRoot:
         raise ConfigError("this DATA_ROOT already holds other data, so a SYNTHETIC run is refused here")
     root = DataRoot(path)
     root.guard.check(SYNTHETIC_MARKER).write_text("Generated test data. Not market data.\n", encoding="utf-8")
+    # Also in the catalog, so that losing the marker stops a report instead of removing its label.
+    catalog = Catalog(root.catalog_path)
+    catalog.set_meta("data_kind", "SYNTHETIC")
+    catalog.close()
     return root
+
+
+def _generated_policy(policy: RetentionPolicy) -> RetentionPolicy:
+    """The deletion path has to run here, so its rule counts as reviewed for this generated root, in memory
+    only.
+
+    The shipped rule stays unreviewed until data-steward confirms it.
+    """
+    rules = tuple(
+        replace(rule, reviewed=True) if rule.id == "raw-archive-after-curated" else rule
+        for rule in policy.rules
+    )
+    return replace(policy, rules=rules)
 
 
 def _context(
@@ -484,6 +529,7 @@ def run_synthetic(
 ) -> dict[str, Any]:
     """Run everything once, on a simulated clock. The same seed gives byte-identical output."""
     first_day = FIRST_DAY
+    policy = _generated_policy(policy)
     config = synthetic_config(base_config, first_day=first_day, days=days)
     market = SyntheticMarket(seed, first_day, days)
     last_day = market.last_day()
@@ -510,10 +556,11 @@ def run_synthetic(
     # 3. The hourly poll, with generated lateness and the odd dropped slot.
     api = SyntheticTradesApi(market, config.poll.page_size)
     rng = random.Random(seed + 7)  # noqa: S311
-    cron = "23 * * * *"
+    cron = f"{config.poll.nominal_minute} * * * *"
     polls = 0
     for hours_back in range(_POLL_HOURS, 0, -1):
-        slot = now.replace(minute=23, second=0, microsecond=0) - dt.timedelta(hours=hours_back)
+        minute = config.poll.nominal_minute
+        slot = now.replace(minute=minute, second=0, microsecond=0) - dt.timedelta(hours=hours_back)
         if rng.random() < 0.05:
             continue
         delay = dt.timedelta(seconds=rng.randint(30, 1800))
@@ -555,6 +602,7 @@ def run_synthetic(
             "errors": second_pass.errors,
         },
         "raw_files_left": sum(1 for p in root.guard.check("raw").rglob("*") if p.is_file()),
+        "exclusions": status["reconciliation"]["exclusions"],
         "poll_runs": polls,
         "poll_api_calls": api.calls,
         "poll_runs_logged": len(runs),

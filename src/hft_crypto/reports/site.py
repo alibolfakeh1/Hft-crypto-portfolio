@@ -351,6 +351,12 @@ def _benchmark_section(status: dict[str, Any], benchmarks: Sequence[Benchmark]) 
         ],
         rows,
     )
+    notes = "".join(
+        f"<p>{_e(symbol)}: {_e(item['max_drawdown_note'])}</p>"
+        for symbol, item in status["benchmarks"].items()
+        if item.get("max_drawdown_note")
+    )
+    table += notes
     short = any(item["days"] < 365 for item in status["benchmarks"].values())
     caution = (
         "<p>This period is under a year, so CAGR extrapolates a short stretch and Sharpe has a wide margin of "
@@ -452,7 +458,9 @@ def _poll_section(status: dict[str, Any]) -> str:
             ["Delay, largest", _seconds(poll["delay_max_s"])],
             ["Scheduled slots with no run", poll["missed_slots_total"]],
             ["Failed runs", poll["failed_runs"]],
-            ["Trade id gaps found", poll["gaps"]],
+            ["Data gaps found", poll["gaps"]],
+            ["Runs with no record after their cut", poll["data_gap_runs"]],
+            ["Share of runs that passed on server time alone", _pct(poll["server_time_share"])],
             ["Last run", poll["last_run"]],
             ["Last run status", poll["last_status"]],
         ],
@@ -500,8 +508,11 @@ def _reconciliation_section(status: dict[str, Any]) -> str:
     text = (
         f"<p>Canonical bars against official candles: {official['days']} symbol-days checked, "
         f"{official['pass']} pass, {official['warn']} warn, {official['fail']} fail. "
-        "The daily totals must match. Single bars may differ slightly, because the official bars use a "
-        "different boundary.</p>"
+        "At every minute, trades and candles must agree within what fills running past a boundary can explain, "
+        "and what one day sends past midnight the next must take in. That window is a declared placeholder until "
+        "it is rechecked on the approved source.</p>"
+        f"<p>Symbol-days left out of results: {status['reconciliation']['exclusions']}. Their bars stay readable, "
+        "flagged from the first minute the check could not explain.</p>"
     )
     cross = status["reconciliation"]["cross_venue"]
     if cross:

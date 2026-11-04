@@ -39,10 +39,10 @@ from hft_crypto.data.derive import (
     derive_day,
     derive_task_key,
     needs_derive,
+    reopen_day,
 )
 from hft_crypto.data.fetch import Fetcher, FetchError, NotPublishedError
 from hft_crypto.data.guard import PathGuardError
-from hft_crypto.data.health import measure_zones
 from hft_crypto.data.parsers import (
     CuratedResult,
     ValidationError,
@@ -60,8 +60,8 @@ from hft_crypto.data.sources import (
     archive_candidates,
     expected_partitions,
 )
-from hft_crypto.data.zones import ZONE_DIRS
-from hft_crypto.timeutil import iso, month_key, next_month
+from hft_crypto.data.zones import ZONE_DIRS, measure_zones
+from hft_crypto.timeutil import MICROS_PER_SECOND, iso, iso_us, month_key, next_month, to_us
 from hft_crypto.versioning import code_version
 
 STATE_OVERDUE = "overdue"
@@ -126,6 +126,9 @@ class IngestSummary:
     raw_deleted_files: int = 0
     raw_deleted_bytes: int = 0
     raw_kept_after_curated: int = 0
+    bars_left_by_budget: int = 0
+    nothing_selected: bool = False
+    alerts: list[str] = field(default_factory=list)
     catalog_marked_absent: int = 0
     catalog_rebuild_needed: int = 0
     temp_files_swept: int = 0
@@ -264,9 +267,12 @@ def _quarantine_file(ctx: JobContext, path: Path, rel_name: str) -> None:
 
 
 def _fetch_raw(
-    ctx: JobContext, fetcher: Fetcher, task: Task, summary: IngestSummary
+    ctx: JobContext, fetcher: Fetcher, task: Task, summary: IngestSummary, *, refetch: bool
 ) -> tuple[Path, ArchiveFile, dict[str, Any]]:
-    """Download into a temporary name, verify any checksum, then rename into the raw zone."""
+    """Download into a temporary name, verify any checksum, then rename into the raw zone.
+
+    refetch ignores a copy already on disk, because a retry after a failed check is looking for a better file.
+    """
     limits = ctx.config.fetch
     last_missing: NotPublishedError | None = None
     for candidate in archive_candidates(ctx.config, task.spec, task.symbol, task.partition):
@@ -275,7 +281,8 @@ def _fetch_raw(
         )
         record = ctx.catalog.get_file(ctx.relative(final))
         if (
-            final.is_file()
+            not refetch
+            and final.is_file()
             and record is not None
             and record.status == "present"
             and record.sha256 == sha256_file(final)
@@ -318,19 +325,42 @@ def _fetch_raw(
 def _parse(ctx: JobContext, task: Task, raw: Path) -> CuratedResult:
     limit = ctx.config.fetch.max_uncompressed_bytes
     kind = task.spec.kind
+    venue = task.spec.venue
+    allowance_us = ctx.config.source(venue).fill_span_allowance_us
     if kind == "aggTrades":
-        return parse_agg_trades(raw, task.symbol, task.partition, limit, task.spec.venue)
+        return parse_agg_trades(
+            raw, task.symbol, task.partition, limit, venue=venue, allowance_us=allowance_us
+        )
     if kind == "trades":
-        return parse_bybit_trades(raw, task.symbol, task.partition, limit, task.spec.venue)
+        return parse_bybit_trades(
+            raw, task.symbol, task.partition, limit, venue=venue, allowance_us=allowance_us
+        )
     if kind == "klines":
-        return parse_klines(raw, task.symbol, task.partition, limit, task.spec.venue)
+        return parse_klines(raw, task.symbol, task.partition, limit, venue=venue, allowance_us=allowance_us)
     if kind == "bookDepth":
         return parse_book_depth(
-            raw, task.symbol, task.partition, limit, ctx.config.book_depth_allowance_s, task.spec.venue
+            raw, task.symbol, task.partition, limit, ctx.config.book_depth_allowance_s, venue=venue
         )
     if kind == "fundingRate":
-        return parse_funding(raw, task.symbol, task.partition, limit, task.spec.venue)
+        return parse_funding(raw, task.symbol, task.partition, limit, venue=venue, allowance_us=allowance_us)
     raise ValueError(f"no parser for {kind}")
+
+
+def _refuse_future_stamps(ctx: JobContext, result: CuratedResult) -> None:
+    """A row stamped ahead of the clock cannot be real, so nothing built on it can be trusted."""
+    newest = result.checks.get("last_ts_us")
+    limit = to_us(ctx.now()) + round(ctx.config.max_future_skew_s * MICROS_PER_SECOND)
+    if newest is not None and int(newest) > limit:
+        raise ValidationError(f"a row is stamped {iso_us(int(newest))}, ahead of the clock")
+
+
+def _quality_warnings(ctx: JobContext, task: Task, result: CuratedResult) -> list[str]:
+    warnings = list(result.warnings)
+    largest = result.checks.get("largest_time_gap_s")
+    quiet = task.spec.max_quiet_s
+    if quiet is not None and largest is not None and float(largest) > quiet:
+        warnings.append(f"a silence of {largest} s, above the declared {quiet:g} s")
+    return warnings
 
 
 def _book_result(raw: Path, task: Task) -> CuratedResult:
@@ -348,8 +378,10 @@ def run_archive_task(ctx: JobContext, fetcher: Fetcher, task: Task, summary: Ing
     """Process one partition from download to curated. Return the state it ended in."""
     now_iso = ctx.now_iso()
     spec = task.spec
+    before = ctx.catalog.get_task(task.key)
+    refetch = before is not None and before.state == STATE_FAILED
     try:
-        raw, source, raw_checks = _fetch_raw(ctx, fetcher, task, summary)
+        raw, source, raw_checks = _fetch_raw(ctx, fetcher, task, summary, refetch=refetch)
     except NotPublishedError:
         overdue_at = task.partition_end() + dt.timedelta(hours=spec.overdue_hours)
         state = STATE_OVERDUE if ctx.now() > overdue_at else STATE_PENDING
@@ -399,6 +431,7 @@ def run_archive_task(ctx: JobContext, fetcher: Fetcher, task: Task, summary: Ing
         )
     try:
         result = _book_result(raw, task) if spec.kind == "orderbook" else _parse(ctx, task, raw)
+        _refuse_future_stamps(ctx, result)
     except ValidationError as exc:
         _quarantine_file(ctx, raw, raw_rel)
         ctx.catalog.set_file_status(raw_rel, "quarantined", now_iso)
@@ -406,6 +439,7 @@ def run_archive_task(ctx: JobContext, fetcher: Fetcher, task: Task, summary: Ing
         summary.errors.append(f"{task.key}: {exc}")
         return STATE_FAILED
 
+    warnings = _quality_warnings(ctx, task, result)
     target = curated_path(ctx, spec, task.symbol, task.partition)
     atomic_write_parquet(target, result.frame, guard=ctx.root.guard)
     ctx.register_output(
@@ -417,8 +451,8 @@ def run_archive_task(ctx: JobContext, fetcher: Fetcher, task: Task, summary: Ing
         date_start=partition_text,
         date_end=date_end,
         rows=result.frame.height,
-        check_status="pass",
-        check_detail={**result.checks, "warnings": list(result.warnings)},
+        check_status="warn" if warnings else "pass",
+        check_detail={**result.checks, "warnings": warnings},
         parents=[raw_rel],
         tier=spec.tier,
         venue=spec.venue,
@@ -434,44 +468,60 @@ def run_archive_task(ctx: JobContext, fetcher: Fetcher, task: Task, summary: Ing
         now=now_iso,
         attempts=0,
     )
+    # What this file feeds has to be built again, whatever state it was left in. A replaced file also changes
+    # what its neighbours can conclude about the midnight between them.
+    if spec.curated in (TRADES, OFFICIAL):
+        for offset in (-1, 0, 1):
+            reopen_day(ctx, spec.venue, task.symbol, task.partition + dt.timedelta(days=offset))
     return STATE_DONE
+
+
+def _fail_derive(
+    ctx: JobContext, venue: str, symbol: str, day: dt.date, reason: str, summary: IngestSummary
+) -> None:
+    """Record a failed day and schedule both of its files to be fetched again, in case a good one appears."""
+    key = derive_task_key(venue, symbol, day)
+    summary.bars_failed += 1
+    summary.errors.append(f"{key}: {reason}")
+    current = ctx.catalog.get_task(key)
+    attempts = (current.attempts if current else 0) + 1
+    retry_at = _retry_at(ctx, attempts)
+    ctx.catalog.set_task(
+        key,
+        dataset_id=derive_dataset_id(venue),
+        symbol=symbol,
+        partition_key=day.isoformat(),
+        state=STATE_FAILED,
+        now=ctx.now_iso(),
+        attempts=attempts,
+        last_error=reason[:500],
+        next_retry_at=retry_at,
+    )
+    for spec in ctx.config.datasets:
+        if spec.venue == venue and spec.curated in (TRADES, OFFICIAL):
+            ctx.catalog.set_task(
+                f"archive:{spec.id}:{symbol}:{day.isoformat()}",
+                dataset_id=spec.id,
+                symbol=symbol,
+                partition_key=day.isoformat(),
+                state=STATE_FAILED,
+                now=ctx.now_iso(),
+                attempts=attempts,
+                last_error="the bars built from this file failed a check",
+                next_retry_at=retry_at,
+            )
 
 
 def _run_derive(ctx: JobContext, venue: str, symbol: str, day: dt.date, summary: IngestSummary) -> None:
     key = derive_task_key(venue, symbol, day)
-    outcome = derive_day(ctx, venue, symbol, day)
+    try:
+        outcome = derive_day(ctx, venue, symbol, day)
+    except Exception as exc:
+        # One bad day must not stop the others. Its task stays open and the next run tries again.
+        _fail_derive(ctx, venue, symbol, day, f"{type(exc).__name__}: {exc}", summary)
+        return
     if outcome.state == STATE_FAILED:
-        summary.bars_failed += 1
-        message = f"{key}: {outcome.reason}"
-        summary.errors.append(message)
-        current = ctx.catalog.get_task(key)
-        attempts = (current.attempts if current else 0) + 1
-        retry_at = _retry_at(ctx, attempts)
-        ctx.catalog.set_task(
-            key,
-            dataset_id=derive_dataset_id(venue),
-            symbol=symbol,
-            partition_key=day.isoformat(),
-            state=STATE_FAILED,
-            now=ctx.now_iso(),
-            attempts=attempts,
-            last_error=str(outcome.reason)[:500],
-            next_retry_at=retry_at,
-        )
-        # A daily total that disagrees may mean a bad delivery, so both sides are fetched again later.
-        for spec in ctx.config.datasets:
-            if spec.venue == venue and spec.curated in (TRADES, OFFICIAL):
-                ctx.catalog.set_task(
-                    f"archive:{spec.id}:{symbol}:{day.isoformat()}",
-                    dataset_id=spec.id,
-                    symbol=symbol,
-                    partition_key=day.isoformat(),
-                    state=STATE_FAILED,
-                    now=ctx.now_iso(),
-                    attempts=attempts,
-                    last_error="reconciliation failed",
-                    next_retry_at=retry_at,
-                )
+        _fail_derive(ctx, venue, symbol, day, str(outcome.reason), summary)
         return
     summary.bars_built += 1
     if outcome.state == STATE_PROVISIONAL:
@@ -483,7 +533,7 @@ def _run_derive(ctx: JobContext, venue: str, symbol: str, day: dt.date, summary:
         partition_key=day.isoformat(),
         state=outcome.state,
         now=ctx.now_iso(),
-        attempts=0,
+        attempts=0 if outcome.state == STATE_DONE else None,
     )
 
 
@@ -513,13 +563,48 @@ def _bar_targets(ctx: JobContext, options: IngestOptions) -> list[tuple[str, str
     return pairs
 
 
-def _sweep_open_bars(ctx: JobContext, options: IngestOptions, summary: IngestSummary) -> None:
-    """Rebuild any day whose inputs have changed since it was built, whichever run fetched them."""
-    for venue, symbol in _bar_targets(ctx, options):
-        for part in ctx.root.curated_parts(TRADES, venue, symbol):
-            day = dt.date.fromisoformat(part.stem.removeprefix("part-"))
-            if needs_derive(ctx, venue, symbol, day):
-                _run_derive(ctx, venue, symbol, day, summary)
+def _sweep_open_bars(
+    ctx: JobContext,
+    options: IngestOptions,
+    summary: IngestSummary,
+    *,
+    deadline: float | None,
+    clock: Callable[[], float],
+) -> None:
+    """Rebuild any day whose inputs have changed since it was built, whichever run fetched them.
+
+    A rebuild can make a neighbour's answer available, so this repeats until nothing changes. Newly final days
+    can settle their neighbours, and each pass can only move a day towards final, so it ends. The budget
+    bounds it too.
+    """
+    for _ in range(4):
+        days = [
+            (venue, symbol, dt.date.fromisoformat(part.stem.removeprefix("part-")))
+            for venue, symbol in _bar_targets(ctx, options)
+            for part in ctx.root.curated_parts(TRADES, venue, symbol)
+        ]
+        open_days = [item for item in days if needs_derive(ctx, *item)]
+        if not open_days:
+            return
+        for index, (venue, symbol, day) in enumerate(open_days):
+            if deadline is not None and clock() >= deadline:
+                summary.bars_left_by_budget = len(open_days) - index
+                return
+            _run_derive(ctx, venue, symbol, day, summary)
+
+
+def _delete_settled_raw(ctx: JobContext, summary: IngestSummary) -> None:
+    """A last pass: a file kept earlier in this run may now be allowed to go. The protocol decides each
+    one."""
+    kept = 0
+    for record in ctx.catalog.files(status="present", prefix="raw/archive/"):
+        deleted, _reason = protocol_delete(ctx, record.rel_path, RAW_RULE)
+        if deleted:
+            summary.raw_deleted_files += 1
+            summary.raw_deleted_bytes += record.size_bytes
+        else:
+            kept += 1
+    summary.raw_kept_after_curated = kept
 
 
 def _persisted(summary: IngestSummary) -> dict[str, Any]:
@@ -529,8 +614,28 @@ def _persisted(summary: IngestSummary) -> dict[str, Any]:
     return values
 
 
+def _contain_task_failure(ctx: JobContext, task: Task, exc: Exception, summary: IngestSummary) -> None:
+    """Record whatever escaped, keep the evidence out of the way, and let the run go on."""
+    message = f"{type(exc).__name__}: {exc}"
+    prefix = (
+        f"raw/archive/{task.spec.venue}/{task.spec.kind}/{task.symbol}/date={task.partition.isoformat()}/"
+    )
+    for record in ctx.catalog.files(status="present", prefix=prefix):
+        try:
+            path = ctx.root.guard.check(record.rel_path)
+            if path.is_file():
+                _quarantine_file(ctx, path, record.rel_path)
+            ctx.catalog.set_file_status(record.rel_path, "quarantined", ctx.now_iso())
+        except (PathGuardError, OSError) as quarantine_error:
+            message += f"; could not quarantine: {quarantine_error}"
+    _set_failed(ctx, task, message)
+    summary.errors.append(f"{task.key}: {message}")
+
+
 def _finish_status(summary: IngestSummary) -> str:
-    if summary.not_started_time_budget or summary.held_by_watermark:
+    if summary.nothing_selected:
+        return "nothing_selected"
+    if summary.not_started_time_budget or summary.held_by_watermark or summary.bars_left_by_budget:
         return "partial"
     if summary.failed or summary.bars_failed:
         return "partial"
@@ -556,7 +661,8 @@ def run_ingest(
         code_version=code_version(),
         config_hash=ctx.config.config_hash,
     )
-    summary.temp_files_swept = len(sweep_temp_files(ctx.root.guard, ZONE_DIRS))
+    zones = tuple(zone for zone in ZONE_DIRS if zone not in ("ledger", "decisions"))
+    summary.temp_files_swept = len(sweep_temp_files(ctx.root.guard, zones))
     summary.catalog_marked_absent, summary.catalog_rebuild_needed = sync_catalog_with_disk(ctx)
 
     if not ctx.config.enabled_sources():
@@ -573,6 +679,15 @@ def run_ingest(
 
     tasks = plan_tasks(ctx, options)
     summary.planned = len(tasks)
+    # An approved source with nothing selected must not look like a healthy run that fetched nothing.
+    if options.dataset_ids is not None:
+        selected = {spec.venue for spec in ctx.config.datasets if spec.id in options.dataset_ids}
+        for name in ctx.config.enabled_sources():
+            if name not in selected:
+                summary.alerts.append(
+                    f"Approved source {name} has no dataset selected, so nothing was fetched."
+                )
+        summary.nothing_selected = not selected
     quota = quota_bytes(ctx.config.default_quota_gb)
     routine_since = ctx.now().date() - dt.timedelta(days=ctx.config.routine_window_days)
     books_done = 0
@@ -598,29 +713,45 @@ def run_ingest(
         if storage.level == LEVEL_CRITICAL or (storage.stop_backfill and task.partition < routine_since):
             summary.held_by_watermark += 1
             continue
-        state = run_archive_task(ctx, fetcher, task, summary)
+        try:
+            state = run_archive_task(ctx, fetcher, task, summary)
+        except Exception as exc:
+            # One bad partition can never stop the others. Work is newest first, so an escape here would hit
+            # the same file again on every later run, and catch-up would never get past it.
+            _contain_task_failure(ctx, task, exc, summary)
+            summary.failed += 1
+            continue
         if state == STATE_DONE:
             summary.done += 1
             if task.spec.kind == "orderbook":
                 books_done += 1
-            if task.spec.curated == TRADES:
-                for day in (task.partition, task.partition - dt.timedelta(days=1)):
-                    if needs_derive(ctx, task.spec.venue, task.symbol, day):
-                        _run_derive(ctx, task.spec.venue, task.symbol, day, summary)
-            elif task.spec.curated == OFFICIAL and needs_derive(
-                ctx, task.spec.venue, task.symbol, task.partition
-            ):
-                _run_derive(ctx, task.spec.venue, task.symbol, task.partition, summary)
+            venue, symbol, day = task.spec.venue, task.symbol, task.partition
+            # With the partner file still to come in this run, wait for it. Deriving now would judge the new
+            # file against the old one, and that is how a failed day used to stay failed.
+            waiting = task.spec.curated == OFFICIAL and any(
+                later.spec.curated == TRADES
+                and later.spec.venue == venue
+                and later.symbol == symbol
+                and later.partition == day
+                for later in tasks[index + 1 :]
+            )
+            if task.spec.curated in (TRADES, OFFICIAL) and not waiting:
+                for target in (day, day - dt.timedelta(days=1)):
+                    if needs_derive(ctx, venue, symbol, target):
+                        _run_derive(ctx, venue, symbol, target, summary)
             if options.delete_raw:
                 _delete_raw_for(ctx, task, summary)
         elif state == STATE_PENDING:
             summary.pending += 1
         elif state == STATE_OVERDUE:
             summary.overdue += 1
+            summary.alerts.append(f"{task.key} is overdue")
         else:
             summary.failed += 1
 
-    _sweep_open_bars(ctx, options, summary)
+    _sweep_open_bars(ctx, options, summary, deadline=deadline, clock=clock)
+    if options.delete_raw:
+        _delete_settled_raw(ctx, summary)
     summary.seconds = round(clock() - started, 3)
     summary.status = _finish_status(summary)
     summary.source_state = ctx.config.source_state()

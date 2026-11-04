@@ -107,14 +107,39 @@ def test_a_snapshot_replaces_the_book() -> None:
 
 
 def test_a_service_restart_snapshot_is_a_reset_and_not_a_break() -> None:
+    """F-19. It used to restate the same book, and never asked whether the day passed."""
+    new_book = book_message("snapshot", 1, [["90.0", "7"], ["89.0", "2"]], [["91.0", "1"], ["92.0", "2"]])
     result = replay(
         SNAPSHOT,
         book_message("delta", 2, [], []),
-        book_message("snapshot", 1, [["100.0", "1"], ["99.0", "2"]], [["101.0", "1"], ["102.0", "2"]]),
+        new_book,
         book_message("delta", 2, [], []),
     )
     assert result.update_id_resets == 1
     assert result.update_id_breaks == 0
+    assert result.snapshot_mismatches == 0
+    assert result.ok is True
+
+
+def test_a_snapshot_that_is_not_a_reset_still_has_to_agree() -> None:
+    result = replay(SNAPSHOT, book_message("snapshot", 2, [["90.0", "7"]], [["91.0", "1"]]))
+    assert result.snapshot_mismatches == 1
+    assert result.ok is False
+
+
+@pytest.mark.parametrize("size", ["-1", "NaN", "inf"], ids=["negative", "nan", "infinite"])
+def test_a_size_that_cannot_be_real_is_malformed(size: str) -> None:
+    """F-19. These passed."""
+    result = replay(SNAPSHOT, book_message("delta", 2, [["100.0", size]], []))
+    assert result.malformed_lines == 1
+    assert result.ok is False
+
+
+def test_a_file_with_an_empty_side_never_checked_for_a_crossed_book_does_not_pass() -> None:
+    """F-19. With no ask at all, nothing could ever cross, and that passed."""
+    result = replay(book_message("snapshot", 1, [["100.0", "1"]], []))
+    assert result.crossed_checks == 0
+    assert result.ok is False
 
 
 def test_a_snapshot_that_jumps_is_a_break() -> None:

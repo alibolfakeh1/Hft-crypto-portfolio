@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from hft_crypto.data.guard import canonical_rel_path
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS datasets (
   dataset_id TEXT PRIMARY KEY,
@@ -119,10 +121,43 @@ CREATE TABLE IF NOT EXISTS poll_state (
   last_trade_id INTEGER,
   emitted_end_us INTEGER,
   last_trade_us INTEGER,
+  rebuilding INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reconciliation_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  check_name TEXT NOT NULL,
+  venue TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  date TEXT NOT NULL,
+  status TEXT NOT NULL,
+  detail TEXT NOT NULL,
+  checked_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS file_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  rel_path TEXT NOT NULL,
+  old_sha256 TEXT NOT NULL,
+  new_sha256 TEXT NOT NULL,
+  changed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS exclusions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  venue TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  date TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  boundary_window_ms REAL,
+  excluded_at TEXT NOT NULL,
+  resolved_at TEXT,
+  UNIQUE (venue, symbol, date, reason)
+);
 """
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -165,6 +200,11 @@ class PollState:
     last_trade_id: int | None
     emitted_end_us: int | None
     last_trade_us: int | None
+    rebuilding: bool = False
+
+
+def _manifest_path(entry: Any) -> str:
+    return str(entry["path"]) if isinstance(entry, dict) else str(entry)
 
 
 def _file_from_row(row: sqlite3.Row) -> FileRecord:
@@ -243,8 +283,19 @@ class Catalog:
             )
 
     def register_file(self, record: FileRecord, parents: Iterable[str] = ()) -> None:
+        parents = tuple(parents)
+        canonical_rel_path(record.rel_path)
+        for parent in parents:
+            canonical_rel_path(parent)
         detail = None if record.check_detail is None else json.dumps(record.check_detail, sort_keys=True)
+        previous = self.get_file(record.rel_path)
         with self._db:
+            if previous is not None and previous.sha256 != record.sha256:
+                self._db.execute(
+                    """INSERT INTO file_history (rel_path, old_sha256, new_sha256, changed_at)
+                       VALUES (?,?,?,?)""",
+                    (record.rel_path, previous.sha256, record.sha256, record.created_at),
+                )
             self._db.execute(
                 """INSERT OR REPLACE INTO files
                    (rel_path, dataset_id, kind, partition_key, date_start, date_end, size_bytes, sha256,
@@ -275,6 +326,11 @@ class Catalog:
                 "INSERT OR IGNORE INTO file_parents (child_path, parent_path) VALUES (?,?)",
                 [(record.rel_path, parent) for parent in parents],
             )
+
+    def changed_files(self, prefix: str) -> list[dict[str, Any]]:
+        """Files whose content changed after being recorded. On a delivered file that deserves an alert."""
+        rows = self._db.execute("SELECT * FROM file_history ORDER BY id")
+        return [dict(row) for row in rows if str(row["rel_path"]).startswith(prefix)]
 
     def get_file(self, rel_path: str) -> FileRecord | None:
         row = self._db.execute("SELECT * FROM files WHERE rel_path=?", (rel_path,)).fetchone()
@@ -413,7 +469,7 @@ class Catalog:
         now: str,
         status: str,
         summary: dict[str, Any] | None = None,
-        data_manifest: list[str] | None = None,
+        data_manifest: list[Any] | None = None,
         published: bool = False,
     ) -> None:
         with self._db:
@@ -453,7 +509,11 @@ class Catalog:
         rows = self._db.execute(
             "SELECT run_id, data_manifest FROM runs WHERE published=1 AND data_manifest IS NOT NULL"
         )
-        return [row["run_id"] for row in rows if rel_path in json.loads(row["data_manifest"])]
+        return [
+            row["run_id"]
+            for row in rows
+            if any(_manifest_path(entry) == rel_path for entry in json.loads(row["data_manifest"]))
+        ]
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         row = self._db.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
@@ -543,12 +603,93 @@ class Catalog:
         now: str,
     ) -> None:
         with self._db:
+            text = json.dumps(detail, sort_keys=True)
             self._db.execute(
                 """INSERT OR REPLACE INTO reconciliations
                    (check_name, venue, symbol, date, status, detail, checked_at)
                    VALUES (?,?,?,?,?,?,?)""",
-                (check_name, venue, symbol, date, status, json.dumps(detail, sort_keys=True), now),
+                (check_name, venue, symbol, date, status, text, now),
             )
+            # The latest result replaces the row above, so the evidence of a past failure is kept here.
+            self._db.execute(
+                """INSERT INTO reconciliation_history
+                   (check_name, venue, symbol, date, status, detail, checked_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (check_name, venue, symbol, date, status, text, now),
+            )
+
+    def get_reconciliation(
+        self, check_name: str, venue: str, symbol: str, date: str
+    ) -> dict[str, Any] | None:
+        row = self._db.execute(
+            """SELECT * FROM reconciliations
+               WHERE check_name=? AND venue=? AND symbol=? AND date=?""",
+            (check_name, venue, symbol, date),
+        ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["detail"] = json.loads(item["detail"])
+        return item
+
+    def reconciliation_history(self, venue: str, symbol: str, date: str) -> list[dict[str, Any]]:
+        rows = self._db.execute(
+            """SELECT * FROM reconciliation_history
+               WHERE venue=? AND symbol=? AND date=? ORDER BY id""",
+            (venue, symbol, date),
+        )
+        return [dict(row) for row in rows]
+
+    def add_exclusion(
+        self,
+        venue: str,
+        symbol: str,
+        date: str,
+        reason: str,
+        window_ms: float | None,
+        *,
+        now: str,
+    ) -> bool:
+        """Record a day left out of results. Return whether this reason is new for that day."""
+        with self._db:
+            cursor = self._db.execute(
+                """INSERT OR IGNORE INTO exclusions
+                   (venue, symbol, date, reason, boundary_window_ms, excluded_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (venue, symbol, date, reason, window_ms, now),
+            )
+            self._db.execute(
+                "UPDATE exclusions SET resolved_at=NULL WHERE venue=? AND symbol=? AND date=? AND reason=?",
+                (venue, symbol, date, reason),
+            )
+        return cursor.rowcount > 0
+
+    def resolve_exclusions(self, venue: str, symbol: str, date: str, *, now: str) -> None:
+        """A later good file settled it. The record of the exclusion stays, marked as resolved."""
+        with self._db:
+            self._db.execute(
+                """UPDATE exclusions SET resolved_at=?
+                   WHERE venue=? AND symbol=? AND date=? AND resolved_at IS NULL""",
+                (now, venue, symbol, date),
+            )
+
+    def exclusions(self, *, active_only: bool = True) -> list[dict[str, Any]]:
+        query = "SELECT * FROM exclusions"
+        if active_only:
+            query += " WHERE resolved_at IS NULL"
+        return [dict(row) for row in self._db.execute(query + " ORDER BY date, venue, symbol, id")]
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._db:
+            self._db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?,?)", (key, value))
+
+    def get_meta(self, key: str) -> str | None:
+        row = self._db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return None if row is None else str(row["value"])
+
+    def dataset_venues(self) -> set[str]:
+        rows = self._db.execute("SELECT DISTINCT venue FROM datasets WHERE venue IS NOT NULL")
+        return {str(row["venue"]) for row in rows}
 
     def reconciliations(self, check_name: str | None = None) -> list[dict[str, Any]]:
         if check_name is None:
@@ -577,20 +718,22 @@ class Catalog:
             last_trade_id=row["last_trade_id"],
             emitted_end_us=row["emitted_end_us"],
             last_trade_us=row["last_trade_us"],
+            rebuilding=bool(row["rebuilding"]),
         )
 
     def set_poll_state(self, state: PollState, *, now: str) -> None:
         with self._db:
             self._db.execute(
                 """INSERT OR REPLACE INTO poll_state
-                   (symbol, cursor_ns, last_trade_id, emitted_end_us, last_trade_us, updated_at)
-                   VALUES (?,?,?,?,?,?)""",
+                   (symbol, cursor_ns, last_trade_id, emitted_end_us, last_trade_us, rebuilding, updated_at)
+                   VALUES (?,?,?,?,?,?,?)""",
                 (
                     state.symbol,
                     str(state.cursor_ns),
                     state.last_trade_id,
                     state.emitted_end_us,
                     state.last_trade_us,
+                    int(state.rebuilding),
                     now,
                 ),
             )

@@ -1,10 +1,20 @@
-"""Bars from trades, following the timing contract in docs/00_CHARTER.md section 3.
+"""Bars from trades, following the timing contract in docs/00_CHARTER.md section 3 and conventions C2 and C17.
 
 - A bar covers (open_time, close_time], so a trade exactly on a boundary closes the bar ending there.
-- A bar is knowable at close_time, or later when its data reached us later.
-- A higher-timeframe bar is emitted only when it has closed, and is knowable only then.
-- A minute with no trades is a real row: prices null, volumes zero. Nothing is forward filled, because
-  a missing price must not look like a traded one.
+- A minute with no trades is a real row with null prices and zero volume, and it says how we know that.
+  `empty_proof` is `traded` for a minute with trades, `id_run` when the rows on either side have consecutive
+  ids, and `none` otherwise. Unproven means a gap: a hole must never pass as a quiet market. Nothing is
+  forward filled.
+- A row carrying one stamp over an interval can hold fills from after that stamp, so nothing built from it is
+  known at the stamp. A trade is knowable at its stamp plus the source's declared allowance, and a bar at its
+  close plus that allowance, or when this system received it if that was later. See the leak audit's ruling 2.
+- `volume` and its relatives put a whole row in the bar of its stamp. The `settled_*` columns move a row that
+  could run past the close into the next bar, so they hold only what had printed by the close. IDEAL mode
+  reads only them.
+- A higher-timeframe bar is emitted only when it has closed, by a closing time the caller states.
+
+Every argument that decides timing is required, so that no caller gets the optimistic reading by leaving one
+out.
 
 Sums run in NumPy on rows sorted by time and trade id. Their result depends only on that order, not on how
 many threads a data frame engine happens to use, which keeps the output byte-identical between runs.
@@ -12,7 +22,9 @@ many threads a data frame engine happens to use, which keeps the output byte-ide
 
 from __future__ import annotations
 
-from typing import cast
+from collections.abc import Collection
+from dataclasses import dataclass
+from typing import Literal, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -21,6 +33,11 @@ import polars as pl
 from hft_crypto.timeutil import MICROS_PER_MINUTE
 
 UTC_TIME = pl.Datetime("us", "UTC")
+Continuity = Literal["trade_id", "none"]
+
+PROOF_TRADED = "traded"
+PROOF_ID_RUN = "id_run"
+PROOF_NONE = "none"
 
 BAR_SCHEMA: dict[str, pl.DataType] = {
     "venue": pl.String(),
@@ -35,17 +52,33 @@ BAR_SCHEMA: dict[str, pl.DataType] = {
     "quote_volume": pl.Float64(),
     "buy_volume": pl.Float64(),
     "sell_volume": pl.Float64(),
+    "settled_volume": pl.Float64(),
+    "settled_quote_volume": pl.Float64(),
+    "settled_buy_volume": pl.Float64(),
+    "settled_sell_volume": pl.Float64(),
     "trade_count": pl.Int64(),
     "fill_count": pl.Int64(),
+    "empty_proof": pl.String(),
     "gap": pl.Boolean(),
     "knowable_time": UTC_TIME,
 }
+_HIGHER_COLUMNS = {key: value for key, value in BAR_SCHEMA.items() if key != "empty_proof"}
 HIGHER_BAR_SCHEMA: dict[str, pl.DataType] = {
-    **BAR_SCHEMA,
+    **_HIGHER_COLUMNS,
     "n_1m": pl.Int32(),
     "complete": pl.Boolean(),
 }
-TRADE_INPUT_COLUMNS = ("ts", "price", "qty", "is_taker_buy", "trade_id", "n_fills")
+TRADE_INPUT_COLUMNS = (
+    "ts",
+    "price",
+    "qty",
+    "is_taker_buy",
+    "trade_id",
+    "file_row",
+    "n_fills",
+    "knowable_time",
+)
+_FLOW_COLUMNS = ("volume", "quote_volume", "buy_volume", "sell_volume")
 
 # Decimal places kept on summed quantities. The inputs have far fewer, so this removes only float noise.
 _QTY_DECIMALS = 10
@@ -53,10 +86,22 @@ _QUOTE_DECIMALS = 6
 
 _IntArray = npt.NDArray[np.int64]
 _FloatArray = npt.NDArray[np.float64]
+_BoolArray = npt.NDArray[np.bool_]
 
 
 class TimingContractError(Exception):
-    """A value was used before its knowable time."""
+    """A value was used before its knowable time, or a run asked for something it could not have."""
+
+
+@dataclass(frozen=True)
+class IdSkip:
+    """A place where consecutive rows do not have consecutive trade ids, so rows may be missing."""
+
+    after_id: int
+    next_id: int
+    from_us: int
+    to_us: int
+    known_at_us: int
 
 
 def minute_close_us(ts_us: _IntArray) -> _IntArray:
@@ -76,39 +121,89 @@ def _empty(schema: dict[str, pl.DataType]) -> pl.DataFrame:
     return pl.DataFrame(schema=schema)
 
 
+def _us(series: pl.Series) -> _IntArray:
+    return cast(_IntArray, series.dt.timestamp("us").to_numpy().astype(np.int64))
+
+
+def _sorted_view(trades: pl.DataFrame) -> tuple[_IntArray, _IntArray, _IntArray]:
+    """Return row order, sorted stamps and sorted ids. A row with no trade id sorts by its file position."""
+    ts_us = _us(trades["ts"])
+    rows = trades["file_row"].to_numpy().astype(np.int64)
+    ids = trades["trade_id"].fill_null(-1).to_numpy().astype(np.int64)
+    # A null id means the row has no sequence, so its position in the file decides ties.
+    tie_break = np.where(trades["trade_id"].is_null().to_numpy().astype(bool), rows, ids)
+    order = np.lexsort((tie_break, ts_us))
+    return order, ts_us[order], ids[order]
+
+
+def find_id_skips(trades: pl.DataFrame) -> list[IdSkip]:
+    """Every place where the rows' own ids show that something between them is missing."""
+    if trades.height < 2 or trades["trade_id"].null_count() == trades.height:
+        return []
+    order, ts_us, ids = _sorted_view(trades)
+    known = _us(trades["knowable_time"])[order]
+    positions = np.flatnonzero(np.diff(ids) != 1)
+    return [
+        IdSkip(int(ids[i]), int(ids[i + 1]), int(ts_us[i]), int(ts_us[i + 1]), int(known[i + 1]))
+        for i in positions.tolist()
+    ]
+
+
+def find_long_quiets(trades: pl.DataFrame, max_quiet_us: int) -> list[tuple[int, int]]:
+    """Silences longer than a source's declared limit, as (from, to) stamps."""
+    if trades.height < 2:
+        return []
+    _, ts_us, _ = _sorted_view(trades)
+    positions = np.flatnonzero(np.diff(ts_us) > max_quiet_us)
+    return [(int(ts_us[i]), int(ts_us[i + 1])) for i in positions.tolist()]
+
+
+def closes_between(from_us: int, to_us: int) -> set[int]:
+    """Every minute close whose minute touches a stretch, from the bar holding its start to the bar holding
+    its end."""
+    first = ((from_us - 1) // MICROS_PER_MINUTE + 1) * MICROS_PER_MINUTE
+    last = ((to_us - 1) // MICROS_PER_MINUTE + 1) * MICROS_PER_MINUTE
+    return set(range(first, last + 1, MICROS_PER_MINUTE))
+
+
 def build_bars_1m(
     trades: pl.DataFrame,
     *,
     venue: str,
     symbol: str,
-    first_close_us: int | None = None,
-    last_close_us: int | None = None,
-    knowable_at_us: int | None = None,
-    gap_close_us: set[int] | None = None,
+    first_close_us: int,
+    last_close_us: int,
+    continuity: Continuity,
+    fill_span_allowance_us: int,
+    received_at_us: int | None,
+    gap_close_us: Collection[int] = frozenset(),
 ) -> pl.DataFrame:
-    """Build one-minute bars from trades.
+    """Build one-minute bars on an explicit grid, from first_close_us through last_close_us.
 
-    The grid runs from first_close_us to last_close_us. Without them, it spans the trades given. Trades
-    outside the grid are ignored. knowable_at_us is the moment this data actually reached us, used by the
-    poll path: a bar is then knowable at the later of that moment and its close. gap_close_us marks bars
-    known to be incomplete.
+    The grid is required, so a bar's existence never depends on whether a later trade is in the data. trades
+    may hold rows outside the grid: they add nothing to a bar's prices or volume, but the row before and after
+    the grid prove continuity at its edges, and a row just before it can carry into the first bar's settled
+    columns.
+
+    continuity says whether trade ids can prove an empty minute. fill_span_allowance_us is how long after its
+    stamp a row can run. received_at_us is when this system had the data, or None for an archive. gap_close_us
+    marks bars known to be incomplete for reasons outside the rows.
     """
     for column in TRADE_INPUT_COLUMNS:
         if column not in trades.columns:
             raise ValueError(f"trades are missing column {column}")
-    if first_close_us is not None and first_close_us % MICROS_PER_MINUTE != 0:
-        raise ValueError("first_close_us is not on a minute boundary")
-    if last_close_us is not None and last_close_us % MICROS_PER_MINUTE != 0:
-        raise ValueError("last_close_us is not on a minute boundary")
-
-    ts_us = trades["ts"].dt.timestamp("us").to_numpy().astype(np.int64)
-    closes = minute_close_us(ts_us)
-    first = int(closes.min()) if first_close_us is None and closes.size else first_close_us
-    last = int(closes.max()) if last_close_us is None and closes.size else last_close_us
-    if first is None or last is None or first > last:
+    if continuity not in ("trade_id", "none"):
+        raise ValueError(f"unknown continuity: {continuity!r}")
+    if first_close_us % MICROS_PER_MINUTE != 0 or last_close_us % MICROS_PER_MINUTE != 0:
+        raise ValueError("the grid is not on a minute boundary")
+    if fill_span_allowance_us < 0:
+        raise ValueError("a fill span allowance cannot be negative")
+    if first_close_us > last_close_us:
         return _empty(BAR_SCHEMA)
+    if continuity == "trade_id" and trades["trade_id"].null_count():
+        raise ValueError("continuity by trade id needs an id on every row")
 
-    grid: _IntArray = np.arange(first, last + 1, MICROS_PER_MINUTE, dtype=np.int64)
+    grid: _IntArray = np.arange(first_close_us, last_close_us + 1, MICROS_PER_MINUTE, dtype=np.int64)
     size = grid.size
     open_: _FloatArray = np.full(size, np.nan)
     high: _FloatArray = np.full(size, np.nan)
@@ -118,35 +213,72 @@ def build_bars_1m(
     quote: _FloatArray = np.zeros(size)
     buy: _FloatArray = np.zeros(size)
     sell: _FloatArray = np.zeros(size)
+    settled_volume: _FloatArray = np.zeros(size)
+    settled_quote: _FloatArray = np.zeros(size)
+    settled_buy: _FloatArray = np.zeros(size)
+    settled_sell: _FloatArray = np.zeros(size)
     count: _IntArray = np.zeros(size, dtype=np.int64)
     fills: _IntArray = np.zeros(size, dtype=np.int64)
+    knowable: _IntArray = grid + fill_span_allowance_us
+    if received_at_us is not None:
+        knowable = np.maximum(knowable, received_at_us)
+    proof = np.full(size, PROOF_NONE, dtype=object)
+    gaps: _BoolArray = np.isin(grid, list(gap_close_us)) if gap_close_us else np.zeros(size, dtype=bool)
 
-    keep = (closes >= first) & (closes <= last)
-    if keep.any():
-        trade_ids = trades["trade_id"].to_numpy().astype(np.int64)
-        order = np.lexsort((trade_ids[keep], ts_us[keep]))
-        sorted_close = closes[keep][order]
-        price: _FloatArray = trades["price"].to_numpy().astype(np.float64)[keep][order]
-        qty: _FloatArray = trades["qty"].to_numpy().astype(np.float64)[keep][order]
-        taker_buy = trades["is_taker_buy"].to_numpy().astype(bool)[keep][order]
-        n_fills: _IntArray = trades["n_fills"].to_numpy().astype(np.int64)[keep][order]
+    if trades.height:
+        order, ts_us, ids = _sorted_view(trades)
+        closes = minute_close_us(ts_us)
+        price: _FloatArray = trades["price"].to_numpy().astype(np.float64)[order]
+        qty: _FloatArray = trades["qty"].to_numpy().astype(np.float64)[order]
+        taker_buy = trades["is_taker_buy"].to_numpy().astype(bool)[order]
+        n_fills: _IntArray = trades["n_fills"].to_numpy().astype(np.int64)[order]
+        row_knowable = _us(trades["knowable_time"])[order]
 
-        starts = np.concatenate(([0], np.flatnonzero(np.diff(sorted_close)) + 1))
-        ends = np.concatenate((starts[1:], [sorted_close.size]))
-        slots = (sorted_close[starts] - first) // MICROS_PER_MINUTE
-        open_[slots] = price[starts]
-        close[slots] = price[ends - 1]
-        high[slots] = np.maximum.reduceat(price, starts)
-        low[slots] = np.minimum.reduceat(price, starts)
-        volume[slots] = np.add.reduceat(qty, starts)
-        quote[slots] = np.add.reduceat(price * qty, starts)
-        buy[slots] = np.add.reduceat(np.where(taker_buy, qty, 0.0), starts)
-        sell[slots] = np.add.reduceat(np.where(taker_buy, 0.0, qty), starts)
-        count[slots] = ends - starts
-        fills[slots] = np.add.reduceat(n_fills, starts)
+        keep = (closes >= first_close_us) & (closes <= last_close_us)
+        if keep.any():
+            kept_close = closes[keep]
+            starts = np.concatenate(([0], np.flatnonzero(np.diff(kept_close)) + 1))
+            ends = np.concatenate((starts[1:], [kept_close.size]))
+            slots = (kept_close[starts] - first_close_us) // MICROS_PER_MINUTE
+            kept_price, kept_qty = price[keep], qty[keep]
+            kept_buy = taker_buy[keep]
+            open_[slots] = kept_price[starts]
+            close[slots] = kept_price[ends - 1]
+            high[slots] = np.maximum.reduceat(kept_price, starts)
+            low[slots] = np.minimum.reduceat(kept_price, starts)
+            volume[slots] = np.add.reduceat(kept_qty, starts)
+            quote[slots] = np.add.reduceat(kept_price * kept_qty, starts)
+            buy[slots] = np.add.reduceat(np.where(kept_buy, kept_qty, 0.0), starts)
+            sell[slots] = np.add.reduceat(np.where(kept_buy, 0.0, kept_qty), starts)
+            count[slots] = ends - starts
+            fills[slots] = np.add.reduceat(n_fills[keep], starts)
+            knowable[slots] = np.maximum(knowable[slots], np.maximum.reduceat(row_knowable[keep], starts))
+            proof[slots] = PROOF_TRADED
 
-    knowable = grid if knowable_at_us is None else np.maximum(grid, knowable_at_us)
-    gaps = np.isin(grid, list(gap_close_us)) if gap_close_us else np.zeros(size, dtype=bool)
+        _add_settled(
+            settled_volume,
+            settled_quote,
+            settled_buy,
+            settled_sell,
+            grid_first=first_close_us,
+            grid_last=last_close_us,
+            ts_us=ts_us,
+            closes=closes,
+            price=price,
+            qty=qty,
+            taker_buy=taker_buy,
+            n_fills=n_fills,
+            allowance_us=fill_span_allowance_us,
+        )
+        if continuity == "trade_id":
+            _mark_proven_empty(grid, count, proof, knowable, closes, ids, row_knowable)
+            # A skip shows only in the row after it, so nothing it flags is known before that row is.
+            for skip in find_id_skips(trades):
+                touched = np.isin(grid, list(closes_between(skip.from_us, skip.to_us)))
+                gaps |= touched
+                knowable[touched] = np.maximum(knowable[touched], skip.known_at_us)
+
+    gaps |= proof == PROOF_NONE
     return pl.DataFrame(
         [
             pl.repeat(venue, size, eager=True, dtype=pl.String).alias("venue"),
@@ -161,12 +293,88 @@ def build_bars_1m(
             pl.Series("quote_volume", np.round(quote, _QUOTE_DECIMALS)),
             pl.Series("buy_volume", np.round(buy, _QTY_DECIMALS)),
             pl.Series("sell_volume", np.round(sell, _QTY_DECIMALS)),
+            pl.Series("settled_volume", np.round(settled_volume, _QTY_DECIMALS)),
+            pl.Series("settled_quote_volume", np.round(settled_quote, _QUOTE_DECIMALS)),
+            pl.Series("settled_buy_volume", np.round(settled_buy, _QTY_DECIMALS)),
+            pl.Series("settled_sell_volume", np.round(settled_sell, _QTY_DECIMALS)),
             pl.Series("trade_count", count, dtype=pl.Int64),
             pl.Series("fill_count", fills, dtype=pl.Int64),
+            pl.Series("empty_proof", proof.tolist(), dtype=pl.String),
             pl.Series("gap", gaps, dtype=pl.Boolean),
             _time_series("knowable_time", knowable),
         ]
     )
+
+
+def _add_settled(
+    settled_volume: _FloatArray,
+    settled_quote: _FloatArray,
+    settled_buy: _FloatArray,
+    settled_sell: _FloatArray,
+    *,
+    grid_first: int,
+    grid_last: int,
+    ts_us: _IntArray,
+    closes: _IntArray,
+    price: _FloatArray,
+    qty: _FloatArray,
+    taker_buy: _BoolArray,
+    n_fills: _IntArray,
+    allowance_us: int,
+) -> None:
+    """Fill the columns holding only what had printed by each close.
+
+    A row that can span time, because it aggregates fills or shares its stamp with others, and that is stamped
+    within the allowance before a close, may have run past that close. Such a row counts in the next bar. A
+    row with one fill and its own stamp happened at its stamp, and stays. Only earlier stamps decide a bar, so
+    this stays causal.
+    """
+    shared = np.zeros(ts_us.size, dtype=bool)
+    if ts_us.size > 1:
+        same = np.diff(ts_us) == 0
+        shared[:-1] |= same
+        shared[1:] |= same
+    can_span = (n_fills > 1) | shared
+    defer = can_span & ((closes - ts_us) < allowance_us)
+    settle_close = closes + np.where(defer, MICROS_PER_MINUTE, 0)
+    inside = (settle_close >= grid_first) & (settle_close <= grid_last)
+    if not inside.any():
+        return
+    slots = (settle_close[inside] - grid_first) // MICROS_PER_MINUTE
+    weights = qty[inside]
+    is_buy = taker_buy[inside]
+    size = settled_volume.size
+    # bincount adds in row order on one thread, so the result depends only on the sorted rows.
+    settled_volume += np.bincount(slots, weights=weights, minlength=size)
+    settled_quote += np.bincount(slots, weights=price[inside] * weights, minlength=size)
+    settled_buy += np.bincount(slots, weights=np.where(is_buy, weights, 0.0), minlength=size)
+    settled_sell += np.bincount(slots, weights=np.where(is_buy, 0.0, weights), minlength=size)
+
+
+def _mark_proven_empty(
+    grid: _IntArray,
+    count: _IntArray,
+    proof: npt.NDArray[np.object_],
+    knowable: _IntArray,
+    closes: _IntArray,
+    ids: _IntArray,
+    row_knowable: _IntArray,
+) -> None:
+    """An empty minute is proven only by the rows around it having consecutive ids.
+
+    That proof comes from the next row, so the minute is not known to be empty until that row is known.
+    """
+    empty_slots = np.flatnonzero(count == 0)
+    if empty_slots.size == 0:
+        return
+    next_row = np.searchsorted(closes, grid[empty_slots], side="left")
+    has_both = (next_row > 0) & (next_row < ids.size)
+    proven_slots = empty_slots[has_both]
+    after = next_row[has_both]
+    consecutive = ids[after] == ids[after - 1] + 1
+    slots = proven_slots[consecutive]
+    proof[slots] = PROOF_ID_RUN
+    knowable[slots] = np.maximum(knowable[slots], row_knowable[after[consecutive]])
 
 
 def _first_valid(values: _FloatArray) -> float:
@@ -179,65 +387,67 @@ def _last_valid(values: _FloatArray) -> float:
     return float(valid[-1]) if valid.size else float("nan")
 
 
-def aggregate_bars(bars_1m: pl.DataFrame, minutes: int) -> pl.DataFrame:
+def aggregate_bars(bars_1m: pl.DataFrame, minutes: int, *, through_close_us: int) -> pl.DataFrame:
     """Aggregate one-minute bars into a higher timeframe aligned to the UTC epoch.
 
-    A higher bar appears only once its closing minute is among the input, so an unfinished bar can never
-    be seen. A closed bar with minutes missing is emitted with complete=False and gap=True, because hiding
-    it would look like a clean series. It is knowable at the later of its close and its newest input.
+    through_close_us is the last minute the caller knows to be closed. It is required, so an unfinished bar
+    can never be seen, whatever the input holds. A closed bar with minutes missing or flagged is emitted with
+    complete=False and gap=True, because hiding it would look like a clean series. It is knowable at the
+    latest of its inputs.
     """
     if minutes < 2 or 1440 % minutes != 0:
         raise ValueError(f"timeframe {minutes}m must be above 1m and divide a UTC day")
     if bars_1m.is_empty():
         return _empty(HIGHER_BAR_SCHEMA)
+    # Prices from different venues are never merged into one bar, under C1.
+    if bars_1m["venue"].n_unique() != 1 or bars_1m["symbol"].n_unique() != 1:
+        raise ValueError("one venue and one symbol at a time")
     ordered = bars_1m.sort("close_time")
-    close_us = ordered["close_time"].dt.timestamp("us").to_numpy().astype(np.int64)
+    close_us = _us(ordered["close_time"])
     width = minutes * MICROS_PER_MINUTE
     buckets: _IntArray = ((close_us - 1) // width + 1) * width
-    newest_known = int(close_us.max())
 
     def floats(name: str) -> _FloatArray:
-        return ordered[name].fill_null(np.nan).to_numpy().astype(np.float64)
+        return cast(_FloatArray, ordered[name].fill_null(np.nan).to_numpy().astype(np.float64))
 
     open_, high, low, close = floats("open"), floats("high"), floats("low"), floats("close")
-    volume, quote = floats("volume"), floats("quote_volume")
-    buy, sell = floats("buy_volume"), floats("sell_volume")
+    flows = {name: floats(name) for name in _FLOW_COLUMNS}
+    settled = {f"settled_{name}": floats(f"settled_{name}") for name in _FLOW_COLUMNS}
     count = ordered["trade_count"].to_numpy().astype(np.int64)
     fills = ordered["fill_count"].to_numpy().astype(np.int64)
     gaps = ordered["gap"].to_numpy().astype(bool)
-    knowable = ordered["knowable_time"].dt.timestamp("us").to_numpy().astype(np.int64)
+    knowable = _us(ordered["knowable_time"])
 
     starts = np.concatenate(([0], np.flatnonzero(np.diff(buckets)) + 1))
     ends = np.concatenate((starts[1:], [buckets.size]))
     rows: list[dict[str, object]] = []
     for start, end in zip(starts, ends, strict=True):
         bucket_close = int(buckets[start])
-        if bucket_close > newest_known:
-            continue  # still open as far as the input knows
+        if bucket_close > through_close_us:
+            continue  # still open as far as the caller knows
         span_high = high[start:end]
         span_low = low[start:end]
         has_price = bool((~np.isnan(span_high)).any())
         n_1m = int(end - start)
-        complete = n_1m == minutes
-        rows.append(
-            {
-                "close_us": bucket_close,
-                "open": _first_valid(open_[start:end]),
-                "high": float(np.nanmax(span_high)) if has_price else float("nan"),
-                "low": float(np.nanmin(span_low)) if has_price else float("nan"),
-                "close": _last_valid(close[start:end]),
-                "volume": float(np.round(np.sum(volume[start:end]), _QTY_DECIMALS)),
-                "quote_volume": float(np.round(np.sum(quote[start:end]), _QUOTE_DECIMALS)),
-                "buy_volume": float(np.round(np.sum(buy[start:end]), _QTY_DECIMALS)),
-                "sell_volume": float(np.round(np.sum(sell[start:end]), _QTY_DECIMALS)),
-                "trade_count": int(np.sum(count[start:end])),
-                "fill_count": int(np.sum(fills[start:end])),
-                "gap": bool(gaps[start:end].any()) or not complete,
-                "knowable_us": max(bucket_close, int(knowable[start:end].max())),
-                "n_1m": n_1m,
-                "complete": complete,
-            }
-        )
+        any_gap = bool(gaps[start:end].any())
+        complete = n_1m == minutes and not any_gap
+        row: dict[str, object] = {
+            "close_us": bucket_close,
+            "open": _first_valid(open_[start:end]),
+            "high": float(np.nanmax(span_high)) if has_price else float("nan"),
+            "low": float(np.nanmin(span_low)) if has_price else float("nan"),
+            "close": _last_valid(close[start:end]),
+            "trade_count": int(np.sum(count[start:end])),
+            "fill_count": int(np.sum(fills[start:end])),
+            "gap": not complete,
+            "knowable_us": max(bucket_close, int(knowable[start:end].max())),
+            "n_1m": n_1m,
+            "complete": complete,
+        }
+        for name, values in {**flows, **settled}.items():
+            decimals = _QUOTE_DECIMALS if "quote" in name else _QTY_DECIMALS
+            row[name] = float(np.round(np.sum(values[start:end]), decimals))
+        rows.append(row)
     if not rows:
         return _empty(HIGHER_BAR_SCHEMA)
 
@@ -264,6 +474,10 @@ def aggregate_bars(bars_1m: pl.DataFrame, minutes: int) -> pl.DataFrame:
             float_column("quote_volume"),
             float_column("buy_volume"),
             float_column("sell_volume"),
+            float_column("settled_volume"),
+            float_column("settled_quote_volume"),
+            float_column("settled_buy_volume"),
+            float_column("settled_sell_volume"),
             pl.Series("trade_count", [r["trade_count"] for r in rows], dtype=pl.Int64),
             pl.Series("fill_count", [r["fill_count"] for r in rows], dtype=pl.Int64),
             pl.Series("gap", [r["gap"] for r in rows], dtype=pl.Boolean),
@@ -274,16 +488,58 @@ def aggregate_bars(bars_1m: pl.DataFrame, minutes: int) -> pl.DataFrame:
     )
 
 
+def _time_literal(value_us: int) -> pl.Expr:
+    return pl.lit(value_us, dtype=pl.Int64).cast(UTC_TIME)
+
+
 def visible_bars(bars: pl.DataFrame, as_of_us: int) -> pl.DataFrame:
     """Return only the bars knowable by the given moment."""
-    limit = pl.lit(as_of_us, dtype=pl.Int64).cast(UTC_TIME)
-    return bars.filter(pl.col("knowable_time") <= limit)
+    return bars.filter(pl.col("knowable_time") <= _time_literal(as_of_us))
 
 
-def assert_knowable(bars: pl.DataFrame, as_of_us: int) -> None:
+def assert_knowable(frame: pl.DataFrame, as_of_us: int) -> None:
     """Raise if any row was not yet knowable at the given moment. For use at joins."""
-    if bars.is_empty():
+    if frame.is_empty():
         return
-    newest = cast(int, bars["knowable_time"].dt.timestamp("us").max())
+    newest = cast(int, frame["knowable_time"].dt.timestamp("us").max())
     if newest > as_of_us:
-        raise TimingContractError(f"bar knowable at {newest} used at {as_of_us}")
+        raise TimingContractError(f"a row knowable at {newest} was used at {as_of_us}")
+
+
+def bars_for_run(bars: pl.DataFrame, t_cut_us: int, t_dec_us: int) -> pl.DataFrame:
+    """What one run may read, under the run clock of C17. Later code reads bars through this, or `ideal_view`.
+
+    Contract item 1 says when a value could exist, and receipt says when this system had it. So a run needs
+    both conditions at once: a close at or before t_cut, and knowable by t_dec. A bar past t_cut is simply not
+    returned. A bar at or before t_cut that this run could not yet have had is an error, because it means the
+    run is being given data from its own future. That is never quietly dropped.
+    """
+    if t_dec_us < t_cut_us:
+        raise TimingContractError("a run cannot commit before its own data cut-off")
+    selected = bars.filter(pl.col("close_time") <= _time_literal(t_cut_us))
+    assert_knowable(selected, t_dec_us)
+    return selected
+
+
+def trades_for_run(trades: pl.DataFrame, t_cut_us: int, t_dec_us: int) -> pl.DataFrame:
+    """The trades one run may read, by the same two conditions as bars_for_run."""
+    if t_dec_us < t_cut_us:
+        raise TimingContractError("a run cannot commit before its own data cut-off")
+    selected = trades.filter(pl.col("ts") <= _time_literal(t_cut_us))
+    assert_knowable(selected, t_dec_us)
+    return selected
+
+
+def ideal_view(bars: pl.DataFrame, *, ideal_allowed: bool) -> pl.DataFrame:
+    """Bars as IDEAL mode may read them: only what had printed by each close.
+
+    A decision at a close with no allowance cannot use a volume that might include later fills, so the settled
+    columns replace the plain ones and the plain ones are gone. A source whose prices can carry an after-close
+    print gets no IDEAL view at all.
+    """
+    if not ideal_allowed:
+        raise TimingContractError(
+            "this source's row shape can put later prints in a bar, so it has no IDEAL view"
+        )
+    renamed = {f"settled_{name}": name for name in _FLOW_COLUMNS}
+    return bars.drop(list(_FLOW_COLUMNS)).rename(renamed)

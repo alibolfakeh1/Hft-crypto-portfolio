@@ -68,12 +68,10 @@ def test_sharpe_hand_computed() -> None:
 def test_annualisation_is_365_and_not_252() -> None:
     returns = [0.01, -0.02, 0.03, 0.0]
     volatility = annualised_volatility(returns)
-    wrong = annualised_volatility(returns)
     assert volatility is not None
-    assert wrong is not None
-    assert volatility == pytest.approx(wrong)
     daily = math.sqrt(sum((r - 0.005) ** 2 for r in returns) / 3)
     assert volatility / daily == pytest.approx(math.sqrt(365.0))
+    assert volatility / daily != pytest.approx(math.sqrt(252.0))
 
 
 def test_compute_stats_hand_computed() -> None:

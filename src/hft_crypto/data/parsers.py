@@ -12,6 +12,7 @@ import gzip
 import io
 import re
 import zipfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,7 @@ TRADE_SCHEMA: dict[str, pl.DataType] = {
     "qty": pl.Float64(),
     "is_taker_buy": pl.Boolean(),
     "trade_id": pl.Int64(),
+    "file_row": pl.Int64(),
     "n_fills": pl.Int32(),
     "is_rpi": pl.Boolean(),
     "knowable_time": UTC_TIME,
@@ -96,7 +98,7 @@ def read_zip_member(path: Path, limit: int) -> bytes:
                 raise ValidationError(f"zip member declares {members[0].file_size} bytes")
             with archive.open(members[0]) as stream:
                 return _read_capped(stream, limit, "zip member")
-    except (zipfile.BadZipFile, EOFError, OSError, RuntimeError) as exc:
+    except (zipfile.BadZipFile, zlib.error, EOFError, OSError, RuntimeError, ValueError) as exc:
         raise ValidationError(f"unreadable zip: {exc}") from exc
 
 
@@ -104,7 +106,7 @@ def read_gzip(path: Path, limit: int) -> bytes:
     try:
         with gzip.open(path, "rb") as stream:
             return _read_capped(stream, limit, "gzip file")
-    except (gzip.BadGzipFile, EOFError, OSError) as exc:
+    except (gzip.BadGzipFile, zlib.error, EOFError, OSError, ValueError) as exc:
         raise ValidationError(f"unreadable gzip: {exc}") from exc
 
 
@@ -143,6 +145,14 @@ def _strict_cast(frame: pl.DataFrame, types: dict[str, pl.DataType]) -> pl.DataF
         raise ValidationError(f"bad value in file: {exc}") from exc
 
 
+def _require_finite(frame: pl.DataFrame, columns: list[str]) -> None:
+    """`price <= 0` is false for NaN, so a NaN or an infinity would otherwise pass every check and reach a
+    bar."""
+    for name in columns:
+        if not frame[name].is_finite().all():
+            raise ValidationError(f"a value in column {name} is not a finite number")
+
+
 def _require_no_nulls(frame: pl.DataFrame, columns: list[str]) -> None:
     for name in columns:
         count = frame[name].null_count()
@@ -175,12 +185,27 @@ def _time_checks(ts_us: np.ndarray[Any, Any], first_us: int, end_us: int) -> dic
     }
 
 
+def _knowable_after(column: str, allowance_us: int) -> pl.Expr:
+    """A row is knowable its stamp plus the source's declared allowance, so no consumer has to remember
+    that."""
+    return (pl.col(column).dt.timestamp("us") + allowance_us).cast(UTC_TIME).alias("knowable_time")
+
+
+def _time_warnings(checks: dict[str, Any]) -> list[str]:
+    warnings = []
+    if checks["rows_outside_partition"]:
+        warnings.append(f"{checks['rows_outside_partition']} rows stamped outside the partition")
+    if checks["out_of_order"]:
+        warnings.append(f"{checks['out_of_order']} rows out of order")
+    return warnings
+
+
 def _finish_trades(frame: pl.DataFrame) -> pl.DataFrame:
-    return frame.select(list(TRADE_SCHEMA)).sort(["ts", "trade_id"], maintain_order=True)
+    return frame.select(list(TRADE_SCHEMA)).sort(["ts", "trade_id", "file_row"], maintain_order=True)
 
 
 def parse_agg_trades(
-    path: Path, symbol: str, day: dt.date, limit: int, venue: str = "binance"
+    path: Path, symbol: str, day: dt.date, limit: int, *, venue: str, allowance_us: int
 ) -> CuratedResult:
     raw = read_zip_member(path, limit)
     has_header, line = _split_header(raw, AGG_TRADES_HEADER, 7)
@@ -198,7 +223,19 @@ def parse_agg_trades(
             "transact_time": pl.Int64(),
         },
     )
-    _require_no_nulls(typed, ["agg_trade_id", "price", "quantity", "transact_time", "maker_text"])
+    _require_no_nulls(
+        typed,
+        [
+            "agg_trade_id",
+            "price",
+            "quantity",
+            "first_trade_id",
+            "last_trade_id",
+            "transact_time",
+            "maker_text",
+        ],
+    )
+    _require_finite(typed, ["price", "quantity"])
     if not typed["maker_text"].is_in(["true", "false"]).all():
         raise ValidationError("is_buyer_maker holds a value other than true or false")
     if (typed["price"] <= 0).any() or (typed["quantity"] <= 0).any():
@@ -219,10 +256,11 @@ def parse_agg_trades(
         pl.col("quantity").alias("qty"),
         (pl.col("maker_text") == "false").alias("is_taker_buy"),
         pl.col("agg_trade_id").alias("trade_id"),
+        pl.Series("file_row", np.arange(typed.height, dtype=np.int64)),
         (pl.col("last_trade_id") - pl.col("first_trade_id") + 1).cast(pl.Int32).alias("n_fills"),
         pl.lit(False).alias("is_rpi"),
-    ).with_columns(pl.col("ts").alias("knowable_time"))
-    warnings = []
+    ).with_columns(_knowable_after("ts", allowance_us))
+    warnings = _time_warnings(checks)
     if checks["id_breaks"]:
         warnings.append(f"{checks['id_breaks']} breaks in aggregate trade ids")
     if checks["duplicate_ids"]:
@@ -231,7 +269,7 @@ def parse_agg_trades(
 
 
 def parse_bybit_trades(
-    path: Path, symbol: str, day: dt.date, limit: int, venue: str = "bybit"
+    path: Path, symbol: str, day: dt.date, limit: int, *, venue: str, allowance_us: int
 ) -> CuratedResult:
     raw = read_gzip(path, limit)
     has_header, line = _split_header(raw, BYBIT_TRADE_HEADERS, 11)
@@ -242,6 +280,7 @@ def parse_bybit_trades(
         raise ValidationError("file holds no rows")
     typed = _strict_cast(text, {"size": pl.Float64(), "price": pl.Float64()})
     _require_no_nulls(typed, ["timestamp", "symbol", "side", "size", "price", "trdMatchID"])
+    _require_finite(typed, ["size", "price"])
     if not (typed["symbol"] == symbol).all():
         raise ValidationError("file holds another symbol")
     if not typed["side"].is_in(["Buy", "Sell"]).all():
@@ -272,14 +311,19 @@ def parse_bybit_trades(
         ts_series.cast(UTC_TIME).alias("ts"),
         pl.col("size").alias("qty"),
         (pl.col("side") == "Buy").alias("is_taker_buy"),
-        pl.Series("trade_id", np.arange(typed.height, dtype=np.int64)),
+        # These rows carry only a random match id, so no id can show that a row is missing between them. The
+        # row number is kept for ordering, under its own name, so it can never pass as a continuity proof.
+        pl.lit(None, dtype=pl.Int64).alias("trade_id"),
+        pl.Series("file_row", np.arange(typed.height, dtype=np.int64)),
         pl.lit(1, dtype=pl.Int32).alias("n_fills"),
         (rpi.fill_null(False).alias("is_rpi") if rpi is not None else pl.lit(False).alias("is_rpi")),
-    ).with_columns(pl.col("ts").alias("knowable_time"))
-    return CuratedResult(_finish_trades(frame), checks)
+    ).with_columns(_knowable_after("ts", allowance_us))
+    return CuratedResult(_finish_trades(frame), checks, tuple(_time_warnings(checks)))
 
 
-def parse_klines(path: Path, symbol: str, day: dt.date, limit: int, venue: str = "binance") -> CuratedResult:
+def parse_klines(
+    path: Path, symbol: str, day: dt.date, limit: int, *, venue: str, allowance_us: int
+) -> CuratedResult:
     raw = read_zip_member(path, limit)
     has_header, line = _split_header(raw, KLINES_HEADER, 12)
     text = _read_csv(raw, line, has_header)
@@ -301,7 +345,11 @@ def parse_klines(path: Path, symbol: str, day: dt.date, limit: int, venue: str =
             "taker_buy_quote_volume": pl.Float64(),
         },
     )
-    _require_no_nulls(typed, ["open_time", "open", "high", "low", "close", "volume", "close_time"])
+    _require_no_nulls(
+        typed,
+        ["open_time", "open", "high", "low", "close", "volume", "close_time", "count", "taker_buy_volume"],
+    )
+    _require_finite(typed, ["open", "high", "low", "close", "volume", "taker_buy_volume"])
     open_us = typed["open_time"].to_numpy() * 1000
     first_us = day_start_us(day)
     checks = _time_checks(open_us, first_us, first_us + MICROS_PER_DAY)
@@ -317,8 +365,12 @@ def parse_klines(path: Path, symbol: str, day: dt.date, limit: int, venue: str =
             pl.lit(venue).alias("venue"),
             pl.lit(symbol).alias("symbol"),
             (pl.col("open_time") * 1000).cast(pl.Int64).cast(UTC_TIME).alias("open_time"),
-            # Official candles run [open, open + 59.999 s]. They are knowable once that minute is over.
-            ((pl.col("open_time") + 60_000) * 1000).cast(pl.Int64).cast(UTC_TIME).alias("knowable_time"),
+            # Official candles run [open, open + 59.999 s]. They are knowable once that minute is over, plus
+            # the source's allowance.
+            ((pl.col("open_time") + 60_000) * 1000 + allowance_us)
+            .cast(pl.Int64)
+            .cast(UTC_TIME)
+            .alias("knowable_time"),
             pl.col("count").alias("trade_count"),
         )
         .select(
@@ -345,7 +397,7 @@ def parse_klines(path: Path, symbol: str, day: dt.date, limit: int, venue: str =
 
 
 def parse_book_depth(
-    path: Path, symbol: str, day: dt.date, limit: int, allowance_s: float, venue: str = "binance"
+    path: Path, symbol: str, day: dt.date, limit: int, allowance_s: float, *, venue: str
 ) -> CuratedResult:
     raw = read_zip_member(path, limit)
     has_header, line = _split_header(raw, BOOK_DEPTH_HEADER, 4)
@@ -364,6 +416,7 @@ def parse_book_depth(
     except pl.exceptions.PolarsError as exc:
         raise ValidationError(f"bad timestamp in file: {exc}") from exc
     _require_no_nulls(stamped, ["ts", "percentage", "depth", "notional"])
+    _require_finite(stamped, ["percentage", "depth", "notional"])
     if (stamped["depth"] < 0).any() or (stamped["notional"] < 0).any():
         raise ValidationError("negative depth or notional")
     ts_us = stamped["ts"].dt.timestamp("us").to_numpy()
@@ -385,7 +438,7 @@ def parse_book_depth(
 
 
 def parse_funding(
-    path: Path, symbol: str, month_start: dt.date, limit: int, venue: str = "binance"
+    path: Path, symbol: str, month_start: dt.date, limit: int, *, venue: str, allowance_us: int
 ) -> CuratedResult:
     raw = read_zip_member(path, limit)
     has_header, line = _split_header(raw, FUNDING_HEADER, 3)
@@ -403,6 +456,7 @@ def parse_funding(
         },
     )
     _require_no_nulls(typed, ["calc_time", "funding_interval_hours", "last_funding_rate"])
+    _require_finite(typed, ["last_funding_rate"])
     ts_us = typed["calc_time"].to_numpy() * 1000
     first_us = day_start_us(month_start)
     end_us = day_start_us(next_month(month_start))
@@ -416,7 +470,7 @@ def parse_funding(
             (pl.col("calc_time") * 1000).cast(pl.Int64).cast(UTC_TIME).alias("settle_time"),
             pl.col("last_funding_rate").alias("funding_rate"),
         )
-        .with_columns(pl.col("settle_time").alias("knowable_time"))
+        .with_columns(_knowable_after("settle_time", allowance_us))
         .select(
             "venue",
             "symbol",
