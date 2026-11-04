@@ -1,0 +1,187 @@
+# Versioned pipeline configuration. Every run records a hash of this file.
+# The start dates are limited by the Actions cache, not by what the archives hold. Backfill runs newest
+# first, so moving a start date earlier only adds older work. See storage below before doing that.
+
+schema_version = 1
+
+[universe]
+symbols = ["BTCUSDT", "ETHUSDT"]
+
+[bars]
+# Multiples of one minute. Each must divide a UTC day, so a day partition holds whole bars.
+timeframes_minutes = [5, 15, 30, 60, 120, 240, 1440]
+
+[storage]
+# Measured against DATA_QUOTA_GB. The environment variable wins over this default. The Actions cache
+# limit is 10 GB per repository, and the poll cache needs room beside this one.
+default_quota_gb = 8.0
+# What survives between runs through the Actions cache. raw and quarantine stay on the runner.
+persisted_zones = ["curated", "features", "catalog"]
+
+[sources]
+binance_base = "https://data.binance.vision/data/futures/um"
+bybit_trades_base = "https://public.bybit.com/trading"
+bybit_book_base = "https://quote-saver.bycsi.com/orderbook/linear"
+# Bybit moved from ob500 to ob200 at a date we do not hard-code. Every depth is tried, in this order.
+bybit_book_depths = [200, 500]
+
+[fetch]
+timeout_s = 60.0
+attempts = 3
+backoff_s = 2.0
+max_download_bytes = 2_000_000_000
+max_uncompressed_bytes = 8_000_000_000
+
+[catchup]
+# Dates older than this are a backfill, which the watermarks can stop. Newer dates are routine catch-up.
+routine_window_days = 7
+retry_base_minutes = 30
+retry_max_hours = 24
+# Book files are large and a runner's disk is small, so an opt-in run takes one day at most.
+max_book_days_per_run = 1
+
+[latency]
+# bookDepth stamps are truncated to the second, so a row stamped 00:00:06 may be as late as 00:00:06.999.
+# It is treated as knowable one second after its stamp.
+book_depth_allowance_s = 1.0
+
+# Official candles are a reconciliation check on our bars. See docs/08_DATA_CENTER.md section 4.
+# aggTrades gives an aggregate trade one timestamp, but official candles count each of its fills in its own
+# minute, so volume stamped just before a boundary can appear after it. A daily difference must be covered by
+# trades this close to midnight, or it is an error. The widest window measured was 96 ms, over 8 symbol-days.
+[reconcile.BTCUSDT]
+daily_total_abs = 0.000001
+boundary_window_ms = 250.0
+bar_price_abs = 15.0
+
+[reconcile.ETHUSDT]
+daily_total_abs = 0.000001
+boundary_window_ms = 250.0
+bar_price_abs = 1.5
+
+# ---- Archive datasets. Lower priority numbers run first on the same date. --------------------------------
+
+[[datasets]]
+id = "binance.klines"
+venue = "binance"
+kind = "klines"
+curated = "candles_official"
+tier = "T0"
+granularity = "day"
+start = "2024-01-01"
+overdue_hours = 36.0
+light = true
+opt_in = false
+priority = 0
+terms_note = "Binance public archive. Terms not yet reviewed (UNVERIFIED). Raw data is never republished."
+
+[[datasets]]
+id = "binance.fundingRate"
+venue = "binance"
+kind = "fundingRate"
+curated = "funding"
+tier = "T0"
+granularity = "month"
+start = "2024-01-01"
+overdue_hours = 72.0
+light = true
+opt_in = false
+priority = 1
+terms_note = "Binance public archive. Terms not yet reviewed (UNVERIFIED). Raw data is never republished."
+
+[[datasets]]
+id = "binance.bookDepth"
+venue = "binance"
+kind = "bookDepth"
+curated = "book_depth"
+tier = "T2"
+granularity = "day"
+start = "2026-01-01"
+overdue_hours = 36.0
+light = true
+opt_in = false
+priority = 2
+terms_note = "Binance public archive. Terms not yet reviewed (UNVERIFIED). Raw data is never republished."
+
+[[datasets]]
+id = "binance.aggTrades"
+venue = "binance"
+kind = "aggTrades"
+curated = "trades"
+tier = "T1"
+granularity = "day"
+start = "2026-06-01"
+overdue_hours = 36.0
+light = true
+opt_in = false
+priority = 3
+terms_note = "Binance public archive. Terms not yet reviewed (UNVERIFIED). Raw data is never republished."
+
+[[datasets]]
+id = "bybit.trades"
+venue = "bybit"
+kind = "trades"
+curated = "trades"
+tier = "T1"
+granularity = "day"
+start = "2026-10-01"
+overdue_hours = 36.0
+light = false
+opt_in = false
+priority = 4
+terms_note = "Bybit public archive. Terms not yet reviewed (UNVERIFIED). Raw data is never republished."
+
+[[datasets]]
+id = "bybit.orderbook"
+venue = "bybit"
+kind = "orderbook"
+curated = "book_replay"
+tier = "T2"
+granularity = "day"
+start = "2026-10-01"
+overdue_hours = 36.0
+light = false
+opt_in = true
+priority = 5
+terms_note = "Bybit public archive. Terms not yet reviewed (UNVERIFIED). Only replay statistics are kept."
+
+# ---- Hourly poll of closed trades. Own DATA_ROOT and own cache, so it stays small and fast. ---------------
+
+[poll]
+venue = "kraken"
+base_url = "https://api.kraken.com/0/public/Trades"
+# The cursor starts here whenever the poll state is empty, so a lost cache rebuilds through catch-up.
+start_date = "2026-10-25"
+page_size = 1000
+min_interval_s = 1.1
+# A minute is emitted as a bar only once it closed this long before the fetch ended.
+bar_grace_s = 60.0
+default_time_budget_s = 120.0
+# Consecutive missed hourly slots that count as a state change worth a commit.
+missed_slots_alert = 6
+default_quota_gb = 1.0
+terms_note = "Kraken public REST. Terms not yet reviewed (UNVERIFIED). Raw data is never republished."
+
+[[poll.pairs]]
+symbol = "BTCUSD"
+pair = "XBTUSD"
+archive_symbol = "BTCUSDT"
+
+[[poll.pairs]]
+symbol = "ETHUSD"
+pair = "ETHUSD"
+archive_symbol = "ETHUSDT"
+
+# Kraken spot against Binance perpetual is a sanity check between two different markets, not a reconciliation
+# of the same data. A wide median difference means something is wrong with one side.
+[poll.cross_venue]
+median_abs_close_diff_bps_warn = 30.0
+min_return_corr_warn = 0.5
+
+[report]
+# Stale means the newest bar is older than this. Stale data is labelled and never shown as current.
+stale_after_hours = 60.0
+# Equity marks and max drawdown use this timeframe. Volatility and Sharpe use daily close-to-close returns.
+equity_timeframe_minutes = 60
+benchmark_venue = "binance"
+benchmark_symbols = ["BTCUSDT", "ETHUSDT"]

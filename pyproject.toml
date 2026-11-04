@@ -1,0 +1,60 @@
+[project]
+name = "hft-crypto"
+version = "0.1.0"
+description = "Research data center and report pipeline for BTC and ETH. Sends no orders."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.1,<3",
+    "polars>=1.30,<2",
+]
+
+[project.scripts]
+hft-crypto = "hft_crypto.cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hft_crypto"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+pythonpath = ["tests"]
+markers = [
+    "network: reaches a public endpoint, deselected unless asked for",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "C4", "SIM", "RUF", "DTZ", "PTH"]
+ignore = [
+    "S603", # subprocess is used only for git with fixed arguments
+    "S607", # git is looked up on PATH on purpose
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S108", "S311", "S603", "S607"]
+# Inline stylesheet, script and markup. Wrapping them would only hurt.
+"src/hft_crypto/reports/site.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+mypy_path = ["src", "tests"]
+explicit_package_bases = true
+warn_unreachable = true
