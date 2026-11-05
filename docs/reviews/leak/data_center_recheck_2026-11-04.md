@@ -27,6 +27,8 @@ truncation or future perturbation on generated data. And one of them comes from 
 
 **Injected leaks.** 105 of 115 ran. 1 of the audit's 30 passes everything, against 3, and 12 of the new ones pass what ran, 8 of them direct leaks. Section 8 says what did not run.
 
+**Later rulings.** Section 15 gives the exact form of ruling 7 condition 2. Section 16 rules on the `D-18` listing, and the plan's verdict does not change.
+
 **What this blocks.** Nothing here holds back building the engine and `V0` on generated data. Section 10, next, lists in order of importance what must be fixed before any of that sees market data. I did not review the new modules.
 
 **Severity** is used as in the earlier audits. `HIGH`: a faithful reading makes a decision or fill depend on data not available at that time. The scale does not depend on size. `MEDIUM`: one plausible reading leaks, or a selection, fill or accounting rule favours the strategy. `LOW`: no future data enters, but the rule is ambiguous, not reproducible or leaves a wrong audit trail.
@@ -46,12 +48,12 @@ This section is out of numerical order on purpose, because two developers are wa
 | # | Item | Who | Why it comes here |
 |---|---|---|---|
 | 1 | **The candle-to-bar converter and its dataset, under ruling 7,** with its tests | `developer` | No such code exists. `parse_klines` output is not a bar, and every timing fact of the first run rests on this |
-| 2 | **Condition 2 of ruling 7, and the charter and C2 sentences.** Sample days from the first span, declared before they are read, and none that `D-18` touched | `data-steward`, `project-manager`, `strategy-architect` | Without them the first run breaks the contract's wording, and its volume rests on an inference. If condition 2 is not shown, `IDEAL` is not reported and nothing else stops |
+| 2 | **Condition 2 of ruling 7, in the form of section 15, and the charter and C2 sentences.** Sample days from the first span, declared before they are read, and none that `D-18` touched | `data-steward`, `project-manager`, `strategy-architect` | Without them the first run breaks the contract's wording, and its volume rests on an inference. If condition 2 is not shown, `IDEAL` is not reported and nothing else stops |
 | 3 | **A reader for these bars,** with `IDEAL` gated on condition 2 and `IDEAL-1M` served as of `t + max(latency, A)` | `developer` | `ideal_allowed` tests the wrong thing for these bars. S01 and S06 select under `IDEAL-1M`, which has no as-of read today |
 | 3a | **The date guard, in the reader, the report, the benchmark and the portfolio view.** Bars by close time, trades by stamp, funding by settlement time. The value comes from a dated log entry, and a test compares the two. The last bar of the span stays readable, so do not guard on `knowable_time` | `developer` | The plan rests on it, and at `dafe3f2` `report.py` reads parquet directly |
 | 4 | **Close the read-path holes in section 8.** A test with `t_cut` clearly earlier than `t_dec` on `trades`, `live_trades`, `live_dataset` and `trades_for_run`. One `IDEAL` test per timeframe. All four volume columns in the `IDEAL` view. A row between half the allowance and the allowance | `developer` | A run reading past its cut, or a view returning plain flow, passes the whole suite today |
 | 5 | **Declared values, frozen before the first `V0` run:** `RT`, stop slippage, `candle_allowance`, the research span common to all symbols, C-5 and C-7. Also the **estimators** for the stage 2 values, though not yet their values (section 14, condition 5) | `project-manager` | Set after seeing results, they are selection |
-| 5a | **The new entry for `D-27`, the file-by-file anchor for C-5, and the `D-18` dates** (sections 13.2 and 13.4, FP-03) | `project-manager`, `data-steward` | C-5 cannot be written without them. A report seen over a stretch of `D-18` dates makes the plan `BLOCKED` |
+| 5a | **The new entry for `D-27`, the file-by-file anchor for C-5, and the `D-18` search** (sections 13.2 and 16, FP-03) | `project-manager`, `data-steward` | C-5 cannot be written without them. A report seen over a stretch of `D-18` dates makes the plan `BLOCKED` |
 | 6 | **DR-08: a declared span for the benchmark,** ending at the last opened date | `developer` | One fault flipped a benchmark's sign in my probe, and `V0` is reported beside it |
 | 6a | **FP-05: the portfolio figure's line rule, declared before the first run,** and FP-04's note on `D-28` | `project-manager`, `developer` | Six strategies cannot select at this stage, and the figure still needs a line for each |
 | 7 | **The false "frozen" wording** | `developer` | It sits where the next reader will trust it |
@@ -224,7 +226,7 @@ It is causal, since it rests only on what was held at the run. The backtest wind
 | # | Condition | Why |
 |---|---|---|
 | 1 | **Charter item 1 and C2 say it.** "A bar from official candles covers `[open, close)`. It is knowable at its close plus the source's declared candle allowance." C2's bar source bullet carves out this run | The contract is law, and it says `(open_time, close_time]` |
-| 2 | **A candle holds no print from after its close, shown and not assumed.** On sample days outside any test block, run `reconcile_official`'s walk against aggregate trades. Cumulative candle volume at each boundary must never exceed cumulative trade volume stamped before it. One excess falsifies the condition | That candles count each fill in its own minute is inferred from a first look. If it fails, `IDEAL` may not read their volume |
+| 2 | **A candle holds no print from after its close, shown and not assumed.** On sample days outside any test block, compare candles with aggregate trades in the exact form of section 15, and not through `reconcile_official`'s walk. Cumulative candle volume at each boundary must never exceed cumulative trade volume stamped before it, apart from a carry that section computes and bounds. One excess falsifies the condition | That candles count each fill in its own minute is inferred from a first look. If it fails, `IDEAL` may not read their volume |
 | 3 | **Last-trade candles only,** from one venue and symbol. Not mark or index | C1 |
 | 4 | **A missing row is a gap.** A row with zero trades is proof of an empty minute, a third kind that C2 must name. **Its prices are set to null** if the venue carries the last close forward, which is `UNVERIFIED`. Otherwise a carried price can touch a stop, and that is a forward fill C2 forbids | Same rule, different proof. Here the proof comes from the row itself, so nothing rests on a later row and DR-03's problem does not arise on these bars |
 | 5 | **Checks at the row:** checksum, 1,440 rows, the grid, `H >= max(O, C)`, `L <= min(O, C)`, taker buy at or below volume. A failure flags that minute | A candle cannot reconcile against itself, so G1 reports reconciliation as not available until trades arrive |
@@ -430,6 +432,7 @@ My first audit's search of `src/` for `visible_bars`, `assert_knowable`, `forwar
 | Report and benchmark | DR-08, DC-15 |
 | `DATA_GAP` | Section 5, question 3 |
 | Fold plan, against git history at `1e634fc` | Sections 13 and 14. No data was opened. Times are UTC, from commit headers |
+| The form of condition 2, on generated fills with planted prints | Section 15 |
 
 **Checked and clean.** Knowable time on all timeframes and both paths. No later bar in report calculations. No forward or backward fill. Official candles change no bar. First receipt stands. A failing day's earlier minutes are untouched on the same day.
 
@@ -506,7 +509,7 @@ My first audit's search of `src/` for `visible_bars`, `assert_knowable`, `forwar
 | **Failing-quarter rule** | **Holds.** It was declared before any coverage was read, from counts alone, for both symbols together. Dates move only at the head of the history, or in the fallback for too few test quarters, which closes at the first outcome. It does select against outage-heavy quarters, without looking at any outcome. A failed quarter is named in every report. FP-09 adds the second source |
 | **One read rule** | **Holds as a rule,** and it answers N4: one global locked read, a definition of read, nothing extending. Needs FP-01, FP-07 and FP-08. A read by mistake being logged and excluded is right. My own re-audit probes on candles stay inside the first span |
 | **What the owner may see** | **Holds, with FP-04 and FP-05.** First span only, every line, every label, with the counted lines kept in `N`. The trial count shown includes `D-27`'s two runs. The demonstration's output is not reopened beside it |
-| **The `D-18` runs** | **The largest open item.** Configured starts of 2024-01-01 for candles and funding and 2026-06-01 for trades fall inside test and locked dates, and these are the same venue's files. The plan's rule is right: a listing by name before C-5, each such day excluded, and `BLOCKED` if a report over a stretch was seen. The listing must also say whether the `results` branch or any workflow artifact holds a benchmark from those runs, since the workflow publishes one and I cannot look without network. Its recheck of the reconciliation rule uses days those runs did not touch |
+| **The `D-18` runs** | **The largest open item when written. Section 16 rules on the listing made since.** Configured starts of 2024-01-01 for candles and funding and 2026-06-01 for trades fall inside test and locked dates, and these are the same venue's files. The plan's rule is right: a listing by name before C-5, each such day excluded, and `BLOCKED` if a report over a stretch was seen. The listing must also say whether the `results` branch or any workflow artifact holds a benchmark from those runs, since the workflow publishes one and I cannot look without network. Its recheck of the reconciliation rule uses days those runs did not touch |
 | **Expanding training, placebo calendar** | **Hold.** The charter item 11 sentence is still due with C-7 |
 | **"A later change is a counted trial"** | Edits this review requires are dated entries. No outcome exists yet, so they add no trial. Once a `V0` outcome exists, the sentence applies as written |
 | **Section 7 of the plan** | The states are right and the order is right. "A log entry for official candles" is answered by `D-31` in the same commit. Add the items of section 10 above: 0, 3a, 5a and 6a |
@@ -531,4 +534,70 @@ Stage 1 also cannot produce candidates for six of the eight. They cannot select 
 | 6 | **Any rule or constant that differs between stages is a counted trial,** apart from a list written before stage 2's first run of what follows from the bar source alone | A stage 2 "new document version" carries a tuned constant in with the boundary change |
 | 7 | **`D-31`'s "no `aggTrades`" covers strategy inputs.** Condition 2 of ruling 7 needs them on sample days, first span only, with a flag as the only output | Otherwise the stage either skips the check silently or reads trades without a record. If it is not run, `IDEAL` is not reported |
 | 8 | **If stage 2 is dropped, that is a new decision.** `D-12` stands until then. Stage 1's figures are never presented as results on bars from trades | The size of the trades files is unmeasured, so this is a real path |
+
+## 15. Condition 2 of ruling 7: the exact form
+
+**Do not use `reconcile_official._walk` for this test. The wording that said to was mine, and condition 2 now points here.**
+
+The walk asks whether a day's difference can be explained by rows near a boundary. Condition 2 asks whether a candle holds a later print. On generated fills only, with 8 quiet days and 3 busy days:
+
+| Planted on the tested day | This form | `_walk` as written |
+|---|---|---|
+| Nothing, quiet days, rows running up to 400 ms | Passes 8 of 8 | Passes 2 of 8. It fails on a row longer than its 250 ms window, which is not an after-close print |
+| Nothing, busy days | Passes 3 of 3 | Passes 3 of 3 |
+| The next 1 or 20 fills moved into the first candle, or into a midday candle | Fails 11 of 11 in each case | Fails 11 of 11 in each case |
+| Every candle reaches 50 ms past its close | Fails 11 of 11 | Fails 11 of 11 |
+| The first candle holds one extra fill, never given back | Fails 8 of 11 | **Passes 5 of 11** |
+| Candles built by row stamp, so a row's later fills sit in the earlier candle | `INCONCLUSIVE` 11 of 11 | **Passes 11 of 11** |
+
+**`data-steward`'s warning is right about the form, and one part is narrower than it reads.** A print given back in the next candle was caught in every run, because the inflated carry pushes later readings over the walk's upper bound. That catch comes through a side check on a placeholder window. What really passes is an excess that is never given back, and candles built by row stamp, which is the case condition 2 exists to exclude. `eps` at today's 0.000001 sits far below one fill in my runs, whose step of 0.001 is my own choice. So that route is narrow today, but it is a configuration key, and this test has no such key.
+
+**The form.** For each sample day `D`, each symbol, and each of volume, taker-buy volume and fill count. In integers, with no tolerance, no window and nothing fitted. It is new code, apart from `_walk`.
+
+1. **The readings.** `S(b)` sums `D`'s rows stamped in `[midnight, b)`, so a row stamped exactly at `b` is after it. `K(b)` sums the candles closing at or before `b`. `d(b) = S(b) - K(b)`.
+2. **Zero points.** `b` is a zero point if the last row stamped before it on `D` is one fill (`first_trade_id = last_trade_id`). Rows run one after another, so nothing is still printing across `b`, and `d(b)` is exactly minus the carry across midnight.
+3. **Every zero point reads the same.** Call that value `d0`. With fewer than 2 zero points the day is `INCONCLUSIVE`. Different values fail the day.
+4. **`d(b) >= d0` at all 1,440 boundaries.** This is the excess: candles have counted more than had been stamped before the close. One failure fails the day.
+5. **The carry is computed, then bounded.** `-d0` must lie between 0 and the previous file's last row: that row's amount in this column if it has more than one fill, and 0 if it has one. That row is all the previous day supplies. Outside this range fails the day.
+6. **Prices.** A traded candle's close equals the price of the last row stamped before its close.
+7. **It must have been able to see a split.** `d(b) > d0` must occur somewhere on the day, or the day is `INCONCLUSIVE`. Candles built by row stamp read `d(b) = d0` everywhere, and they pass steps 3 to 6 while holding later fills.
+
+**A day's first boundary is not special.** `d0` comes from zero points and never from the first reading, so nothing is absorbed. An excess there reads below `d0` and fails step 4. One that is never given back moves `d0` itself, and step 5 catches it.
+
+**The result.** One of `PASS`, `FAIL` or `INCONCLUSIVE` per symbol and day, with the failing step as a fixed code and no quantity. Condition 2 is shown for a symbol only if no day fails, at least 43 of the 48 days `PASS`, and every quarter has a `PASS` day. Otherwise `IDEAL` is not reported, and nothing else stops. After a failure, a changed form is a new dated decision and does not rerun quietly. The planted cases above become its tests, on generated fills.
+
+**Its assumptions fail safe.** It assumes a row is stamped at its first fill and that rows do not overlap. With stamps at the last fill, 4 of 4 clean days failed in my probe. Overlapping rows should fail step 3 too, which is reasoning and not a probe. Either way the cost is `IDEAL`, and no false pass.
+
+**Limits.**
+
+- An excess in the first candle that is never given back, and no larger than the previous file's last row, cannot be told from a carry. That is the 3 of 11 above.
+- A candle that counts some rows by stamp and others by fill time passes, since step 7 needs one split a day. Aggregate rows cannot separate these.
+- **A per-fill file would close both.** If the venue publishes one for these dates, which is from memory and `UNVERIFIED`, a listing settles it. The test is then that each candle's volume, taker-buy volume and count equal its own minute's fills by each fill's own stamp, exactly, and its close equals the last fill's price. That has no carry, no zero points and no first-boundary question. **If the listing shows it, use it on the same days,** decided from the listing and sizes before anything is fetched. The size may exceed the 3,109 MB declared, which is `UNVERIFIED`.
+
+**The sample.** I accept the 15ths: they come from the calendar, with no replacements. A sample says nothing direct about other days, and `data-steward` says so about stressed ones. Before a test block opens, the same test runs on its 15ths in the check-only root, with flags alone leaving it, because `IDEAL` on that block rests on this property.
+
+## 16. The `D-18` listing and the undated 137 MB
+
+I read `docs/reviews/data/binance_vision_coverage_2026-11-05.md` at `aac99e2`. Its figures are its author's. I checked its arithmetic and that git here shows no `results` ref, and I reran no listing.
+
+**The plan's verdict stays `PASS WITH CONDITIONS`. `BLOCKED` is not met on this evidence, and for the undated part it is not excluded.**
+
+**The measured part closes most of what I called the largest open item.** 30 dates and one funding month, all after the locked block, no results branch, no artifact, and no pipeline run on the host. I accept the first two rows of section 3.4. The reconciliation table asked about in its section 3.1 **is a read of those days,** since a conclusion from it went into `08_DATA_CENTER.md` section 4. It touches no block.
+
+**I do not read the 137 MB as small.** Section 3.2's "about 5 days" holds only for a run of the same shape as the measured one. The same document gives 124.40 MB for every candle file from 2024-01 to 2026-09 on both symbols. The plan records configured starts of 2024-01-01 for candles and funding at that time, and a light ingest exists today, though whether it did then is `UNVERIFIED`. **So 137 MB is about the size of a candles-and-funding run across every test and locked date.** I do not say that happened. Size cannot tell these apart, and it may equally be a counting difference.
+
+**A download alone is still not a read.** Under plan section 3 this matters only if a value from those bytes reached a person, an agent, a report or a log. That is the same gap section 3.1 leaves open: a report over a root later replaced.
+
+**What to do, in order.**
+
+1. **Search the session logs by filter, before C-5.** `data-steward` was right not to read them, since they can hold market values. A script can print only dated file names, `--start` and `--end` values, dataset names and byte totals, with nobody reading a log line. That stays inside "not a read". Also ask who ran it.
+2. **Check the count.** Section 3 keeps the other venue's files in `dl_sample` outside the Binance count and gives no size for them. If `D-18`'s 953 MB included them, and they come to about 137 MB, the gap closes with no Binance date at all. This is a guess, and names and sizes settle it.
+3. **Apply the plan's rule to what is found.** A date in a test or locked block joins plan section 4 and is excluded. A report seen over a stretch makes the plan `BLOCKED`.
+4. **If neither settles it,** the third row of section 3.4 stays `UNVERIFIED`, with this treatment in place of "No date can be excluded until one is named":
+
+   "Undated. A download is not a read, and whether any value left is unknown. Stage 1 is unaffected. Every written request to open a test block or the locked block states this, and every report naming those blocks says it."
+
+   C-5 may then proceed, because stage 1 reads only the first span. An exclusion cannot help, since no date is named. So the owner decides on each later read with this in front of them.
+
+**Existence checks.** Another venue's 2025-06-01 falls on a test-block date, and it is recorded as existence only. If its contents were opened, it is a read of that date on that venue and joins plan section 4 like any other. I can take that no further, and it stays `UNVERIFIED`.
 
