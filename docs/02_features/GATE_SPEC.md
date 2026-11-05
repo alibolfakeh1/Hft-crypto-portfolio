@@ -1,14 +1,16 @@
 # Gate specification
 
-Status: draft for leak audit. Date: 2026-11-04. Owner: `feature-integrator`.
+Status: revised after [the leak audit of 2026-11-04](../reviews/leak/features_2026-11-04.md), and awaiting re-audit. No verdict is claimed here. Date: 2026-11-05. Owner: `feature-integrator`.
 
-This document specifies the entry gate (`ENTER`, `WAIT`, `VETO`, `EXPIRE`) and the flow exit (`HOLD`, `TIGHTEN`, `SCALE_OUT`, `EXIT`). It covers the clock, the windows, how thresholds are set on past data, missing-data behaviour and what happens when a run is late or dropped.
+This document specifies the entry gate (`ENTER`, `WAIT`, `VETO`, `EXPIRE`) and the flow exit (`HOLD`, `TIGHTEN`, `SCALE_OUT`, `EXIT`). It covers what flow reads inside a run, how thresholds are set on past data, missing-data behaviour, and what happens when a run is late or dropped.
 
 **Nothing here has been tested.** No code exists. Every default below is a declared value chosen without looking at outcomes, not a fitted or measured one, unless it says otherwise. The gate is a hypothesis under test, not a claim that flow improves anything.
 
-**The run itself is defined in [C17 of the strategy conventions](../01_strategies/00_INDEX.md#c17-hourly-live-cycle), and this document does not redefine it.** Its run order, time fields and delay scenarios apply as written. This document adds only what the gate and the flow exit do inside a run.
+**The run belongs to [C17 of the strategy conventions](../01_strategies/00_INDEX.md#c17-hourly-live-cycle), and this document does not redefine it.** Its run clock, run order, time fields, gap rules and delay scenarios apply as written. This document adds only what the gate and the flow exit do inside a run.
 
-Related: [strategy feature matrix](STRATEGY_FEATURE_MATRIX.md), [triage](FEATURE_TRIAGE.md), [decision point map](DECISION_POINT_MAP.md), [timing contract](../00_CHARTER.md#3-timing-contract), [data center](../08_DATA_CENTER.md#5-running-on-github-itself).
+**Source (`D-22`).** Kraken spot, BTC/USD and ETH/USD, subject to written permission that has not been requested. Bitstamp is the fallback. All sources stay disabled. `T0` and `T1` only on free data, spot only, with no perpetual or funding input. Nothing about this source is assumed from another venue. Every value that must come from the source is marked `UNVERIFIED`.
+
+Related: [strategy feature matrix](STRATEGY_FEATURE_MATRIX.md), [triage](FEATURE_TRIAGE.md), [decision point map](DECISION_POINT_MAP.md), [data sources](../03_DATA_SOURCES.md), [timing contract](../00_CHARTER.md#3-timing-contract), [data center](../08_DATA_CENTER.md#5-running-on-github-itself).
 
 ## 1. What the hourly cycle costs
 
@@ -18,25 +20,28 @@ The whole system runs as scheduled GitHub jobs (`D-15`). There is no continuous 
 |---|---|
 | `VETO` at the first look after a bar close | Mostly survives. This is the realistic live job of the gate |
 | `ENTER` | Not a timing decision. It means "the first run after the setup, if nothing blocks it" |
-| `WAIT` | Means "the next run, if it comes within `A_max`". At 1h under `C-LATE` a second look exists for only about 13% to 46% of setups. See 5.4. Close to worthless at 1h, weak at 4h |
+| `WAIT` | Means "the next run, if it comes within `A_max`". At 1h under `C-LATE`, the next run passes the Age check for only about 16% to 49% of setups. See 5.4. Close to worthless at 1h, weak at 4h |
 | Flow exit, `TIGHTEN` | Slow conflict only, on trades held for many hours. Fast reaction is gone |
-| Book features, `T2` | No live use at all |
+| Book features, `T2` | No live use, and no free history to study them on |
 | Timeframes under 1 hour | Backtest only. S01 and S06 are backtest only at every timeframe |
 
-An always-on machine (`D-04`) is what would restore the losses. [Section 5.7 of the triage](FEATURE_TRIAGE.md#57-what-the-hourly-cycle-costs) has the full list and shows how to measure the cost without building one.
+An always-on machine (`D-04`) would restore the live losses. Paid book history would restore the book research. Both are owner decisions, and nothing here plans on them. [Section 5.7 of the triage](FEATURE_TRIAGE.md#57-what-the-hourly-cycle-costs) has the full list.
 
 ## 2. Two kinds of variant
 
-Every flow result belongs to exactly one kind. **They are never mixed, averaged or presented as evidence for each other.** The charter has adopted these names.
+Every flow result belongs to exactly one kind. **They are never mixed, averaged or presented as evidence for each other.**
 
 | | Live-eligible, `.L` | Research-only, `.R` |
 |---|---|---|
-| Clock | `CYCLE` under C17, with delays and drops reproduced | `IDEAL` under C5 to C7, section 10 |
-| Inputs | What a run can see: closed 1m bars, and trades since the last run from the poll source or its archive | Any `T1`, `T2` archives |
+| Mode, from [the mode table](../01_strategies/00_INDEX.md#5-common-conventions) | `CYCLE` under C17 | `IDEAL-1M`, with the look grid in section 10 |
+| Inputs | What a run can see: closed 1m bars and trades up to `t_cut` | Trades and 1m bars from the same source's archive, at finer windows |
+| Source | The approved source | **The same approved source.** A different one would confound venue with clock |
 | Timeframes | 1h, 4h | 5m to 4h |
 | Can reach a live paper position | Yes | **No** |
-| Report label | `SIMULATED` | `SIMULATED`, `RESEARCH-ONLY`, and for S01 and S06 also `IDEAL, NOT LIVE-COMPARABLE` |
-| Compared against | `V0.L` | `V0.R` |
+| Report label | `SIMULATED`, with `mode` | `SIMULATED`, `RESEARCH-ONLY`, with `mode`, and for S01 and S06 also their documents' label |
+| Compared against | `V0.L` | `V0.R`, which is `V0` under `IDEAL-1M` |
+
+**No flow variant runs in `IDEAL`.** The mode table lets `IDEAL` read only the `settled_*` volume columns, with no plain volume column and no `fill_count`, and a source whose prices can carry an after-close print gets no `IDEAL` results at all. Flow needs signed trades and windows that reach past the close. So `IDEAL` is left to the strategies' own reports. Whether S07 and S08 have `IDEAL` results is open with `leak-auditor`, and it does not change this rule.
 
 | Name | Entry | Exit |
 |---|---|---|
@@ -47,321 +52,422 @@ Every flow result belongs to exactly one kind. **They are never mixed, averaged 
 | `VX.L`, `VX.R` | Candle only | Dynamic model plus flow |
 | `VEX.L`, `VEX.R` | `VE.F` | Dynamic model plus flow |
 
-**The baseline must run on the same clock.** Comparing `VE.F.L` with `V0` under `IDEAL` would hide the cost of the cycle and misstate the gate. Cross-kind comparison is allowed for exactly one purpose, which is to measure that cost. `V0.R` minus `V0.L` on the same data is the `IDEAL` minus `CYCLE` difference that C17 already requires. Gate value on `.R` minus gate value on `.L` is the same measure for flow. `T2` results always carry the caveat that a next-day archive is not a live feed.
+**The baseline must run on the same clock.** Comparing `VE.F.L` with an ideal `V0` would hide the cost of the cycle and misstate the gate. Cross-kind comparison is allowed for one purpose only, which is to measure that cost: `V0.R` minus `V0.L`, and gate value on `.R` minus gate value on `.L`, on the same source. This is the difference C17 reports with `IDEAL-1M` beside `IDEAL`, and on a source with no `IDEAL` it is the only one. The rejection reason R5 in the matrix is the only other decision that may read across kinds.
 
-**No `.L` result exists until check D9 names a poll source.** A run on the hourly clock using an archive whose REST source has not passed is `.R`, whatever clock it used. If no source passes, `VE.L`, `VX.L` and `VEX.L` cannot run, and live paper is `V0.L` only. S07 and S08 are `T1` strategies, so they would not run live at all.
+**No `.L` result exists until all of these hold.** The written permission, the source card (check D14, including the side check D2), the C-10 trade feed values in C17, and reachability from a GitHub runner (check D9). A run on the hourly clock before that is `.R`, whatever clock it used. Until a source is approved, nothing runs at all: under `D-12` every bar comes from that source's trades, so this holds for every strategy and not only the `T1` ones.
 
 ## 3. The cycle
 
 ### 3.1 Run timeline
 
-Everything here comes from C17, except the one helper marked below.
+**All of this comes from C17.** It is restated here only so that the flow rules below can name it.
 
-| Field | Meaning | Source |
-|---|---|---|
-| Nominal minute | Fixed minute after the hour when a run should start. Default 7 | C17 |
-| `t_dec` | Decision time of the run | C17 step 4 |
-| `P_dec` | Close of the last completed 1m bar | C17 step 4 |
-| `latency` | Declared. Entries, close-based exits and flow exits fill at the open of the first 1m bar with `open_time >= t_dec + latency`. New stops and targets act from `t_dec + latency` | C17 steps 5 and 6 |
-| `knowable_time` | When an input became knowable | C17 |
-| `event_time` | Close of the 1m bar in which a touch or fill happened, or `t_dec` for a decision | C17 |
-| `detection_time` | Start of the run that found it | C17 |
-| `effective_from` | When a new stop or target starts to act | C17 |
-| `lateness` | `detection_time - knowable_time`. For a gate decision, `knowable_time` is the setup's `t_k`, so `lateness` matches the C17 timeline | C17 |
-| `t_last` | **Helper, this document only.** Close time of the bar that gives `P_dec`. Every flow window ends here | This document |
+| Field | Meaning |
+|---|---|
+| `run_start` | When the job starts. In a backtest, nominal minute 7 plus the scenario's delay |
+| `t_poll[source]` | The runner's clock at the start of the fetch attempt that delivered that source's data |
+| `A` | Declared allowance, 10 s, `UNVERIFIED` until measured from a runner |
+| `t_cut` | `floor_1m(min(t_poll[source]) - A)`. One per run and symbol, shared by all strategies and variants |
+| `P_dec` | Close of the last 1m bar with close time at or before `t_cut` |
+| `t_dec` | Commit time. In a backtest, `run_start + D_run`. Used only for fills and `effective_from` |
+| `D_run` | As C17 declares per tier. A flow variant uses the same value as its `V0` on the same clock. Re-basing tier `T0` on the shared fetch is part of condition C-10 |
+| `latency` | 500 ms |
+| `effective_from` | Open time of the first 1m bar with `open_time >= t_dec + latency` that has a price. The same bar is the fill bar. The bar straddling that instant keeps the old values |
+| `knowable_time`, `event_time`, `detection_time`, `lateness` | As in the C17 table. For a gate decision, `knowable_time` is the setup's `t_k`, so `lateness` matches the C17 timeline |
 
-**What a record's availability means.** Polled data arrives in one batch, so every trade polled at a run has about the same receive time, up to about an hour after it happened. Windows are therefore defined on the exchange clock, and availability is checked against the run: a record may be used if its exchange time is at or before `t_last` and it was received by `t_dec`. A window at a run is `(t_last - W, t_last]`. This satisfies item 6 of the timing contract. In backtests, C17 requires data shown only up to `t_dec` less a declared allowance, and that allowance is 10 s by default.
+**What flow reads.** Step 3b of `decide` reads only bars and trades at or before `t_cut`. A `Bar` window at a run is `(t_cut - W, t_cut]` on the exchange clock. An `Anchored` window ends at its own object's knowable time, which is at or before `t_cut`, and an `F27-X1` episode starts no earlier than the zone's knowable time. Under C17, `t_cut + A <= t_poll <= t_dec` holds by construction, and invariant I10 tests it.
 
-**Bars, not ticks.** Features are built from trade-built minute bars, as `D-12` requires, except those that need individual trades (`F25-X1`, `F26-X1`, `F27-X1`). The same run function is used on the poll and on the archive, as C17 requires.
+**One source, one fetch.** Flow reads the symbol's trade feed, the same feed that builds its bars under `D-12`, so it adds no source to `min(t_poll)` and its fetch offset is the 0 s in C17. If a later document adds a flow source, its offset must be declared here. A book snapshot is not a source. See 14.
+
+**Bars, not ticks.** Features are built from trade-built 1m bars, except those that need individual trades (`F25-X1`, `F26-X1`, `F27-X1`). The same `decide` runs on the poll and on the archive, as C17 requires.
 
 ### 3.2 Windows on the cycle
 
-| Timeframe | Entry window, primary | Entry window, single sensitivity | Exit window | Looks possible | Reference |
-|---|---|---|---|---|---|
-| 1h | 60 min | 15 min | 60 min | 1, sometimes 2. See 5.4 | Hourly grid, section 4 |
-| 4h | 240 min | 60 min | 60 min | 2, sometimes 3. See 5.4 | Hourly grid, section 4 |
-| 5m, 15m, 30m | Not on the cycle | | | | `.R` only |
+| Timeframe | Entry window, primary | Entry window, single sensitivity | Exit window | Reference |
+|---|---|---|---|---|
+| 1h | 60 min | 15 min | 60 min | Section 4 |
+| 4h | 240 min | 60 min | 60 min | Section 4 |
+| 5m, 15m, 30m | Not on the cycle | | | `.R` only |
 
-Windows are not searched. One bar is primary because it is the natural unit and it matches the bar that produced the setup. A recipe may instead use an `Anchored` window tied to a strategy object, such as a departure or a box, as listed in the [matrix](STRATEGY_FEATURE_MATRIX.md). An anchored value is computed from cached bars and has its own `knowable_time`.
+Windows are not searched. One bar is primary because it matches the bar that produced the setup. A recipe may instead use an `Anchored` window, as listed in the [matrix](STRATEGY_FEATURE_MATRIX.md). An anchored value is computed once at its object's knowable time and kept in state. See 3.7.
 
-**Trap.** The entry window overlaps the trigger bar, so aligned flow may only re-measure the same move. Section 11 requires a control for this.
+**Trap.** The entry window overlaps the trigger bar, and by how much depends on the delay: a `Bar` first look holds 51 of 60 trigger-bar minutes under `C-FAST`, and as few as 8 at the latest `C-LATE` run, ranked against one reference. It is not future information, but it is a different mix at each delay. So the decision record logs overlap minutes, and the control in section 11 is reported by overlap band.
 
 ### 3.3 Late and dropped runs
 
 | Situation | Decisions | What happens |
 |---|---|---|
-| Run on time or late | Yes | Same rules, at its actual `t_dec`. `lateness` is logged |
-| Run dropped | None for that hour | A look is lost. Nothing is decided retroactively. C17 has the next run walk all the new 1m bars and process each newly closed `T_d` bar in order |
-| Any 1m bar missing since the last processed minute | **None for this symbol** | C17 logs `DATA_GAP`, resolves nothing past the gap, and takes no new decisions for this symbol. Never fill or assume |
+| Run on time or late | Yes | Same rules, on its own `t_cut`. `lateness` is logged |
+| Run dropped | None for that hour | A look is lost, and nothing is decided retroactively. The next run walks all the new 1m bars and processes each newly closed `T_d` bar in order |
+| Any 1m bar missing since the last processed minute, or an empty minute with no proof of continuity under C2 | **None for this symbol** | `DATA_GAP`. Resolve nothing past the gap. If the gap is still open at the next run, each open position is closed, logged `GAP_CLOSE`. C17 has the hole deadline and corrections |
 
 **The late-run rule.**
 
-1. **Never back-date.** A late run decides at its actual `t_dec` on data up to its actual `t_last`.
+1. **Never back-date.** A late run decides on its own `t_cut`.
 2. **Never replay missed looks.** A run gives each live setup one look, however many hours were missed. Missed looks are counted.
 3. **Life does not stretch.** A dropped run burns setup life. `expiry` and `A_max` count from `t_k`.
-4. **Backtest the same way.** Delays and drops come from the C17 scenarios. See section 9.
+4. **Backtest the same way.** Delays and drops come from the C17 scenarios.
 
-Being late does not make a decision invalid, because it uses only data available at its own `t_dec`. It makes it worse, and that cost shows up honestly in `.L` results.
+Being late does not make a decision invalid, because it uses only data available at its own `t_cut`. It makes it worse, and that cost shows up honestly in `.L` results.
+
+**Open, not decided here.** How `decide` treats a `gap` flag resting on a later row is with `leak-auditor`. The window rule in 3.4 follows that ruling.
 
 ### 3.4 Run health
 
-There is no feed to watch, so health is judged per run and recorded on the run's log entry. This adds to C17's `DATA_GAP` and does not replace it.
+There is no feed to watch, so health is judged per run. This adds to C17 and replaces none of it.
 
-| Check | Failure state | Effect |
-|---|---|---|
-| 1m bars complete since the last processed minute | `DATA_GAP` | C17 rule, for the symbol. For `T1` strategies, also when trades are missing |
-| Flow source poll complete, within the job budget of about 3 minutes, with continuity verified by trade id where the source has it | `flow_blind` | Flow features are invalid. A `T0` strategy's base logic continues |
-| Runner clock within 5 s of venue server time, where available | `CLOCK_SUSPECT` | No new decisions this run |
-| Bars needed for a window and its reference are in the cache or recoverable by poll | `WARMUP` | That feature is invalid |
+| Check | Where it is defined | Failure | Effect |
+|---|---|---|---|
+| Source data complete through `t_cut` | C17 completeness check | `t_cut` moves back one minute and the check repeats once, then `DATA_GAP` | No decisions for this symbol, in any variant |
+| 1m bars complete, empty minutes proved | C17, C2, charter G1 | `DATA_GAP` | Same |
+| Poll fits its budget | 3.6 | Over budget means the data does not reach `t_cut`, so the completeness check fails | Same. **Flow and bars share a feed, so a failed poll is never a flow-only event** |
+| State for a window or reference is held | 3.7 | `WARMUP` | That feature is invalid. Reason `flow_blind`. The base strategy continues |
+| Taker side usable | Source card, check D14 | Source-wide, before any run | Features needing the side do not run at all |
 
-**A feature is valid at a run only if** its stream is continuous across the window and its reference exists. Otherwise it is invalid, with a reason code, and it is never imputed.
+**The runner's clock has no separate state.** C17 logs the skew at each run. A runner clock running behind only moves `t_cut` earlier. One running ahead moves `t_cut` past the data, so the completeness check fails and the run logs `DATA_GAP`. Both are safe by construction, and `V0.L` and flow variants are treated alike.
+
+**A feature is valid at a run only if** its window holds no gap and its reference and state exist. Otherwise it is invalid, with a reason code, and it is never imputed.
 
 **Missing and quiet are different.** A support failure, such as too little flow, is `NEUTRAL`: the market said nothing. Missing data is `UNKNOWN`: we do not know. See 5.1.
 
-**Reference venue.** The poll source and the price venue may differ (`D-01` is open). Health is tracked for each one. A `.L` price path for `F18-X1` comes from the flow source itself, since a response on one venue must be measured with its own prices. A zone from the price venue may differ slightly from the flow venue's prices, and that basis is reported.
-
 ### 3.5 Where flow attaches to the run
 
-C17's order is normative. Flow attaches at these points only:
+C17's order is normative. Flow attaches here and nowhere else:
 
-| C17 step | What flow does |
+| C17 stage and step | What flow does |
 |---|---|
-| 1. Load state, check gap | Also checks flow health |
-| 2. Resolve pending fills, walk positions through 1m bars | **Nothing.** Stops and targets resolve first, on the stops active before this run |
-| 3. Process each newly closed `T_d` bar in order | **Nothing.** Invalidation, time stops, model updates and setup detection are candle logic |
-| 4. Set `t_dec`, `P_dec`, commit decisions | **Here.** Flow exit (section 6) for each position still open, then the entry gate (section 5) for each live setup, oldest first. All decisions commit together |
-| 5. Fills | Entries and flow exits fill as C17 states |
-| 6. New stops and targets act | Flow `TIGHTEN` acts as C17 states |
+| `fetch` 0, `decide` 1 to 3 | **Nothing.** Bars, gap checks, the walk, model updates, setup detection and late-entry checks are candle logic |
+| `decide` 3b | **Here, at every run.** Flow exit for each open position, then the entry gate for each live setup, oldest first. It reads only bars and trades at or before `t_cut`, with position state as of `t_cut`. It computes no model update |
+| `decide` 4 | All decisions commit together, including those from step 3b |
+| `settle` 5 | Entries, flow exits and scale-outs fill as C17 states. Every 1m bar before the fill bar is walked first under the stop in force. A touch there stands, and a pending exit is cancelled and logged as superseded |
+| `settle` 6 | Flow `TIGHTEN` enters the stored history with its `effective_from` |
 
-Posts go out only after the ledger write, as the charter requires.
+**`settle` cannot change a decision, and nothing in it feeds flow.** Posts go out only after the ledger write, as the charter requires.
 
-**Idempotency.** A decision is keyed by `(setup_id, run_id)` or `(position_id, run_id)`. A retried run finds the key in the ledger and books nothing new.
+**Pending exits and overlap.** Flow is not evaluated for a position with an exit already pending from step 3, so no second order can be sent. Under C11, a pending exit counts as open, so a same-run setup on that strategy and symbol is `SKIPPED_OPEN`, whichever step set the exit.
 
-**A decision exists only once committed.** If the ledger write fails, the run counts as dropped and nothing is booked. The fill rule is deterministic, so a crash after the commit costs nothing: the next run computes the same fill.
+**Idempotency.** A decision is keyed by `(setup_id, run_id)` or `(position_id, run_id)`. A retried run finds the key in the ledger and books nothing new. C17 covers a run that dies after its commit.
+
+### 3.6 Poll capacity
+
+C17 item 3 requires a run that would exceed its budget to behave in a backtest as it would live, and leaves per-source values to this document. Flow has no source of its own, so **these are the trade feed values held as a placeholder in C17 (condition C-10), and no `CYCLE` run may start until `data-steward` fills them.**
+
+| Value | Kraken spot `Trades` | Status |
+|---|---|---|
+| Page size | 1,000 trades per call | `doc`, in `03_DATA_SOURCES.md`. Confirm under D9 |
+| Call spacing | 1 to 2 s between calls is suggested | `doc`. The real limit from a runner is `UNVERIFIED` |
+| Recent history reachable with `since` | `UNVERIFIED` | Needed for how far a backlog can be recovered |
+| Job budget | About 3 minutes (`08_DATA_CENTER.md`), matching `D_run` of 180 s | Shared by both symbols. Their order and split are declared under C-10 |
+| Trades per hour by symbol, normal and stressed | `UNVERIFIED` | Not measured, and no size carries over from another venue |
+
+**Arithmetic only, and an upper bound.** At 1 to 2 s between calls, 180 s gives 90 to 180 calls, so 90,000 to 180,000 trades for both symbols together, before any time for responses. Whether a stressed hour or a backlog on Kraken exceeds that is `UNVERIFIED`.
+
+**Modelled fetch, for every simulated run.**
+
+1. From the archive, count the trades on each symbol since that symbol's last successful fetch, up to the run's cut.
+2. Compute `pages = ceil(trades / page size)`, in the declared symbol order, against the shared budget.
+3. If a symbol's pages do not fit, its data stops short of `t_cut`, and the completeness check fails exactly as it would live: `t_cut` moves back once, then `DATA_GAP`.
+4. The next run starts with the larger backlog. A backlog past the reachable history stays a permanent gap. A gap still open at the next run brings `GAP_CLOSE`.
+
+Dropped runs therefore enlarge later fetches in the backtest, as they would live. **If any value above is unknown, a result is `.R`.** Reports show the share of runs with `DATA_GAP` from capacity. At G8 they compare the live and backtest shares.
+
+### 3.7 State each feature needs
+
+A `.L` backtest reads only what a run would hold. Each member of a reference needs its own point-in-time normaliser (section 4), so the horizon is longer than the reference itself.
+
+| Feature | What is kept | Horizon |
+|---|---|---|
+| `F24-X1`, `D-SV18-X1`, `F23-X1`, `F42-X1`, `F41-X1`, `F39-X2` | 1m bars with buy notional, sell notional, trade count and price. These also serve the windows and `JS` | 84 days: 28 for the reference, plus 8 weeks for each member's `E_W`. 70 days at the minimum of 6 valid weeks |
+| `F18-X1`, `F19-X1`, `D-RR18-X1` | The same 1m bars | 85 days, adding the 24 hour fit that each member needs |
+| `F25-X1`, `F26-X1` | Burst summaries per minute, and burst rows for the `F25-X1` reference, because 1m bars cannot rebuild them. Valid only if check D14 shows millisecond or finer stamps on both endpoints | 35 days of burst rows, plus the 84 days of 1m bars |
+| `F27-X1` | Trades inside the longest entry window, and the earlier setups' `AE` values for its rank | 240 minutes of trades. `AE` values for the life of the record |
+| `Anchored` values | The value computed at the object's knowable time | The object's life, up to its setup's `A_max`. A departure can be days old |
+
+**Where it lives.** The Actions cache, under `08_DATA_CENTER.md` section 5, with a deterministic rebuild or `DATA_GAP`. Sizes are `UNVERIFIED`, and must fit the cache budget in that document.
+
+**After a lost cache.** Rebuilding 84 days through REST at 1,000 trades per call is not expected to fit one job, and rebuild time is `UNVERIFIED`. So what a run cannot recover is `WARMUP`, and the feature is invalid until the state is back. **The backtest does the same.** It applies a declared cache-loss stress, one loss per 90 days at random seeded times, with state back only after the measured rebuild time. Until that is measured, state is back only after the full horizon. These values are my assumptions and are not GitHub figures. Reports show the share of runs in `WARMUP`.
 
 ## 4. Normalisation
 
 A feature value becomes a percentile against its own recent past, with no outcomes involved.
 
 - **`pct(x)`** is the mid-rank of `x` in a reference sample, clipped to `[1/(2n), 1 - 1/(2n)]`.
-- **Reference sample on the cycle.** Values of the same feature and window length, computed from 1m bars at the nominal minute of each hour over the trailing 28 days, which is 672 values. Using the nominal minute makes the reference independent of when runs actually happened, and keeps each window spanning the same number of quarter-hour marks.
-- **Recomputed at each run,** from data before that run. Under item 10 of the timing contract, this is a causal indicator with no fitted state, and it needs no freezing. The same applies to `E_W`, which has the same construction as `SRV` in C3. A threshold on either one is a fitted object. Section 8 covers that. This replaces an earlier weekly refresh, so the question of whether a week is a valid block does not arise here.
-- **Symmetrised for signed features.** The reference holds both `x` and `-x`. Mirroring a market then exactly mirrors the percentile, and the mirror test in section 12 can be exact. Any genuine asymmetry between long and short is reported by side rather than built in.
+- **Reference on the cycle.** Values of the same feature and window length, computed from 1m bars at minute 7 of each hour over the trailing 28 days, up to 672 values. Using a fixed minute makes the reference independent of when runs actually happened.
+- **No overlap.** Each member's window ends at or before `t_cut - W`, so the ranked window never enters its own reference.
+- **Point-in-time members.** Each member's `E_W`, and each member's fit for `D-RR18-X1`, is the value as of that member's own time, never today's profile. Test: recomputing a member a month later gives the identical number.
+- **Recomputed at each run,** from earlier data. Under item 10 of the timing contract this is a causal indicator with no fitted state, and it needs no freezing. A threshold on it is a fitted object. Section 8 covers that.
+- **Minimum.** At least 100 valid members, or the feature is `WARMUP`. A declared value.
+- **Symmetrised for signed features.** The reference holds both `x` and `-x`, so mirroring a market exactly mirrors the percentile, and the mirror test can be exact. A real asymmetry between long and short is reported by side. **An inverted trade side passes this test exactly and looks normal, so the mirror test does not check the side. Only check D2 does.**
 - **Aligned value.** `A = s * (2 * pct(x) - 1)` in `(-1, 1)`, with `s = +1` for a long setup and `-1` for a short one.
-- **Unsigned features** such as stress and jump scores use their own one-sided percentile.
-
-**State.** `F42-X1`, percentiles and windows need up to 28 days of signed 1m bars. C17 and open question 9 of the strategy index leave it to `data-steward` where such derived state may live. If it is lost, a run rebuilds from the source, and otherwise the feature is in `WARMUP`.
+- **Zero-heavy features** (`F25-X1`, `F26-X1`). A window with no sweep or large burst is a real zero, and a percentile cannot say "worst 20%" of a pile of zeros. So these rank among their nonzero members only. Zero is `NEUTRAL`, unless a row names the absence itself, as S06 row 1 does.
+- **`RR`.** Ranked on this same grid, valid members only. See the states in [the matrix](STRATEGY_FEATURE_MATRIX.md#21-notation).
+- **`AE` in `F27-X1`.** No zone exists on the hourly grid. So it ranks against earlier setups of the same strategy and symbol, whose `knowable_time` is before this look, with at least 30 of them. Otherwise it is invalid.
+- **Unsigned risk features** (`F39-X2`, `JSmax_60`) are compared with a frozen limit in their own units. They use no percentile. See section 8.
 
 ## 5. Entry gate on the cycle
 
 ### 5.1 Recipe
 
-A strategy's gate is a **recipe**, frozen before a test block and set in the [matrix](STRATEGY_FEATURE_MATRIX.md). It holds up to 3 features from the live-eligible list, each with an expected sign `e` relative to the setup side, its window, and a mode (`.F` or `.T`). Layers and features are not collapsed into one score.
+A strategy's gate is a **recipe**, frozen before a test block and set in the [matrix](STRATEGY_FEATURE_MATRIX.md). It holds up to 3 features from the live-eligible list, each with an expected sign `e` relative to the setup side, its window, and a mode (`.F` or `.T`). Layers and features are not collapsed into one score. In the first pass each row is a recipe of one feature.
 
 **Votes.** For each feature at a look:
 
-| Vote | Signed feature | Response state, `D-RR18-X1` | Unsigned feature |
+| Vote | Signed feature | Response state, `D-RR18-X1` | Unsigned risk feature |
 |---|---|---|---|
-| `BLOCK` | `e * A <= -tau_b` | The state the recipe names | `pct(x)` beyond its frozen limit, on the side the recipe declares harmful |
+| `BLOCK` | `e * A <= -tau_b` | The state the recipe names | Value beyond its frozen limit |
 | `PASS` | `e * A >= tau_p` | The state the recipe prefers | Inside the limit |
 | `NEUTRAL` | Otherwise, or **support failed** | Otherwise, including `NO_FLOW` | Not used |
-| `UNKNOWN` | **Data missing or not continuous** | Same | Same |
+| `UNKNOWN` | **Data missing, or state not held** | Same | Same |
 
-Response states are defined in [section 2.1 of the matrix](STRATEGY_FEATURE_MATRIX.md#21-notation).
+**First-pass values, declared and not fitted.** `tau_b = 0.6`, the worst 20% among members. `tau_p = 0`, so `PASS` means on the favourable side of the rolling median. Exception: S06 row 1, stated in the matrix.
 
 ### 5.2 Setup and state
 
-The setup comes from Layer 1 as in [C5](../01_strategies/00_INDEX.md#c5-setup-object-and-gate-window). It has `side`, `level_or_zone`, `invalidation` (`S0`), `targets`, `created_at = t_k` and `expiry`. The state below is kept between runs.
+The setup comes from Layer 1 as in [C5](../01_strategies/00_INDEX.md#c5-setup-object-and-gate-window). The state below is kept between runs.
 
 ```text
 LIVE(looks_used, looks_lost) --> ENTERED | VETOED | EXPIRED    all three terminal
 ```
 
-The gate cannot resurrect a closed setup, change its side, or change its stop, targets or expiry. A new trade needs a new setup from the strategy.
+The gate cannot resurrect a closed setup, or change its side, stop or expiry. It cannot raise a target: see the last rule of "Flow under `CYCLE`" in C17 and 5.5.
 
 ### 5.3 Evaluation at each look
 
-Strict order. The first rule that applies decides.
+This is step 3b of `decide`. Strict order. The first rule that applies decides.
 
 | # | Condition | Output | Reason |
 |---|---|---|---|
-| 1 | `t_dec >= expiry` | `EXPIRE` | `expired`, or `no_run` if the setup never received a look |
-| 2 | Any **C17 late-entry check** fails: Age, Path, Chase, Risk, Reward or Thesis, with the values in the strategy's section 14, including any it adds (`S03` Extension, `S08` Roll, `S09` Clock) | `EXPIRE`, event `STALE_SETUP` | The check's own reason, such as `RR_LATE` |
-| 3 | Run health shows `CLOCK_SUSPECT` | `.T`: `WAIT` if a look remains. Otherwise `EXPIRE` | `clock_suspect` |
-| 4 | Risk check breached, if in the recipe: `JSmax_60` or `F39-X2` beyond its limit | `.T`: `WAIT` if a look remains. Otherwise `VETO` | `stress` |
-| 5 | Any valid feature votes `BLOCK` | `VETO` | `flow_block:<feature>` |
-| 6 | Any required feature is `UNKNOWN` | `.T`: `WAIT` if a look remains. Otherwise `EXPIRE` | `flow_blind` |
-| 7 | `.F`: no `BLOCK`, all valid | `ENTER` | `no_block` |
-| 8 | `.T`: all features `PASS` | `ENTER` | `confirmed` |
-| 9 | `.T`: otherwise, a look remains | `WAIT` | `no_confirmation` |
-| 10 | `.T`: otherwise, no look remains | `EXPIRE` | `no_confirmation` |
+| 1 | `t_cut >= expiry` | `EXPIRE` | `expired`, or `no_run` if the setup never received a look |
+| 2 | Any **C17 late-entry check** fails at the current `P_dec`: Age, Path, Chase, Risk, Reward or Thesis, with the values in the strategy's section 14, including any it adds | `EXPIRE`, event `STALE_SETUP` | The check's own reason, such as `RR_LATE` |
+| 3 | Risk check breached, if in the recipe: `JSmax_60` or `F39-X2` beyond its frozen limit | `.T`: `WAIT` if a look remains. Otherwise `VETO` | `stress` |
+| 4 | Any valid feature votes `BLOCK` | `VETO` | `flow_block:<feature>` |
+| 5 | Any required feature is `UNKNOWN` | `.T`: `WAIT` if a look remains. Otherwise `EXPIRE` | `flow_blind` |
+| 6 | `.F`: no `BLOCK`, all valid | `ENTER` | `no_block` |
+| 7 | `.T`: all features `PASS` | `ENTER` | `confirmed` |
+| 8 | `.T`: otherwise, a look remains | `WAIT` | `no_confirmation` |
+| 9 | `.T`: otherwise, no look remains | `EXPIRE` | `no_confirmation` |
 
-A `DATA_GAP` means no decision at all for this symbol this run, under C17, so no rule is evaluated and the look counts as lost.
+A `DATA_GAP` means no decision at all for this symbol this run, under C17, so no rule is evaluated and the look counts as lost. "A look remains" is defined in 5.4, and `.F` never has one. `V0.L` applies rules 1 and 2 only, followed by `ENTER`.
 
-"A look remains" is defined in 5.4, and `.F` never has one. `V0.L` applies rules 1 and 2 only, followed by `ENTER`, so `V0.L` and `VE.L` lose the same setups to `STALE_SETUP`, and the gate is not credited for them.
+**What the gate is charged for.** At the first look, `V0.L` and `VE.L` meet the same checks, so a first-look `STALE_SETUP` is not credited to the gate. On `.T`, a setup that `WAIT` carries into a failed check is charged to the gate: `V0.L` may well have traded it. Section 11 says how each case enters the statistic.
 
 **Why a valid `BLOCK` outranks `UNKNOWN`.** Evidence against the setup stands even if another feature is missing. Absence of evidence never allows an `ENTER`.
 
-**Fail closed, by default.** `VE` with missing flow does not trade. Outages may cluster in stress, so entering blind at those moments is the wrong default. Falling back to candle-only behaviour (`FAIL_OPEN`) is a single registered sensitivity, and its trades carry `degraded = true`. **No recipe silently degrades to fewer features.** A reduced recipe would be a separate registered variant.
+**Fail closed, by default.** `VE` with missing flow does not trade. Falling back to candle-only behaviour (`FAIL_OPEN`) is a single registered sensitivity, and its trades carry `degraded = true`. **No recipe silently degrades to fewer features.** A reduced recipe would be a separate registered variant.
 
 ### 5.4 How `WAIT` works when the next look may be an hour away
 
 C17 states it: `WAIT` means the next run, up to `expiry` and `A_max`. It holds no order and reserves nothing. In every live strategy, `A_max` binds long before `expiry`.
 
-**How many looks actually exist.** A look at run `j` has age about `7 + 60 * j + d` minutes, with `d` the delay after the nominal minute. From the C17 scenarios, by arithmetic on their declared values:
-
-| `A_max` | Strategies | Second look under `C-FAST` | Under `C-LATE` | Under `C-BAD` | Third look under `C-LATE` |
-|---|---|---|---|---|---|
-| 75 min, 1h | S04, S08, S09 | Always | **About 13%** | About 9% | None |
-| 90 min, 1h | S02, S03, S05, S07, S10 | Always | **About 46%** | About 31% | None |
-| 150 min, 4h | S03, S04, S05, S10 | Always | About 95% | About 85% | About 46% |
-
-These figures are arithmetic on assumed delays, not measurements. `C-MEASURED` replaces them once 30 days of run logs exist.
-
 - **Budget.** `looks_max` is 2 at 1h and 3 at 4h, always bounded by `A_max` and `expiry`.
-- **A look remains** when `looks_used < looks_max` and the next nominal run time, plus the median delay of the active scenario, is within both limits.
-- **Last-look rule.** At the last look, `WAIT` is not an available output. `.T` then gives `ENTER` on a full pass, `VETO` on a block, and `EXPIRE` otherwise.
+- **A look remains** when `looks_used < looks_max`, and the next nominal run time plus the active scenario's **declared minimum delay** is within both limits. All current scenarios have a 2 minute minimum.
+- **The decision never reads a realised next run.** No run can know one. Test: changing the seeded next run time leaves the current output unchanged.
+- **A `WAIT` whose next run fails Age** closes as `STALE_SETUP`, and it is charged to the gate.
+- **Last-look rule.** At the last look, `WAIT` is not available. `.T` then gives `ENTER` on a full pass, `VETO` on a block, and `EXPIRE` otherwise.
 - **A dropped run burns life, not budget.** It counts as a look lost, not a look used.
-- **Every look starts over.** Each look recomputes everything, including the C17 checks at the current `P_dec`. A failed check closes the setup, as it would under `V0.L`.
-- **Repeated looks are a trial cost.** Multiple looks at a threshold raise the chance of an `ENTER` by luck, and wait statistics are reported: looks used, looks lost, price change while waiting.
+- **Every look starts over.** Each look recomputes everything on its own `t_cut`, including the C17 checks.
+- **Repeated looks are a trial cost.** Multiple looks at a threshold raise the chance of an `ENTER` by luck, and consecutive 60-minute windows can share up to 43 minutes of flow under `C-LATE`. Wait statistics are reported: looks used, looks lost, price change while waiting.
 
-**Plain expectation, not a result.** At 1h, a second look often does not exist. When it does, the setup has waited a full bar and the flow window no longer overlaps the moment that created it. So `VE.T.L` is **not a per-strategy test**. It runs once pooled across the `A_max = 90` strategies, to check this expectation, and it is dropped if confirmed. At 4h it is a fairer test, but the samples there are too small to read per strategy.
+**Is `WAIT` available?** By the rule above, from minute 7, with a 2 minute minimum, the next nominal age is 69 minutes after the first look and 129 after the second.
+
+| `A_max` | Strategies | Available at first look | Available at second look |
+|---|---|---|---|
+| 75 min, 1h | S04, S08, S09 | Yes | No, this is the last look |
+| 90 min, 1h | S02, S03, S05, S07, S10 | Yes | No, this is the last look |
+| 150 min, 4h | S03, S04, S05, S10 | Yes | Yes. The third is the last |
+
+**How often does the next run pass Age?** This is the realised rate, for reporting only, and no decision reads it. With `t_cut = floor_1m(run_start - 10 s)`, and by arithmetic on the C17 scenarios' assumed values:
+
+| `A_max` | Look | `C-FAST` | `C-LATE` | `C-BAD` |
+|---|---|---|---|---|
+| 75 min, 1h | Second | Always | About 16% | About 11% |
+| 90 min, 1h | Second | Always | About 49% | About 33% |
+| 150 min, 4h | Second | Always | About 95% | About 85% |
+| 150 min, 4h | Third | Always | About 49% | About 33% |
+
+These are arithmetic on assumed delays, not measurements. `C-MEASURED` replaces them once 30 days of run logs exist. Whether load at the top of the hour still reaches minute 7 is `UNVERIFIED`.
+
+**Plain expectation, not a result.** At 1h, `WAIT` usually ends in `STALE_SETUP`, and when a second look does happen, the setup has waited a full bar and its window no longer overlaps the moment that created it. So `VE.T.L` is **not a per-strategy test**. It runs once, pooled across the `A_max = 90` strategies, to check this expectation. At 4h it is a fairer test, but the samples there are too small to read per strategy.
 
 ### 5.5 After `ENTER`
 
-- **Fill** at the open of the first 1m bar with `open_time >= t_dec + latency`. If the fill reference is at or beyond `S0`, the entry is cancelled, as in C17.
-- **Size** uses `abs(P_dec - S0)`, as in C17 and rule 4 of [charter section 7](../00_CHARTER.md#7-dynamic-stops-and-targets).
-- **`R`** is `abs(fill - S0)`, fixed at the fill. A later entry means a different `R` from `V0.L`. Comparison is made in risk units, so each trade risks the same money.
-- **Order style** is taker. The Layer 3 cost check is arithmetic on declared fees and slippage. The book snapshot is logged only.
+From C6, C17 and [charter section 7](../00_CHARTER.md#7-dynamic-stops-and-targets), with nothing added:
 
-**Rejected setups.** `VETO`, `EXPIRE`, `STALE_SETUP` and `SKIPPED_OPEN` setups all stay in the record with their counterfactual (`F35-X1`), as the charter requires.
+- **Fill reference.** The open of the first 1m bar with `open_time >= t_dec + latency` that has a price.
+- **Collar.** The entry goes out as a marketable limit around `P_dec`. A reference beyond it gives `ENTRY_COLLAR`.
+- **Through the stop.** A reference at or beyond `S0` is **not cancelled**. The trade exists and is stopped on the fill bar, logged `ENTRY_THROUGH_STOP`. `Result_B` always includes these trades.
+- **Size** uses `R_dec = abs(P_dec - S0)`. **`R`** is `abs(fill - S0)`, fixed at the fill.
+- **Target.** Under `.T`, where `WAIT` can make the fill later than the first look, each fill-based term of a target rule uses the less distant of its actual value and its value computed with the first look's `P_dec`, as C17 requires. Flow may never extend a target. `.F` fills at the same run as `V0.L`, so it is not affected.
+- **Order style** is taker. No book input reaches this step.
+
+**Rejected setups.** `VETO`, `EXPIRE`, `STALE_SETUP`, `SKIPPED_OPEN` and `ENTRY_COLLAR` all keep their counterfactual under [C14](../01_strategies/00_INDEX.md#c14-event-log). See `F35-X1` in the triage and section 11.
 
 ## 6. Flow exit on the cycle
 
-Applies to `VX.L` and `VEX.L`, for positions still open after C17 steps 2 and 3.
+Applies to `VX.L` and `VEX.L`, in step 3b, for open positions with no exit pending.
 
 **The hard rules, from [charter section 7](../00_CHARTER.md#7-dynamic-stops-and-targets), which no parameter can change:**
 
 1. A stop moves only toward the market. Every flow change passes through the ratchet C8, with the C17 clamp.
 2. Flow may never widen a stop, extend a time stop or extend a target.
-3. `R` never changes.
+3. `R` and `R_dec` never change.
 4. Flow never adds to a position, and a scale-out is never reversed.
-5. Stops and targets are resolved first at each run. Flow acts only on what is still open.
+5. Stops and targets are resolved first, in steps 2 and 5. Flow acts only on what is still open.
 
-**A stop can only be as good as the run that sets it.** C17 keeps the old stop in force until `t_dec + latency`, and never applies a stop retroactively. A dropped run means a stop that was due to tighten did not. Risk does not rise from the original plan, but the plan was not followed, and this is logged. Stops are modelled as orders resting at the venue between runs, as item 13 of the timing contract states, and reports say so.
+**A stop can only be as good as the run that sets it.** C17 keeps the old stop in force until `effective_from`, and never applies a stop retroactively. A dropped run means a stop that was due to tighten did not, and this is logged. Stops are modelled as orders resting at the venue between runs, as item 13 of the timing contract states, and reports say so.
 
-**Time stops.** Under rule 7 of charter section 7, a time stop takes effect at the first run after it falls due, and fills at the first price after that run. The overrun is logged and reported. It is a limit of the cycle, not a rule that extends the stop, and flow has no part in it.
+**Time stops.** Under rule 7 of charter section 7, a time stop takes effect at the first run after it falls due, and fills after that run. The overrun is logged and reported. It is a limit of the cycle, not a rule that extends the stop, and flow has no part in it.
 
 ### 6.1 Ladder
 
-Severity only rises within a position: `HOLD` < `TIGHTEN` < `SCALE_OUT` < `EXIT`.
+**Conflict.** `C = F37-X1` on the recipe's one exit feature, over the exit window, in `(-1, 1)`, positive when flow is against the position.
 
-**Conflict.** `C = F37-X1` on the recipe's exit feature, over the exit window, in `(-1, 1)`, positive when flow is against the position.
-
-**First flow look.** The first run with at least one full exit window of post-fill data, so that a trade is judged on flow since it opened. On the cycle this is usually the second run after the fill.
+**First flow look.** The first run with at least one full exit window of post-fill data, so that a trade is judged on flow since it opened.
 
 | Output | Trigger, from a frozen ladder | Action | Event |
 |---|---|---|---|
-| `HOLD` | None, or any required input invalid | None | Logged in the decision record |
-| `TIGHTEN` | `C >= c1`, at most twice per trade, at least 2 runs apart | Stop candidate halfway between current stop and `P_dec`, through C8 with the C17 clamp | `STOP_UPDATE` |
-| `SCALE_OUT` | `C >= c2`, at most once per trade | Close half of what remains, at the C17 fill | `SCALE_OUT` |
-| `EXIT` | `C >= c3`, or an adverse `F41-X1` breach | Close the rest, at the C17 fill | `EXIT` |
+| `HOLD` | None, or any required input invalid | None | Decision record |
+| `TIGHTEN` | `C >= c1`, at most twice per trade, at least 2 runs apart | Stop candidate halfway between the stop and `P_dec` | `STOP_UPDATE` |
+| `SCALE_OUT` | `C >= c2`, at most once per trade | Close half of what remains, at the C17 fill, less `slip` | `SCALE_OUT` |
+| `EXIT` | `C >= c3`, or an adverse `F41-X1` breach | Close the rest, at the C17 fill, less `slip` | `EXIT` |
 
-At each run, the highest triggered action not yet used is taken. Only one action per run.
+At each run, the highest triggered action not yet used is taken, and only one per run. A `HOLD` or `TIGHTEN` may follow a `SCALE_OUT`: what cannot happen is that quantity rises or a stop loosens. A trigger needs a single look, since waiting for two would mean two hours.
 
-**Ladder settings** on `(c1, c2, c3)`: `(0.4, 0.6, 0.8)` is the first-pass default. `(0.6, 0.8, 0.9)` and `(0.2, 0.5, 0.8)` are for survivors only. A trigger needs a single look, since waiting for two would mean two hours.
+**Adverse `F41-X1`.** `JSmax_60` is beyond its frozen limit, and the signed return of the bar that set it runs against the position. Only this one trigger reads `F41-X1`. `F39-X2` is not in the ladder.
 
-**`TIGHTEN` in detail.** Long: `S_cand = S + 0.5 * (P_dec - S)`, then `S_new = max(S, min(S_cand, C_b - 0.10 * ATR_b, P_dec - 0.10 * ATR_b))`, with `b` the last processed `T_d` bar. Short is the mirror. If this would break the strategy's floor, or if it leaves the stop unchanged, the action is logged as `tighten_blocked` and not counted. `effective_from` is `t_dec + latency`.
+**Ladder settings** on `(c1, c2, c3)`: `(0.4, 0.6, 0.8)` is the first-pass default. `(0.6, 0.8, 0.9)` and `(0.2, 0.5, 0.8)` are for the class test and survivors only.
 
-**Between 4h closes.** C17 says those runs compute no model updates, and also says a gate is evaluated at runs. I read flow as acting at any run, including between 4h closes, using the last processed `T_d` bar. Section 15 asks for this reading to be confirmed.
+**`TIGHTEN` in detail.** `S` is the stop after step 3, **including any model stop pending from this run**. Long: `S_cand = S + 0.5 * (P_dec - S)`, then `S_new = max(S, min(S_cand, C_b - 0.10 * ATR_b, P_dec - 0.10 * ATR_b))`, with `b` the last processed `T_d` bar. Short is the mirror. If this would break the strategy's floor, or leaves the stop unchanged, the action is logged as `tighten_blocked` and not counted. The stop that takes effect at `effective_from` is the tightest of the pending model stop and the flow stop. It enters the stored history, so a later close passes through C8 from it. The bar straddling `t_dec + latency` is ruled by the old stop. If the first bar under the new stop opens through it, the position exits at that open less stop slippage, logged `STOP_GAP`, as in C7.
+
+**Between `T_d` closes.** Flow may act at any run, including runs between 4h closes, using the last closed `T_d` bar, as C8 and C17 now state. The candle model computes nothing at those runs.
 
 **Missing data.** Invalid flow means `HOLD` with reason `flow_blind`. A flow outage is not information about the market. So it never forces an exit, and the position continues under its dynamic model exactly as `V0.L` would.
 
-**When flow exit is not tested.** `flow_reachable_share` is the share of a strategy's `V0.L` trades still open at their first flow look (check D11). If it is below 50%, `VX.L` is recorded as not testable for that strategy. It is not run, and it costs no trial.
+**When flow exit is not tested.** `flow_reachable_share` is the share of a strategy's `V0.L` trades still open at their first flow look (check D11). It is read on the first training span only, and each reading is a counted trial. If it is below 50%, `VX.L` is recorded as not testable for that strategy for the whole record, and it is not run.
 
 ## 7. Failure and fallback on the cycle
 
 | Situation | New entries, `VE.L` | New entries, `V0.L` | Open positions | Record |
 |---|---|---|---|---|
-| Run late | Normal, at actual time | Normal, at actual time | Normal, at actual time | `lateness` logged and reported |
+| Run late | Normal, on its own `t_cut` | Same | Same | `lateness` logged and reported |
 | Run dropped, next run on time | Look lost. C17 checks at the next run | Same | Old stop governs the gap. Touches resolved at the next run with `event_time` and `detection_time`. Updates delayed | Looks lost |
-| Actions outage over many hours | As above, and setups go stale | As above | As above. `OUTAGE` event per the data center document | `OUTAGE` in the ledger |
-| Flow source failing, 1m bars fine | `flow_blind`, per 5.3 | Normal | `HOLD`, `flow_blind`. Stops resolved from 1m bars | Health state logged |
-| Partial flow poll within budget | Invalid features, as above | Normal | `HOLD`, `flow_blind` | Health state logged |
-| 1m bars missing | `DATA_GAP`, no decisions for the symbol | Same | Nothing resolved past the gap, per C17 | `DATA_GAP` |
-| Gap longer than the source's history | Windows crossing it invalid until clear | Normal once bars return | Per C2 and the data center document, the next available bar is processed. A gap through the stop exits at that open as `STOP_GAP`, flagged with `DATA_GAP` | Permanent gap noted |
-| Clock suspect | No decisions | No decisions | `HOLD` | `CLOCK_SUSPECT` |
-| Actions cache lost | `WARMUP` until rebuilt, `flow_blind` | Depends on candle availability | `HOLD`, `flow_blind` | Rebuilt by catch-up per the data center document |
-| Ledger write fails | Run void, counted as dropped | Run void | Unchanged | Next run reports the void |
-| Schedule disabled, GitHub restricts jobs | Everything stops | Everything stops | Unmanaged | Watchdog may also be silent, as the data center document notes |
+| Actions outage over many hours | As above, and setups go stale | Same | As above. `OUTAGE` event per the data center document | `OUTAGE` in the ledger |
+| Poll failing, or over budget (3.6) | `DATA_GAP`, no decisions for the symbol | Same | Nothing resolved past the gap. `GAP_CLOSE` if still open at the next run | `DATA_GAP`, with reason |
+| Empty minute with no proof | Same | Same | Same | `DATA_GAP`. See check D8: **this may be common on Kraken spot, `UNVERIFIED`** |
+| Gap never filled | Windows crossing it invalid until clear | Normal once bars return | Hole deadline, `GAP_UNRESOLVED`, reported both ways under C17 | Permanent gap noted |
+| Cached state lost (3.7) | That feature `WARMUP`, `flow_blind` | Normal, unless the bars themselves are gone | `HOLD`, `flow_blind` | `cache_lost`, and bars marked `rebuild` per C3 |
+| Ledger write fails | Run void, counted as dropped | Same | Unchanged | Next run reports the void |
+| Schedule disabled, GitHub restricts jobs | Everything stops | Same | Unmanaged | Watchdog may also be silent, as the data center document notes |
 
-**Never fill or repair silently.** A correction is a new ledger event. A flagged fill stays flagged.
+**Never fill or repair silently.** A correction is a new ledger event.
 
 ## 8. Fitting and freezing
 
-This applies to both kinds, on their own clocks. Under item 10 of the timing contract, a rolling percentile needs no freezing, while a threshold on one is a fitted object, frozen before its block.
+This applies to both kinds, on their own modes. Under item 10 of the timing contract, a rolling percentile needs no freezing, while a threshold on one is a fitted object, frozen before its block.
 
-**First pass: nothing is fitted to outcomes.** Sample sizes cannot support it, as [section 3.3 of the matrix](STRATEGY_FEATURE_MATRIX.md#33-fixed-thresholds-in-the-first-pass) shows. Each feature uses one declared constant:
+### 8.1 What is frozen, and when
 
-| Item | First-pass value | Kind |
+| Item | Kind | Set from | Frozen |
+|---|---|---|---|
+| `tau_b`, `tau_p`, the first-pass ladder, the 0.5 and 0.25 rank cuts on `RR`, 30% and 100-member minimums | Declared constant | This document, before any data | Now. A change is a counted trial |
+| Nominal minute, `latency`, `A`, `D_run`, seeds | Declared constant | C17 | C17. The check on minute of hour (D12) is a report only |
+| `RT` and stop slippage | Declared constant or estimated, chosen before the first run under C12 | The approved venue's values, `UNVERIFIED`. Measured slippage goes to reports. See [the triage](FEATURE_TRIAGE.md#55-how-do-taker-fees-compare-with-the-effect-being-sought) | Before the first run |
+| `v_min` | Fitted, no outcome | Training span's median of `abs(NS_W)` | At each block's start |
+| `F39-X2` rank map and limit (95th percentile) | Fitted, no outcome | Training span | At each block's start |
+| `JSmax_60` limit (99.5th percentile), `F41-X1` minimum scale (lower 1% of positive `BV`) | Fitted, no outcome | Training span | At each block's start |
+| Any grid result | Fitted on outcomes | Training span only, under 8.5 | At each block's start |
+
+**The block for fitted objects is the calendar quarter of the fold plan.** The same calendar as C12. **Each artifact is keyed by `(kind, source)`.** `.L` loads only artifacts fitted under `.L` on its own source.
+
+### 8.2 Fold plan, frozen before any outcome
+
+These dates come from data coverage alone, and they are frozen before any `V0` outcome. `project-manager` records them under condition C-7, along with which dates were looked at during the build.
+
+| Item | Value | Status |
 |---|---|---|
-| `tau_b` | 0.6, the worst 20%. Exception: S06 row 1, stated in the matrix | Declared constant |
-| Response cuts | Rolling median and 25th percentile of `RR` | Causal indicators |
-| Exit ladder | `(0.4, 0.6, 0.8)` | Declared constant |
-| `v_min`, `F39-X2` scaling, risk limits (`F39-X2` at its 95th percentile, `JSmax_60` at its 99.5th) | Set from the feature's own training distribution, with no outcomes | Fitted, frozen before the block |
+| Research data end | 2026-09-30, the end of Kraken's bulk files | `doc`. REST catch-up is not used in research blocks |
+| **Locked final block** | **2025-10-01 to 2026-09-30, by date.** It does not move as data arrives | Fixed here. Read by nothing before the final verdict, `V0` included |
+| `T_start` | The start of the first calendar quarter from which every later quarter meets the coverage rule, on both symbols | **`UNVERIFIED`.** Computed by `data-steward` from the G1 report, with no outcome read |
+| Coverage rule | Unproved empty minutes under 1%, and at least 100 trades in each of 90% of hours | Declared here. Numeric form of R6 in [the triage](FEATURE_TRIAGE.md#56-whose-flow-is-measured-and-does-that-venue-lead-or-follow) |
+| First training span | 18 months from `T_start` | Declared here |
+| Test blocks | Calendar quarters, from the end of the first training span to 2025-09-30, with expanding training | Follows from the above. Expanding training is the ruling `project-manager` is asked to make under C-7 |
 
-**Grid, for class-level tests and survivors only.**
+**If the fallback applies,** a new table is frozen before the first outcome on that source, and nothing read on Kraken is reused. The fallback is triggered by the permission's status only, never by a result.
 
-1. **Pre-register** the recipe, sign, windows, grid, venue and mode in the trial registry, before the test block.
-2. **Compute outcomes.** Simulate every setup in the training fold under `V0` on the same clock. For `.L`, use `C-LATE`, averaged over at least 5 seeds, since C17 names it for selection.
+### 8.3 What may read outcomes before the blocks
+
+**Only the first training span, and each reading is a counted trial.** That covers the `V0` comparison with C15 for flow purposes, check D11, the setup-free screen and the quintile tables. **Nothing reads the locked block before the final verdict.** `V0` selection follows C18: chosen per fold from training only, under `C-LATE`, on `Result_B`. Flow rows run on the configuration frozen for that block, including its `T_d`.
+
+### 8.4 First pass: nothing is fitted to outcomes
+
+Sample sizes cannot support it, as [section 3.3 of the matrix](STRATEGY_FEATURE_MATRIX.md#33-fixed-thresholds-in-the-first-pass) shows. Each row uses the declared constants in 8.1.
+
+### 8.5 Grid, for class tests and survivors only
+
+1. **Pre-register** the recipe, sign, windows, grid and mode in the trial registry, before the block.
+2. **Compute outcomes.** Simulate every setup in the training span under `V0` on the same clock. For `.L`, use `C-LATE`, averaged over the declared seeds.
 3. **Grid.**
 
    | Mode | Grid | Settings |
    |---|---|---|
-   | `.F` | `tau_b` in {0.8, 0.6, 0.4}, which is the worst 10%, 20% or 30% | 3 |
+   | `.F` | `tau_b` in {0.8, 0.6, 0.4}, the worst 10%, 20% or 30% | 3 |
    | `.T` | The same `tau_b`, and `tau_p` in {0, 0.4} | 6 |
    | Exit | The three ladder settings of 6.1 | 3 |
 
-4. **Objective.** `D`, the mean net `R` of kept setups minus blocked setups. A random veto has `D` near 0 in expectation. Per-setup gain is reported beside it, and is `p * (1 - p) * D` for kept share `p`. For exits, the paired `D_x`.
+4. **Objective.** `D`, in `Result_B`, as defined in section 11. Per-setup gain is reported beside it, and is `p * (1 - p) * D` for kept share `p`. For exits, the paired `D_x`.
 5. **Select.** Standard error by UTC-week block bootstrap, 500 resamples. Keep settings whose `D` exceeds one standard error above 0. Among those within one standard error of the best, take the least restrictive. Requires at least 30% of setups kept and at least 30 rejected.
 6. **No setting qualifies? `PASS_THROUGH`.** The gate does nothing for that fold, and that is recorded. A feature is never forced into use.
-7. **Freeze.** Parameters, code version and training cutoff go into one versioned artifact. It does not change during the block. A new live version starts a new, visibly labelled segment of the paper record, per the charter.
+7. **Freeze** into one versioned artifact. A new live version starts a new, visibly labelled segment of the paper record, per the charter.
 
-**Fold plan (a proposal, to be confirmed once `V0` results exist).**
+### 8.6 Test blocks are not reused for selection
 
-| Tier | First training span | Test blocks | Locked final block |
-|---|---|---|---|
-| `T1` | First 18 months of the chosen source | Calendar quarters, expanding training | The last 12 months |
-| `T2`, `.R` | First 12 months | Calendar quarters | The last 12 months |
+**Each first-pass verdict is recorded with its date.** A later row, grid or sensitivity scored on blocks read before that date is labelled `EXPLORATORY`, and **it cannot earn `SUPPORTED`**. A refinement earns it only on blocks after that date, or once on the locked block. The same holds across waves. An earlier test block may join the training of later blocks only, since it is past for them. Item 11 of the timing contract does not say this yet, so section 15 asks for it.
 
-The locked block is untouched until a final verdict. On Binance data it lies entirely after the RPI change, so a feature that depended on the earlier regime will show it there.
+**Order between kinds.** The `.L` recipes are frozen in the matrix before any `.R` result exists. `.R` and `.L` share calendar blocks and nearly the same setups, so reading `.R` on a quarter largely reveals `.L` on it. A new `.L` recipe written after reading `.R` on a block counts that block as used.
 
-**Purge and embargo.** A training setup is removed if its label interval reaches the test block. Embargo is the longest hold or expiry in the strategy.
+### 8.7 Purge and embargo
 
-**Long and short share one threshold.** Aligned values make this natural, and it improves support. BTC and ETH have their own references, and thresholds are pooled per strategy. Results are reported by side and by symbol.
+**These follow item 11 of the timing contract and C18.** A training setup is removed from selection when `t_k + H_max` reaches the block, using the maximum possible hold and not the actual exit, so removal does not depend on the outcome. Under `CYCLE`, add `A_max` plus 2 hours, and the active scenario's largest declared overrun beyond that, such as the 90-minute hole in `C-GAP`. Each training simulation's data ends at the block's start, and a trade still open then is removed and counted. That also covers a trade whose stop was touched before the block but detected after it, and a run of drops longer than any declared overrun.
 
-**Trial budget.** [Section 7 of the matrix](STRATEGY_FEATURE_MATRIX.md#7-trial-count) has the count. Delay scenarios, seeds and cost multiples are reports, not trials, as the strategy index states. Selecting a seed is forbidden.
+The audit's fix for this item was written on a label's end, using detection times. Item 11 and C18 were ruled after it, and they use the maximum possible hold, so they govern here.
+
+- **Class tests** use the largest `H_max`, `A_max` and overrun in the pool.
+- **Both sides.** Nothing at or after a block's start is in its training. A finished block joins later blocks' training under the same purge.
+- **Counterfactuals** are later events, with `knowable_time` at maturity, under C14.
+- **Bootstrap weeks** are assigned by `created_at`.
+
+### 8.8 Ablation
+
+**Ablation is removing one member of a recipe to see what it adds.** It is pre-registered per recipe and decided on training spans, and each removal is a counted trial. On test blocks, only a frozen recipe is reported. "No gain beyond row 1" is scored on identical setups, under 8.6.
+
+### 8.9 Pooling
+
+Long and short share one threshold. BTC/USD and ETH/USD have their own references, and thresholds are pooled per strategy. Results are reported by side and by symbol. [Section 7 of the matrix](STRATEGY_FEATURE_MATRIX.md#7-trial-count) holds the one symbol rule and every trial.
 
 ## 9. Backtest parity for live-eligible variants
 
-A `.L` backtest must measure what the live record measures. C17 sets out most of this under "Backtest reproduction": the same run function on a dataset truncated at `t_dec`, a declared allowance, `T_d` bars built from 1m bars, run times from a seeded scenario, a replay of actual run times at gate G8, and `IDEAL` minus `CYCLE` as the cost of the cycle. **Those rules apply as written.** Flow adds the items below. **If any item cannot be met, the result is `.R`, whatever it is called.**
+A `.L` backtest must measure what the live record measures. **C17 sets this out under "Backtest reproduction", and those rules apply as written.** Flow adds the items below. **If any item cannot be met, the result is `.R`, whatever it is called.**
 
 | # | Requirement |
 |---|---|
-| P1 | **Same inputs.** Only what a run can see, from the poll source or its archive, reconciled per check D10. No `T2` |
-| P2 | **Same scenarios.** `C-LATE` is the headline and selection scenario. `C-FAST` is the upper bound. `C-BAD` is the stress report. `C-MEASURED` replaces `C-LATE` as a new, visibly labelled configuration once 30 days of run logs exist. At least 5 seeds per random scenario, with the spread |
-| P3 | **Same reference.** Percentiles and `E_W` at each run are built as in section 4 |
-| P4 | **Same attachment.** Flow attaches to the run as in 3.5 |
+| P1 | **Same inputs.** Only what `decide` receives, truncated at `t_cut`, from the approved source. The source card (check D14) covers both REST and the bulk files, and check D10 reconciles them |
+| P2 | **Same scenarios.** `C-LATE` is the headline and selection scenario. `C-FAST` is the upper bound. `C-BAD` and `C-GAP` are stress reports. At least 5 declared seeds per random scenario, with the spread. `D_run` and fetch offsets are drawn or set as C17 says, so the backtest's `t_cut` equals what the run would hold |
+| P3 | **Same state.** Features read only the state in 3.7, under the cache-loss stress there. What a run could not recover is `WARMUP` on both paths |
+| P4 | **Same reference.** As in section 4 |
+| P5 | **Same poll capacity.** The modelled fetch in 3.6. The backtest goes blind in exactly the hours live would |
+| P6 | **One run-time draw.** All variants and placebos of a recipe share it, seed by seed |
 
-**Replay.** C17 requires the live period to be replayed with actual run times, and the trade list must match the ledger. Decisions and vetoes are checked in the same way. Every mismatch goes into the paper-versus-simulation report for gate G8, with its cause: data difference, timing or bug.
+**`C-MEASURED`.** Once 30 days of logs exist, it reports alongside. Re-running a selection under it is a new counted trial, and it applies to later blocks only.
+
+**Replay.** C17 requires the live period to be replayed with actual run times, from the as-seen inputs in `decisions/`. Decisions and vetoes are checked in the same way. Every mismatch goes into the paper-versus-simulation report for gate G8, with its cause.
 
 ## 10. Research-only variants
 
-**These cannot reach a live position on this setup.** They exist to study what the cycle removes, to cover timeframes under 1 hour, and to study the book. S01 and S06 exist only here, apart from their control run through `C-LATE`.
+**These cannot reach a live position on this setup.** They exist to study what the cycle removes and to cover timeframes under 1 hour. S01 and S06 exist only here, apart from their control run through `C-LATE`. There are **no book rows** on the free path.
 
-**Clock.** `IDEAL`, under C5 to C7. The first look is at `t_k`. Later looks on `.T` are every `dg` until `expiry`, each checked against the C5 guard. Fills follow C6. Archives have no receive time, so a record's availability is `exchange_ts + A`, with `A` declared per stream: 300 ms by default, stressed at 1 s and 5 s. It cannot be measured on this setup.
+**Mode.** `IDEAL-1M`. A look at instant `u` reads records with exchange time at or before `u`, and it fills at the first 1m bar with `open_time >= u + max(latency, A)` that has a price, under the C6 collar. The exit engine walks 1m bars in time order, stop first inside each. New stops and targets act from that same first bar, and the straddling bar keeps the old values. **No fill or update precedes its decision.** C7's text naming `O_(k+1)` belongs to `IDEAL` and does not apply here.
 
-| Timeframe | Entry window, primary | Entry window, sensitivity | Exit window | `dg` |
+| Timeframe | Entry window, primary | Entry window, sensitivity | Exit window | Look spacing |
 |---|---|---|---|---|
 | 5m | 5 min | 1 min | 1 min | 60 s |
 | 15m | 15 min | 5 min | 5 min | 60 s |
@@ -369,84 +475,93 @@ A `.L` backtest must measure what the live record measures. C17 sets out most of
 | 1h | 60 min | 15 min | 15 min | 60 s |
 | 4h | 240 min | 60 min | 60 min | 300 s |
 
-**State machines.** The entry gate of section 5 and the flow exit of section 6 apply as written, with these differences: C5 replaces the C17 checks, each tick is a look, the exit requires two consecutive ticks, `looks_max` is bounded only by `expiry`, and the reference is sampled every minute over 28 days. Instead of run health, an archive gap invalidates any window crossing it.
+**State machines.** The entry gate of section 5 and the flow exit of section 6 apply as written, with these differences: C5 replaces the C17 checks, the first look is at `t_k`, each later tick is a look, the exit requires two consecutive ticks, `looks_max` is bounded only by `expiry`, and the reference is sampled every minute over 28 days. Instead of run health, an archive gap invalidates any window crossing it.
 
-**Inputs.** All live-eligible features at finer windows, `F26-X1` as an event, and `T2` features.
-
-**Band depth inputs**, for `F02-X1` and `F16-X1`, use a 1 s grid. `F16-X2` and `F02-X2` use the 30 s `bookDepth` grid. Book state at a tick uses the latest state available by the tick. **A conflated bucket is never treated as individual events.**
+**Inputs.** All live-eligible features at finer windows, and `F26-X1` as an event if check D14 allows it.
 
 ## 11. Evaluation requirements
 
-For all flow variants. **Outcomes and rejection rules are in [section 3 of the matrix](STRATEGY_FEATURE_MATRIX.md#3-rejection-rules).**
+For all flow variants. **Outcomes and rejection rules are in [section 3 of the matrix](STRATEGY_FEATURE_MATRIX.md#3-rejection-rules).** Gates, placebo comparisons and variant comparisons use **`Result_B`**, under charter section 7 rule 4. `R` may be shown beside it.
 
-**Pairing.** Every gate is compared on identical setups, on the same clock, with its own baseline. A veto is judged by what it rejected.
+**The statistic.**
 
-**Placebos.** All are required. Random veto is needed because it looks good whenever costs exceed gross, as [the triage](FEATURE_TRIAGE.md#55-how-do-taker-fees-compare-with-the-effect-being-sought) shows.
+- `D` is the mean `Result_B` of kept setups minus that of blocked setups.
+- **Per setup, on a shadow `V0` trade that ignores C11,** because whether a setup is skipped depends on how an earlier one ended. Path results under C11 are reported separately.
+- **`blocked` means rules 3 and 4 of 5.3 only.** Rules 1, 2 and 5 are reported apart.
+- **Setups `V0` also rejected** are excluded from `D` and `D_C15`, and reported apart. `CF_IDEAL` is for analysis only, under C14.
+- **`CYCLE` figures** are the mean over the declared seeds, with the spread shown. "Positive under `C-BAD`" means that mean.
+- **Timing.** `VE.T` is compared with `VE.F` on identical setups, by the mean `Result_B` per setup. A setup that `WAIT` carried into `STALE_SETUP` counts as 0 for `VE.T`, against its `CF_CYCLE` under `VE.F`.
+
+**Placebos.** All are required. A random veto looks good whenever costs exceed gross, as [the triage](FEATURE_TRIAGE.md#55-how-do-taker-fees-compare-with-the-effect-being-sought) shows. Placebos are controls, logged and labelled as controls.
 
 | Placebo | How | What beating it shows |
 |---|---|---|
-| Random veto | Same rate, stratified by `hour_of_week`. `D` is near 0 in expectation | Selection beats trading less |
-| **C15 placebo** | The same recipe on the strategy's [C15](../01_strategies/00_INDEX.md#c15-placebo-control) setups: random levels at the same distance distribution, or for S03 and S10, random entry times | Flow says something about this mechanism, and is not just a general market filter |
-| Shifted flow | Same feature taken from the same hour one week earlier | Beats a seasonal pattern |
+| Random veto | Same rate, stratified by `hour_of_week`, 200 draws. `D` is near 0 in expectation | Selection beats trading less |
+| **C15 placebo** | The same recipe on the strategy's [C15](../01_strategies/00_INDEX.md#c15-placebo-control) setups, as C15 defines them per strategy. Distribution from earlier blocks. At least 100 declared draws, no redraws, compared with their mean, and the distribution shown. Under `.L`, through the same run function and run times | Flow says something about this mechanism, and is not just a general market filter |
+| Shifted flow | Same feature from the same hour one week earlier | Beats a seasonal pattern |
 | Reversed sign | Flip the expected sign | Should do worse. If not, the feature is not doing what the recipe claims |
 
-**Control for re-measuring the bar.** Report each flow feature's effect after controlling for the return over the same window, `F42-X1` and hour of week. If it vanishes, the gate is re-reading the candle.
+**Control for re-measuring the bar.** Report each flow feature's effect after controlling for the return over the same window, `F42-X1` and hour of week, by overlap band (3.2). If it vanishes, the gate is re-reading the candle.
 
 **Blind set.** Results are shown for setups where flow was valid, compared with `V0` on those **same** setups, plus separately the blind set. Otherwise a gate can look better by simply avoiding periods when data went missing, a selection effect that has nothing to do with flow.
 
-**Decomposition.** Filter value, from `VE.F`. Timing value, from `VE.T` minus `VE.F`. Exit value, from `VX`. Cycle costs from section 2. Reports always include `flow_reachable_share`, looks lost, `lateness`, `STALE_SETUP` by reason and time stop overruns.
+**Decomposition.** Filter value, from `VE.F`. Timing value, from `VE.T` against `VE.F`. Exit value, from `VX`. Cycle costs from section 2. Reports always include `flow_reachable_share`, looks lost, `lateness`, `STALE_SETUP` by reason, time stop overruns, and the capacity and `WARMUP` shares.
 
-**Costs.** At 1x, 2x and 3x, per charter section 6. Slippage measured at the run minute, in line with the note in C6 on measuring it where fills happen.
+**Costs.** At 1x, 2x and 3x, per charter section 6. Measured slippage is a report and never changes a trade list. See 8.1.
 
-**Statistical power.** To detect a difference `D` in mean net `R` between kept and rejected setups, keeping share `p`, at two-sided 5% and 80% power, with outcome standard deviation `sigma`:
+**Statistical power.** To detect a difference `D` in mean `Result_B` between kept and rejected setups, keeping share `p`, at two-sided 5% and 80% power, with outcome standard deviation `sigma`:
 
 ```text
 n >= (1.96 + 0.84)^2 * sigma^2 * (1/p + 1/(1 - p)) / D^2
 ```
 
-With `p = 0.7` and an **assumed** `sigma = 1.2 R`:
+With `p = 0.7` and an **assumed** `sigma = 1.2`, in units of the risk budget:
 
 | `D` | Setups needed |
 |---|---|
-| 0.3 R | About 600 |
-| 0.2 R | About 1,350 |
-| 0.1 R | About 5,400 |
+| 0.3 | About 600 |
+| 0.2 | About 1,350 |
+| 0.1 | About 5,400 |
 
-These are before any multiple-testing correction, and overlapping setups count for less. **[Section 4 of the matrix](STRATEGY_FEATURE_MATRIX.md#4-can-each-gate-question-be-answered) applies this to each strategy, and predicts `INCONCLUSIVE` for most.** Pooling across strategies can answer a class-level question, "does aligned flow help setups of this kind?", but not whether it helps this one. An inconclusive result must be reported as inconclusive and not as a failure or a pass.
+These are before any multiple-testing correction, and overlapping setups count for less. **[Section 4 of the matrix](STRATEGY_FEATURE_MATRIX.md#4-can-each-gate-question-be-answered) applies this to each strategy, and predicts `INCONCLUSIVE` for most.** An inconclusive result must be reported as inconclusive and not as a failure or a pass.
 
-A dense, setup-free first screen of each feature against forward returns at the same horizons has far more power for the question "is there any information?". Those runs are logged as trials too.
+**Setup-free screen.** Each first-pass feature against forward returns at 1 and 4 hours has far more power for the question "is there any information?". It reads the first training span only, and each line is a counted trial.
 
 ## 12. Invariants and required tests
 
-The first group must hold for every run, in code. The second group follows the [leak auditor's list](../../.claude/agents/leak-auditor.md).
-
-**Invariants.**
+The first group must hold for every run, in code. The second group follows the [leak auditor's list](../../.claude/agents/leak-auditor.md) and C17's required tests.
 
 | # | Invariant |
 |---|---|
-| I1 | A stop never moves away from the market |
-| I2 | Flow never extends a time stop and never extends a target |
-| I3 | `R` never changes after the fill |
-| I4 | Flow never increases a position |
-| I5 | Severity within a position never falls, and a scale-out is never reversed |
+| I1 | A stop never moves away from the market. On the same path, a `VX` stop is never looser than the `V0` stop |
+| I2 | Flow never extends a time stop or a target. On `.T`, each fill-based target term is at most as distant as its first-look value |
+| I3 | `R` and `R_dec` never change once set |
+| I4 | Flow never increases a position, and a scale-out is never reversed |
+| I5 | At most one flow action per run. No flow decision on a position with an exit pending |
 | I6 | **All-flow-invalid equivalence.** With all flow invalid, `VX.L` must produce exactly the trades of `V0.L`. With `FAIL_OPEN`, `VE.F.L` must also. With fail closed, it must produce no trades |
 | I7 | **Pass-through equivalence.** With `PASS_THROUGH`, `VE.F.L` must equal `V0.L` exactly |
-| I8 | No `.L` code path can read `T2`, and no `.L` result can be written without its parity manifest |
+| I8 | No `.L` decision input comes from `T2`. `decide` never receives a book snapshot. `.L` loads only `.L` artifacts on its own source. No `.L` result is written without its parity manifest |
 | I9 | One decision per `(setup_id, run_id)` or `(position_id, run_id)`, however many times a run is repeated |
-| I10 | Every flow input has an exchange time at or before `t_last`, and was received by `t_dec` |
-
-**Tests.**
+| I10 | Every flow input has `exchange_ts <= t_cut`, and `t_cut + A <= t_poll <= t_dec` |
+| I11 | `fit_end <= t0` on every `F19-X1` fit, with `t0 = t_cut - W`, and on each reference member's own `t0` |
 
 | Test | What it proves |
 |---|---|
-| Truncation | Removing data after `t_last` changes nothing at or before that run |
-| Future perturbation | Randomising data after `t_last` changes no decision at or before that run |
+| Truncation | Removing data after `t_cut` changes nothing in `decide`, with held state as of `t_cut` |
+| Future perturbation | Randomising data after `t_cut` changes no decision at or before that run |
+| Poll offset | Varying `run_start` and the poll offset gives the `t_cut` that C17 defines, and the backtest never holds more than the run would |
 | Shift | Delaying inputs by one run. A sharp collapse is suspicious |
-| Mirror | Swapping side and sign mirrors every decision exactly |
+| Mirror | Swapping side and sign mirrors every decision exactly. This does not test the side's meaning |
+| Next run | Changing the seeded next run time leaves the current `WAIT` output unchanged |
+| Target on `.T` | A fill made later by `WAIT` gives no fill-based target term further away than its first-look value |
+| Stop under `VX` | On the same path, with a model stop pending in the same run, the stop in force is never looser than under `V0` |
 | Late run | A late run gives the same decision whether simulated or replayed, and it never fills before `t_dec + latency` |
 | Dropped run | Stops are resolved across the gap, looks are lost, `expiry` and `A_max` do not stretch, no retroactive decision appears |
+| Capacity | A run over budget gives `DATA_GAP` in the backtest although the archive holds the trades |
+| Cache loss | A feature whose state is gone is `WARMUP` on both paths |
+| Member | Recomputing a reference member a month later gives the identical number |
+| `.R` fill | No fill or update precedes its decision |
 | Crash | A crash at each run step leaves a valid ledger, and a retry books nothing twice |
-| Sign per venue | Check D2 |
 | Coverage | A hole in the poll invalidates exactly the windows that cross it |
 | Replay | Section 9 |
 
@@ -454,27 +569,27 @@ Hand fixtures for each state transition are required before a verdict on gate G2
 
 ## 13. Worked example
 
-**Invented numbers, for checking the rules only. This is not a market result.** `VEX.L`, 1h long on BTC, in the style of S02. Recipe: `F24-X1`, `e = +1`, `tau_b = 0.6`, window 60 min. Ladder `(0.4, 0.6, 0.8)`. `latency = 500 ms`, slippage 1 bp. Setup: `C_k = 60,000`, `S0 = 59,400`, `T1 = 61,000`, `ATR_k = 300`, `t_k = 10:00`. Checks: `A_max` 90 min, chase `0.75 * ATR_k = 225`, risk up to `2.5 * ATR_k = 750`, `RR_late = 1.0`.
+**Invented numbers, for checking the rules only. This is not a market result.** `VEX.L`, 1h long on BTC/USD, in the style of S02. Recipe: `F24-X1`, `e = +1`, `tau_b = 0.6`, window 60 min. Ladder `(0.4, 0.6, 0.8)`. `latency` 500 ms, `A` 10 s, slippage 1 bp. `D_run` is taken as 180 s for the example, since S02's tier value is being re-based under C-10. Setup: `C_k = 60,000`, `S0 = 59,400`, `T1 = 61,000`, `ATR_k = 300`, `t_k = 10:00`. Checks: `A_max` 90 min, chase `0.75 * ATR_k = 225`, risk up to `2.5 * ATR_k = 750`, `RR_late = 1.0`.
 
-**Run at about 10:07.** Started at 10:09:20, so `detection_time = 10:09:20` and `lateness = 9 min 20 s`. `t_dec = 10:09:50`. Allowing 10 s, the last completed 1m bar closes at `t_last = 10:09:00`, with `P_dec = 60,040`.
+**Run nominally at 10:07, delayed 2 min 20 s.** `run_start = 10:09:20` is `detection_time`, and `lateness` is 9 min 20 s. `t_poll = 10:09:20`. `t_cut = floor_1m(10:09:10) = 10:09:00`. `P_dec = 60,040`, the close of the bar closing 10:09. `t_dec = 10:12:20`.
 
-- C17 checks: age under 10 min passes. Path passes. Chase 40 passes. Risk 640 passes. Reward `61,000 - 60,040 = 960` is at least 640, so it passes.
+- C17 checks: age 9 min passes. Path passes. Chase 40 passes. Risk 640 passes. Reward `61,000 - 60,040 = 960` is at least 640, so it passes.
 - Window `(09:09, 10:09]`. `B_60 = -0.08`. Percentile 0.46, so `A = -0.08`. `e * A = -0.08`, above `-0.6`.
-- `.F` gives `ENTER`, reason `no_block`. Size uses `abs(P_dec - S0) = 640`.
-- Fill: first 1m bar with `open_time >= 10:09:50.5` opens at 10:10:00, at 60,060. With slippage, fill is 60,066. `R = 666`.
+- `.F` gives `ENTER`, reason `no_block`. `R_dec = 640`, and size is `risk_budget / 640`. The collar is `60,040 + 150 = 60,190`.
+- Fill: the first 1m bar with `open_time >= 10:12:20.5` opens at 10:13:00, at 60,060, inside the collar. With slippage, fill is 60,066. `R = 666`.
 
 **The run at about 11:07 is dropped.** No flow look, no stop update, and the 11:00 bar goes unprocessed.
 
-**Run at about 12:07.** `detection_time = 12:08:00`. `t_dec = 12:08:30`, `t_last = 12:08:00`.
+**Run nominally at 12:07, delayed 1 min.** `run_start = 12:08:00`. `t_cut = floor_1m(12:07:50) = 12:07:00`. `t_dec = 12:11:00`.
 
-- C17 step 2: 1m bars from 10:10 to 12:08 show no touch.
-- C17 step 3: bars closing 11:00 and 12:00 are processed in order. Suppose the model's ratchet leaves the stop at 59,400.
-- First flow look: post-fill data covers more than 60 minutes. Window `(11:08, 12:08]`. Percentile of `B_60` is 0.15, so `A = -0.70`, and `C = +0.70`.
-- `C` is above `c2 = 0.6` and below `c3 = 0.8`, so the highest unused action is `SCALE_OUT`. Half closes at the open of the 12:09 bar.
+- Step 2: 1m bars up to 12:07 show no touch.
+- Step 3: bars closing 11:00 and 12:00 are processed in order. Suppose the model's ratchet leaves the stop at 59,400.
+- Step 3b, first flow look: post-fill data covers more than 60 minutes. Window `(11:07, 12:07]`. Percentile of `B_60` is 0.15, so `C = +0.70`. `C` is above `c2 = 0.6` and below `c3 = 0.8`, so the highest unused action is `SCALE_OUT`.
+- `settle`: the first 1m bar with `open_time >= 12:11:00.5` opens at 12:12:00. Bars from 12:07 to 12:12 are walked first under the stop in force. No touch, so half closes at that open, less `slip`.
 
-**Run at about 13:07.** `detection_time = 13:08:10`.
+**Run nominally at 13:07, delayed 1 min 10 s.** `run_start = 13:08:10`. `t_cut = floor_1m(13:08:00) = 13:08:00`.
 
-- C17 step 2: the 1m bar closing 12:41 touched the stop. The rest of the position closes at the stop, with `event_time = 12:41`, `detection_time = 13:08:10`, and `lateness` of 27 min 10 s.
+- Step 2: the 1m bar closing 12:41 touched the stop. The rest closes at the stop, less stop slippage, with `event_time = 12:41`, `detection_time = 13:08:10`, and `lateness` of 27 min 10 s.
 - No flow look occurs, since the position is already closed.
 
 The stop fired at 12:41, and it took until 13:08 to know. The flow reading that might have helped could not arrive any sooner than the next run. That is the cost of the cycle in one example.
@@ -485,24 +600,30 @@ Every look and every exit evaluation writes one append-only record to `decisions
 
 | Group | Fields |
 |---|---|
-| Identity | `decision_id`, `setup_id` or `position_id`, `run_id`, strategy, symbol, side, variant name, kind |
-| Clock | `knowable_time`, `event_time`, `detection_time`, `effective_from`, `lateness`, `t_dec`, `P_dec`, `t_last`, run delay after the nominal minute, `looks_used`, `looks_lost` |
+| Identity | `decision_id`, `setup_id` or `position_id`, `run_id`, strategy, symbol, side, variant name, kind, `mode`, scenario and seed in a backtest |
+| Clock | `knowable_time`, `event_time`, `detection_time`, `effective_from`, `lateness`, `t_poll`, skew, `t_cut`, `t_dec`, `P_dec`, run delay after the nominal minute, `looks_used`, `looks_lost`, trigger-bar overlap minutes |
 | Output | Decision, reason code, C14 event, and for exits: old and new stop, quantity |
-| Inputs | For each feature: value, window, percentile, vote, valid flag, reason |
-| Health | Poll source, price venue, health state per source |
-| Snapshot | Bid, ask and fill distance at the run, for the record only |
+| Inputs | For each feature: value, window, percentile, vote, valid flag, reason, and `fit_end` where it applies |
+| Health | Completeness result, and whether it passed on server time alone, state held per feature, capacity use |
 | Versions | Recipe, threshold artifact, data, code |
 
-No market data goes into git. The values above are small derived statistics. Whether publishing them is allowed under each source's terms is a separate question, already raised in [the data lifecycle document](../05_DATA_LIFECYCLE.md).
+**Book snapshot: optional, and outside `decide`.** If the permission covers it, a separate writer may fetch spread and fill distance **after** the commit, for the mismatch report only. It never reaches `decide`, it is not a source in `min(t_poll)`, and it never takes part in run health. It has no history behind it, so it cannot be backtested. It is off by default.
+
+No market data goes into git beyond what `D-21` and the data documents allow. Whether publishing these values is allowed under the source's terms is part of the written request in [the data sources document](../03_DATA_SOURCES.md).
 
 ## 15. Open items
 
 | Item | Owner | Blocks |
 |---|---|---|
-| Poll source: passes R1 to R6 from a GitHub runner, including terms. **HTTP 451 from Binance USD-M REST on my tool suggests the research favourite may be unusable live. It must not be routed around.** See [section 5.6 of the triage](FEATURE_TRIAGE.md#56-whose-flow-is-measured-and-does-that-venue-lead-or-follow) | `data-steward`, owner under `D-01` | All `.L` results, and S07 and S08 live |
-| Delay and drop distribution, `C-MEASURED` | `data-steward` | Replaces `C-LATE` |
-| `pct` and `E_W` recomputed at each run are treated as causal indicators under item 10, with thresholds as the fitted objects. Please confirm | `leak-auditor` | Section 4 |
-| The availability rule in 3.1, with a 10 s allowance | `leak-auditor` | Section 3 |
-| Flow acting at runs between 4h closes. C17 says those runs compute no model updates, and also that a gate is evaluated at runs | `strategy-architect`, `leak-auditor` | Section 6 |
-| Whether an hourly paper engine and a public channel sit within GitHub's terms, which say Actions may be used to "develop and test" and are limited to activity related to the project. See decision `D-16` | Owner | Live paper |
-| Whether the hourly schedule should ever be shortened. GitHub allows down to 5 minutes, but that would raise the burden question above, and the data center document sets hourly. A `.L` run on a shorter cycle would cost one extra trial family and would show what it might buy | Owner, under `D-04` | Nothing now |
+| **Open, not decided here:** S07 and S08 under `IDEAL` | `leak-auditor`, ruling now | Those strategies' `IDEAL` reports. Flow does not run in `IDEAL` either way |
+| **Open, not decided here:** how `decide` treats a `gap` flag resting on a later row | `leak-auditor`, ruling now | The window rule in 3.4 follows it |
+| Written permission from Kraken, not yet requested. Fallback by its status only | Owner, `D-22` | Everything on market data |
+| Source card, including what `b` and `s` mean (checks D2, D14). The written request could ask Kraken this directly | `data-steward`. Owner for the request | Every feature needing the taker's side |
+| C-10 trade feed values in 3.6, `A`, `fill_span_allowance_ms`, reachability from a runner | `data-steward` | All `.L` results |
+| `T_start` and the fold table in 8.2 | `data-steward`, `project-manager` under C-7 | First `V0` run |
+| Amend item 11 of the timing contract: an earlier test block may join the training of later blocks only | `project-manager` | Section 8.6 reads this way until then |
+| **`RT` on the approved venue.** Kraken Pro's base-tier taker fee as read on 2026-11-04 implies a round trip of 160 bps before slippage. See the triage. `D-01` stays separate | Owner, `strategy-architect` | First run |
+| C1 still says "one linear perpetual", and several strategy documents assume funding and easy shorting. Research is now spot. How shorts are simulated on spot is `UNVERIFIED` | `strategy-architect`, `project-manager` | First `V0` run on the source |
+| Whether empty minutes without proof make `DATA_GAP` common on Kraken spot (check D8) | `data-steward` | Whether `CYCLE` can run on this source at all |
+| Whether an hourly paper engine and a public channel sit within GitHub's terms. See decision `D-16` | Owner | Live paper |
+| Whether the hourly schedule should ever be shortened. GitHub allows down to 5 minutes, but that would raise the question above, and poll capacity depends on it | Owner, under `D-04` | Nothing now |
