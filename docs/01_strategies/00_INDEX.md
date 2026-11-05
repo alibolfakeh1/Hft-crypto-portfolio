@@ -122,6 +122,10 @@ strategy document may add to them and must state any exception explicitly.
 | `IDEAL-1M` | At the bar close. `A >= fill_span_allowance_ms`, compared in one unit, is asserted at the start of a run | The first 1m bar with `open_time >= t + max(latency, A)`, where `t` is the close and `A` is the allowance. The exit engine walks 1m bars | All strategies, reported beside `IDEAL` everywhere. It is the selection mode for S01 and S06 |
 | `CYCLE` | At a run, [C17](#c17-hourly-live-cycle). `A >= fill_span_allowance_ms`, compared in one unit, is asserted at the start of a run | Steps 5 and 6 of C17 | Live-eligible strategies. The only mode compared with live results |
 
+**On official 1-minute candles (`D-31`).** The 1m bars in `IDEAL-1M` are those candles, and its fill rule and 1m walk are unchanged. The assertion reads
+`A >= candle_allowance`, because `fill_span_allowance_ms` describes trade rows. `IDEAL` runs on these bars only if condition 2 of ruling 7 in the data center
+leak recheck holds. The candle boundary and knowable time are left to `leak-auditor`'s ruling and the C2 sentence that follows it.
+
 One fill model holds for a whole sample within a mode. There is no switch to finer data where coverage
 happens to exist. `latency` and `A` are declared in [C17](#c17-hourly-live-cycle). C6 and C7 are written in
 `IDEAL` terms, as are sections 1 to 13 of each document and their worked examples. Section 14 of each document
@@ -311,8 +315,9 @@ for each bar b from the fill bar onward, while quantity > 0:
   exits is a declared configuration value, and the base case uses the taker rate.
 - **G5 stress for targets.** Report two cases: a required trade-through of 2 bp, and a target that exits at the next 1m
   open after the touch, less `slip`.
-- **Slippage.** Stop slippage is a separate required configuration value, because stops fill worst during cascades.
-  Close-based and time exits pay `slip`.
+- **Slippage.** Stop slippage is a separate required configuration value, because stops fill worst during cascades. Its value,
+  `stop_slip`, is in [C16](#c16-rounding-and-arithmetic-in-examples). A long's stop exit fills at `X * (1 - stop_slip)` and a short's at
+  `X * (1 + stop_slip)`, where `X` is `S` or the gapped open. Close-based and time exits pay `slip`.
 
 ### C8. Stop ratchet and `BE+`
 
@@ -387,8 +392,10 @@ ranks) is a causal indicator with no fitted state, under timing contract item 10
 | Selected thresholds | Any grid value, such as `PR_max`, `SRV_min` and `Q_min` | Chosen on training folds under [C18](#c18-selection-purge-and-retirement), frozen for the block |
 | Declared constants | Everything else: stop and target multiples, `VR_k <= 2.0`, the `CR` band, the `Q` weights, `A_max`, chase and `RR_late` values, `m` and `H`, and `RT` and stop slippage if declared | Set before any run. A change is a new document version and a counted trial |
 
-`RT` and stop slippage must be one or the other, chosen before the first run. A value measured over a whole history and
-applied to it would let later data change `S0` for an early setup, and is forbidden.
+`RT` and stop slippage must be one or the other, chosen before the first run. Both are declared constants, with their values and basis in
+[C16](#c16-rounding-and-arithmetic-in-examples). A value measured over a whole history and applied to it would let later data change `S0` for an early setup, and is forbidden.
+Both are logged in the trial registry before the first run, meaning the first simulation of any strategy, control or placebo on any market data from any source. A run refuses
+to start without them, or with values that differ from the registry. Synthetic engineering tests do not count.
 
 **Estimation calendar.** Estimated values refit at 00:00 UTC on 1 January, 1 April, 1 July and 1 October. It is declared
 here before any run, without sight of any result, and a change is a counted trial. S09's rules for what happens across a
@@ -435,8 +442,9 @@ therefore says little, and only the difference from the placebo is informative.
 
 - A placebo level is drawn at the real level's knowable time, as a distance in `ATR` units from the close at that time.
   A placebo band also keeps the real object's width in `ATR` units.
-- The distance distribution is built only on earlier blocks, from real levels and the closes at their knowable times. The
-  first block therefore has no placebo.
+- The distance distribution is built only on earlier blocks, from real levels and the closes at their knowable times. Within the
+  first training span, calendar quarters act as blocks, so its first quarter, 2020-Q1 under the fold plan, has no level placebo, and reports say so. The
+  first test block, 2024-Q1, may draw on the whole first span.
 - The whole level set is replaced, including levels used as targets, so no real level stays in the placebo's result.
 
 **Strategies with no level (S03, S10).** Entry bars are drawn uniformly over bars passing the strategy's non-signal filters.
@@ -451,14 +459,23 @@ from 1 to 23 hours, and the whole schedule moves with it, in its [section 10](S0
 
 **All placebos.** At least 100 draws, declared in advance and reported as a distribution. Redrawing or selecting a draw is forbidden.
 The configuration and the mode are the same as the real run. Under `CYCLE`, placebo setups pass through the same run function, checks and
-run times. Comparisons use `Result_B`. Placebo runs are recorded in the trial registry as controls.
+run times. Comparisons use `Result_B`. Placebo runs are recorded in the trial registry as controls. Within the first training span, every block in this section is a
+calendar quarter. No draw, distance or share reads a date closed under the [read rule](#c18-selection-purge-and-retirement), so a closed block is not an earlier block, and a
+placebo on the locked block is part of its one global read.
 
 ### C16. Rounding and arithmetic in examples
 
 Stops and targets round to the instrument tick: a long stop or target rounds down, a short stop or target
 rounds up. Worked examples use BTC tick 0.1 and ETH tick 0.01, `fee_taker = 5 bp` and `slip = 1 bp`, so
-`RT = 12 bp`. These are **assumptions for arithmetic only**, not venue facts. Binance's fee page refers to
+`RT = 12 bp`. These are **assumptions**, not venue facts. Binance's fee page refers to
 a separate schedule that I could not open.
+
+**Declared cost constants, under `D-29` and C12.** The same `fee_taker`, `slip` and `RT` are the declared base case. Their basis is band A of the
+[cost proposal](COST_AND_INSTRUMENT_2026-11-05.md), and the fee has not been read from this venue's schedule, so it stays `UNVERIFIED`. `stop_slip = 5 bp` per stop exit, on both
+symbols. Its basis is my judgement, `UNVERIFIED`: no source I read gives a figure, and a stop is a market order that fires into the move against it, so I set it at five times the
+`slip` of a market order at a bar open. It was not measured on any market data, and a value measured on a span may not apply to that span. It is not part of `RT`, so it changes the price
+of stop exits only, and no setup, floor or trade list. The 2x and 3x reports multiply it with the fee and `slip`, to 10 bp and 15 bp. At the 48 bp floor, a stop exit costs about
+`0.33R` at 1x, against the `0.25R` of C9's round trip.
 
 Worked examples run in `IDEAL`, and hold `ATR` flat unless a table shows otherwise. Entries show `slip`, because `R` depends on it.
 Exit prices are shown before exit slippage, and results in `R` and `Result_B` are shown before fees, funding and exit slippage.
@@ -685,6 +702,13 @@ possible hold and not the actual exit, because a rule on the actual exit would m
 for one dropped run. Each training simulation's data also ends at the test block's start, and a trade still open then is removed from selection and counted.
 So the engine cannot read test data at all, even after more dropped runs than this allowance covers.
 
+**Read rule.** This section and C15 adopt section 3 of the [fold plan](../decisions/FOLD_PLAN_2026-11-05.md#3-one-rule-for-reading) (`D-30`), with its definition of a read. The first
+training span is open, and each reading is logged and counted. Test blocks stay closed until the owner opens them in writing, in calendar order, with candidates frozen first. A row, grid,
+sensitivity or constant chosen after a verdict is `EXPLORATORY` on every block read by the verdict that led to it. The locked block is read once, globally, at the final verdict, for every
+candidate frozen that day, all counted. Nothing reads it before then, including `V0`, `V0S`, placebos, G3, G7 and portfolio reports. Later quarters join only as new dated blocks. A setup whose
+`t_k + H_max` passes the last opened date is left out of that read and counted, and it comes back when the next block opens. An earlier test block joins the training of later blocks only, once
+read, under this purge. Days already read are excluded as section 4 of the plan says.
+
 | Strategy | `T_d` | `H_max` | `A_max` under `CYCLE` |
 |---|---|---|---|
 | S01 | 15m, 30m | 12 h, 24 h | Control only, 90 min |
@@ -704,6 +728,22 @@ So the engine cannot read test data at all, even after more dropped runs than th
 - For a live-eligible strategy, selection is among its configurations that can run live, under `C-LATE`, on `Result_B`, using the mean over the declared seed list in C17.
 - S01 and S06 cannot run live, so they select under `IDEAL-1M`.
 - A configuration that cannot run live is a labelled comparison report. It cannot be selected, and its runs still count as trials. This applies to S08 at 30m.
+- On the candle stage (`D-31`) no `CYCLE` run may start, so S02, S03, S04, S05, S09 and S10 cannot select. Every grid line runs and is shown, and S01 and S06 select as above.
+
+**Default line.** Each strategy shows one line first on each symbol, in the same configuration on both. It is the document's default, declared here before any outcome. It is a display
+order and not a selection, so it makes no claim to be the best line, and it changes no trial count. The `V0` against C15 reading counted for each strategy on the first span uses this line.
+A change is a new document version and a counted trial. S07 and S08 wait for bars from trades.
+
+| Strategy | `T_d` | Other grid parameters | Where the document says so |
+|---|---|---|---|
+| S01 | 15m | First touch. Full active level set | Stated as default, except the level set, which is the active set section 3 defines |
+| S02 | 1h | `acc` 3. Daily levels only | Stated as default, except the level set, where section 3 makes weekly optional |
+| S03 | 1h | `(Lf, Rt)` (5, 3). `max_bos` 2 | Stated as default |
+| S04 | 1h | `Q_min` 60. Touch limit 0 | Stated as default |
+| S05 | 1h | `RW` 48 | Stated as default |
+| S06 | 15m | `N_r` 2. Period highs and lows plus 1h swings | Stated as default, except the pools, which are the three section 3 lists |
+| S09 | 1h | `W` 8. `SRV_min` 1.0 | Stated as default, except `W`, which sections 3 and 14 use |
+| S10 | 4h | `PR_max` 0.10. `B` 12 | Stated as default |
 
 **Dropping or retiring.**
 
