@@ -34,7 +34,7 @@ something, and never as a directional signal. Whether it adds anything is unknow
 
 ## 3. Definitions
 
-**Seasonal profile: an estimated object under [C12](00_INDEX.md#c12-indicators-and-frozen-values).** At each date of the estimation calendar in C12, which is declared there before any run, on the prior 90 days of weekday data for that symbol and venue:
+**Seasonal profile: an estimated object under [C12](00_INDEX.md#c12-indicators-and-frozen-values).** At each date of the estimation calendar in C12, which is declared there before any run, on the bars that open in the 90 calendar days before that date, on Monday to Friday UTC, for that symbol and venue:
 
 ```text
 m_h     = mean log(volume in UTC hour h), for h = 0, ..., 23
@@ -44,7 +44,7 @@ h_peak  = hour with the highest m_h in the 8 hours from h_end
 T_flat  = h_end + 11
 ```
 
-These are frozen until the next calendar date, per timing contract item 10. **Across a refit:** a range uses the profile in force at its `h_s`, and a position keeps the schedule it entered with, so a refit never changes a
+These are frozen until the next calendar date, per timing contract item 10. The window matches the quarterly refit, so each profile reads about the quarter just ended, which is about 64 weekdays. The first profile is at the first calendar date with all 90 days on or after `T_start`, which is 2020-04-01 if the [fold plan](../decisions/FOLD_PLAN_2026-11-05.md)'s `T_start` holds, and no range exists before it. **Across a refit:** a range uses the profile in force at its `h_s`, and a position keeps the schedule it entered with, so a refit never changes a
 range in progress or an open trade. Hours are read by a bar's open time: hour `h` and the window `[h_s, h_end)` mean the bars that open in them, and `h_end` is the close of the last range bar. `h_peak` is written as a clock time, so
 `h_peak = 16:00` means the bar closing at 16:00 starts that schedule step. My expectation from Hansen et al. is `h_s` near 04:00 and `h_peak` near 16:00, and the example uses those with `W = 8`. Nothing in the rule depends on that expectation.
 
@@ -206,7 +206,7 @@ Result before costs: `0.5 * 1.19 + 0.5 * 1.22 = 1.21R`. `Result_B = (0.5 * 519.4
 | `W` | 6, 8 hours | How long a quiet stretch has to be. Longer means a more reliable range, but fewer hours left to trade |
 | `SRV_min` | 1.0, 1.5 | How strongly volume must exceed its seasonal norm at the break |
 
-Total: 4 configurations at `T_d = 1h`. Everything else is frozen. I dropped a 15m variant, because it could never run live and because each trial has a cost.
+Total: 4 configurations at `T_d = 1h`. Everything else is frozen. I dropped a 15m variant, because it could never run live and because each trial has a cost. The default line under [C18](00_INDEX.md#c18-selection-purge-and-retirement) is `W` 8, `SRV_min` 1.0.
 
 ## 9. BTC and ETH notes
 
@@ -248,8 +248,8 @@ Questions for `feature-integrator`. Trades are available to live runs, so trade-
 
 **Frequency (design estimate, unmeasured).** About 60 to 150 trades per year across BTC and ETH: about 260 weekdays, 2 symbols, and perhaps one day in four or five qualifying.
 
-**Cost.** Typical `R` about 60 to 120 bp, by my judgement, and the floor often binds. At the illustrative `RT = 12 bp`, about `0.10R` to `0.20R` at 1x. A gross `+0.2R` on an 80 bp stop dies at `RT = 16 bp`. The opening-range replication above is the warning:
-gross results there were about the size of the costs. Stop slippage during the volume rise will also be worse than average, and needs its own measurement.
+**Cost.** Typical `R` about 60 to 120 bp, by my judgement, and the floor often binds. At the declared `RT = 12 bp`, about `0.10R` to `0.20R` at 1x. A gross `+0.2R` on an 80 bp stop dies at `RT = 16 bp`. The opening-range replication above is the warning:
+gross results there were about the size of the costs. Stop slippage during the volume rise will also be worse than average, and needs its own measurement. A stop exit pays `stop_slip` in place of `slip`, so 16 bp in all at 1x, under [C16](00_INDEX.md#c16-rounding-and-arithmetic-in-examples).
 
 ## 14. Live on an hourly cycle
 
@@ -283,4 +283,4 @@ Using the example in 7.12, with `C_k = 67,590`, `S0 = 67,165`, `T1 = 68,121.2`, 
 - The frozen profile for live comes from the same calendar as research, in C12. A profile refresh is a logged event, and applies only to ranges that start after it. An open position keeps the schedule it entered with.
 
 **Backtest reproduction.** `CYCLE` under [C17](00_INDEX.md#c17-hourly-live-cycle), with `C-LATE` for selection. It must use the same calendar for the profile, and a dropped run around `T_flat` must carry the position past funding, exactly as live would. Report the share of hard-flat
-exits that were late, and the funding they paid. Report `STALE_SETUP` by reason.
+exits that were late, and the funding they paid. Report `STALE_SETUP` by reason. On the candle stage (`D-31`) no `CYCLE` run may start, so this selection does not run there, under [C18](00_INDEX.md#c18-selection-purge-and-retirement).

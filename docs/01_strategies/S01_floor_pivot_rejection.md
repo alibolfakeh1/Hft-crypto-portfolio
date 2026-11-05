@@ -239,7 +239,7 @@ the stop would have been taken first and no scale-out recorded.
 | Touch limit | first touch, first two | Folklore says first touch is best. Chung and Bellotti and Garzarelli et al. find more prior bounces raise the bounce rate. The two disagree, so both are declared |
 | Level set | `{P, S1, R1}` daily only, full active set | The full set adds trades and may dilute them |
 
-Total: 8 configurations. All stop and target constants are frozen and not searched.
+Total: 8 configurations. All stop and target constants are frozen and not searched. The default line under [C18](00_INDEX.md#c18-selection-purge-and-retirement) is 15m, first touch, full active level set.
 
 ## 9. BTC and ETH notes
 
@@ -289,12 +289,12 @@ Questions for `feature-integrator`. These are not feature choices.
 **Frequency (design estimate, unmeasured).** About 200 to 400 trades per year across BTC and ETH with the
 full set and first touch.
 
-**Cost.** Typical `R` is near the floor, about 50 to 60 bp. At the illustrative `RT = 12 bp`, cost is about
+**Cost.** Typical `R` is near the floor, about 50 to 60 bp. At the declared `RT = 12 bp`, cost is about
 `0.2R` to `0.25R` per trade at 1x, and `0.6R` to `0.75R` at 3x. The kill point is a gross expectancy below
 that. As a rule of thumb, the break-even `RT` equals gross expectancy in `R` times `R` in bp, so a gross
-`+0.2R` on a 55 bp stop dies at 11 bp, below the illustrative taker cost. This is the most cost-sensitive
+`+0.2R` on a 55 bp stop dies at 11 bp, below the declared `RT`. This is the most cost-sensitive
 family in the set, together with S06. If it ever earns a place, it is likely to be through flow-gated
-entry or a much better fee tier. Nothing here suggests that it does.
+entry or a much better fee tier. Nothing here suggests that it does. A stop exit pays `stop_slip` in place of `slip`, so 16 bp in all at 1x, under [C16](00_INDEX.md#c16-rounding-and-arithmetic-in-examples).
 
 ## 14. Live on an hourly cycle
 

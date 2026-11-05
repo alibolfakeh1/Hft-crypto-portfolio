@@ -297,8 +297,8 @@ Questions for `feature-integrator`. Trades are available to live runs, so trade-
 
 **Frequency (design estimate, unmeasured).** About 60 to 150 trades per year across BTC and ETH at 1h, both branches together.
 
-**Cost.** Typical `R` about 60 to 120 bp at 1h, by my judgement. At the illustrative `RT = 12 bp`, about `0.10R` to `0.20R` at 1x. A gross `+0.2R` on an 80 bp stop dies at `RT = 16 bp`. The rejection branch has the nearer
-target, which makes it more cost-sensitive than the acceptance branch. Testable history is limited by `T1`, still to be confirmed per venue.
+**Cost.** Typical `R` about 60 to 120 bp at 1h, by my judgement. At the declared `RT = 12 bp`, about `0.10R` to `0.20R` at 1x. A gross `+0.2R` on an 80 bp stop dies at `RT = 16 bp`. The rejection branch has the nearer
+target, which makes it more cost-sensitive than the acceptance branch. Testable history is limited by `T1`, still to be confirmed per venue. A stop exit pays `stop_slip` in place of `slip`, so 16 bp in all at 1x, under [C16](00_INDEX.md#c16-rounding-and-arithmetic-in-examples).
 
 ## 14. Live on an hourly cycle
 

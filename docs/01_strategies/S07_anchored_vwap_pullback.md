@@ -274,8 +274,8 @@ Questions for `feature-integrator`. Trades are available to live runs, so trade-
 
 **Frequency (design estimate, unmeasured).** About 50 to 120 trades per year across BTC and ETH.
 
-**Cost.** Typical `R` about 80 to 150 bp, by my judgement. At the illustrative `RT = 12 bp`, about `0.08R` to `0.15R` at 1x. A gross `+0.2R` on a
-100 bp stop dies at `RT = 20 bp`. Testable history is limited by `T1`, which is still to be confirmed per venue. This may be the tighter limit.
+**Cost.** Typical `R` about 80 to 150 bp, by my judgement. At the declared `RT = 12 bp`, about `0.08R` to `0.15R` at 1x. A gross `+0.2R` on a
+100 bp stop dies at `RT = 20 bp`. Testable history is limited by `T1`, which is still to be confirmed per venue. This may be the tighter limit. A stop exit pays `stop_slip` in place of `slip`, so 16 bp in all at 1x, under [C16](00_INDEX.md#c16-rounding-and-arithmetic-in-examples).
 
 ## 14. Live on an hourly cycle
 

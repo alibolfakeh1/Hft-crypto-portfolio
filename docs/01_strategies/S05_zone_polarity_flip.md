@@ -287,9 +287,9 @@ Questions for `feature-integrator`.
 
 **Frequency (design estimate, unmeasured).** About 30 to 80 trades per year across BTC and ETH at 1h.
 
-**Cost.** Typical `R` about 80 to 150 bp, by my judgement, since `R` spans the whole zone. At the illustrative `RT = 12 bp`,
+**Cost.** Typical `R` about 80 to 150 bp, by my judgement, since `R` spans the whole zone. At the declared `RT = 12 bp`,
 about `0.08R` to `0.15R` at 1x. A gross `+0.2R` on a 100 bp stop dies at `RT = 20 bp`. With so few trades the statistical
-problem comes before the cost problem: a low trial count here means the deflated Sharpe ratio will need many months of data.
+problem comes before the cost problem: a low trial count here means the deflated Sharpe ratio will need many months of data. A stop exit pays `stop_slip` in place of `slip`, so 16 bp in all at 1x, under [C16](00_INDEX.md#c16-rounding-and-arithmetic-in-examples).
 
 ## 14. Live on an hourly cycle
 
@@ -328,4 +328,4 @@ Using the example in 7.12, with `C_k = 66,440`, `S0 = 66,030`, `X = T1 = 66,900`
 
 **Backtest reproduction.** `CYCLE` under [C17](00_INDEX.md#c17-hourly-live-cycle), with `C-LATE` for selection, and the flip register
 replayed by simulated run in time order. Report the count of `STALE_SETUP` by reason, and the time between a `T1` fill and the
-Stage B stop taking effect. I expect the delay to hurt Stage A entries most, since a good retest leaves quickly. That is untested.
+Stage B stop taking effect. I expect the delay to hurt Stage A entries most, since a good retest leaves quickly. That is untested. On the candle stage (`D-31`) no `CYCLE` run may start, so this selection does not run there, under [C18](00_INDEX.md#c18-selection-purge-and-retirement).

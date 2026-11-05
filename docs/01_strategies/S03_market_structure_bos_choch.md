@@ -304,11 +304,11 @@ Questions for `feature-integrator`.
 **Frequency (design estimate, unmeasured).** About 40 to 100 trades per year across BTC and ETH at 1h, and about a
 third of that at 4h.
 
-**Cost.** Typical `R` about 150 to 250 bp at 1h, and 300 to 500 bp at 4h, by my judgement. At the illustrative
+**Cost.** Typical `R` about 150 to 250 bp at 1h, and 300 to 500 bp at 4h, by my judgement. At the declared
 `RT = 12 bp`, cost is about `0.05R` to `0.08R` at 1h and less at 4h. Fees are not what kills this. It dies on hit
 rate and on the late entry, since entering at a BOS close with the stop behind a confirmed swing often puts `T1` only
 about `1.3R` away. Funding does matter, because holding periods cross many settlements, every 8 hours on a schedule such
-as Binance's default. Report funding separately for this strategy.
+as Binance's default. Report funding separately for this strategy. A stop exit pays `stop_slip` in place of `slip`, so 16 bp in all at 1x, under [C16](00_INDEX.md#c16-rounding-and-arithmetic-in-examples).
 
 ## 14. Live on an hourly cycle
 
@@ -352,4 +352,4 @@ Using the example in 7.12, with `C_k = 66,560`, `S0 = 65,560`, `SL_last = 65,650
 processed in time order during each simulated run, and `Sigma` uses values at `t_(i+Rt)`, including `ATR` for the amplitude
 test, so the list never depends on run timing. Report counts by
 `STALE_SETUP` reason, and compare `IDEAL` and `CYCLE` on the share of exits by `CHoCH` and by stop. I expect a small cycle
-cost at 4h, and a larger one at 1h from extension rejections. That is untested.
+cost at 4h, and a larger one at 1h from extension rejections. That is untested. On the candle stage (`D-31`) no `CYCLE` run may start, so this selection does not run there, under [C18](00_INDEX.md#c18-selection-purge-and-retirement).

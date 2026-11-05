@@ -223,7 +223,7 @@ open by "reclaim lost", at about `-0.3R`.
 | `N_r` | 0, 2 | Same-bar reclaim, or allow two more bars. Practitioners disagree |
 | Pools | Period highs and lows only, plus 1h swings | Period levels are the most widely seen, and swings add more trades |
 
-Total: 8 configurations. All stop and target constants are frozen.
+Total: 8 configurations. All stop and target constants are frozen. The default line under [C18](00_INDEX.md#c18-selection-purge-and-retirement) is 15m, `N_r` 2, period highs and lows plus 1h swings.
 
 ## 9. BTC and ETH notes
 
@@ -267,10 +267,10 @@ Questions for `feature-integrator`. These hooks can only be tested in research, 
 
 **Frequency (design estimate, unmeasured).** About 100 to 250 trades per year across BTC and ETH at 15m. More at 5m.
 
-**Cost.** `R` sits near the cost floor at about 50 to 70 bp at 15m, by my judgement. At the illustrative `RT = 12 bp`, cost is
-`0.17R` to `0.25R` at 1x and `0.5R` to `0.75R` at 3x. A gross `+0.2R` on a 60 bp stop dies at `RT = 12 bp`, the assumed taker cost
+**Cost.** `R` sits near the cost floor at about 50 to 70 bp at 15m, by my judgement. At the declared `RT = 12 bp`, cost is
+`0.17R` to `0.25R` at 1x and `0.5R` to `0.75R` at 3x. A gross `+0.2R` on a 60 bp stop dies at `RT = 12 bp`, the declared value
 itself. Extra stop slippage in the events this strategy trades makes it worse. At 5m the floor binds almost always, and the
-stop no longer reflects structure at all. Together with S01, this is the most cost-exposed idea in the set.
+stop no longer reflects structure at all. Together with S01, this is the most cost-exposed idea in the set. A stop exit pays `stop_slip` in place of `slip`, so 16 bp in all at 1x, under [C16](00_INDEX.md#c16-rounding-and-arithmetic-in-examples).
 
 ## 14. Live on an hourly cycle
 

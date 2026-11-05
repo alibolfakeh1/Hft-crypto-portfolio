@@ -253,8 +253,8 @@ Questions for `feature-integrator`. Trades are available to live runs, so trade-
 
 **Frequency (design estimate, unmeasured).** About 10 to 30 trades per year across BTC and ETH at 4h, and about 40 to 100 at 1h. At 4h this is not enough for quick statistical judgement, which is the strongest reason for the 1h entry in the grid.
 
-**Cost.** Typical `R` about 150 to 300 bp at 4h, by my judgement. At the illustrative `RT = 12 bp`, about `0.04R` to `0.08R` at 1x. Fees cannot kill this at 4h. A gross `+0.1R` on a 200 bp stop only dies at `RT = 20 bp`. The killers are the base rate of false breaks and multi-day funding, which is why funding must
-be reported separately.
+**Cost.** Typical `R` about 150 to 300 bp at 4h, by my judgement. At the declared `RT = 12 bp`, about `0.04R` to `0.08R` at 1x. Fees cannot kill this at 4h. A gross `+0.1R` on a 200 bp stop only dies at `RT = 20 bp`. The killers are the base rate of false breaks and multi-day funding, which is why funding must
+be reported separately. A stop exit pays `stop_slip` in place of `slip`, so 16 bp in all at 1x, under [C16](00_INDEX.md#c16-rounding-and-arithmetic-in-examples).
 
 ## 14. Live on an hourly cycle
 
@@ -287,4 +287,4 @@ Using the example in 7.12, with `C_k = 3,198`, `S0 = 3,128`, `ATR = 28`:
 - Stops only tighten: the `P_dec` clamp in C17 can reduce a candidate, and the ratchet then keeps the old stop.
 
 **Backtest reproduction.** `CYCLE` under [C17](00_INDEX.md#c17-hourly-live-cycle), with `C-LATE` for selection. It must simulate every hourly run, including those between 4h closes, because they resolve touches. Report `STALE_SETUP` by reason. With few trades at 4h, report the spread across seeds as well as the mean: a single dropped run can change a large part of
-a small sample.
+a small sample. On the candle stage (`D-31`) no `CYCLE` run may start, so this selection does not run there, under [C18](00_INDEX.md#c18-selection-purge-and-retirement).

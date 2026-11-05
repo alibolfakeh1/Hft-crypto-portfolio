@@ -232,7 +232,7 @@ under `1R`.
 | `acc` | 2, 3 | Two closes is the shortest definition that is not a single print. Three is stricter and gives fewer trades |
 | Level set | Daily only, daily plus weekly | Weekly levels are rarer and may be better watched, which is untested |
 
-Total: 4 configurations. All stop and target constants are frozen and not searched.
+Total: 4 configurations. All stop and target constants are frozen and not searched. The default line under [C18](00_INDEX.md#c18-selection-purge-and-retirement) is `acc` 3, daily levels only.
 
 ## 9. BTC and ETH notes
 
@@ -280,10 +280,10 @@ Questions for `feature-integrator`.
 
 **Frequency (design estimate, unmeasured).** About 80 to 160 trades per year across BTC and ETH.
 
-**Cost.** Typical `R` of about 80 to 120 bp, by my judgement. At the illustrative `RT = 12 bp`, cost is about
+**Cost.** Typical `R` of about 80 to 120 bp, by my judgement. At the declared `RT = 12 bp`, cost is about
 `0.10R` to `0.15R` per trade at 1x, and `0.3R` to `0.45R` at 3x. A gross expectancy of `+0.2R` on a 100 bp stop
 breaks even at `RT = 20 bp`. It is less cost-sensitive than S01, because it waits for a 1h location and pays
-less in `R` terms. The real risk is the low hit rate typical of breakouts in ranges, not the fee.
+less in `R` terms. The real risk is the low hit rate typical of breakouts in ranges, not the fee. A stop exit pays `stop_slip` in place of `slip`, so 16 bp in all at 1x, under [C16](00_INDEX.md#c16-rounding-and-arithmetic-in-examples).
 
 ## 14. Live on an hourly cycle
 
@@ -331,4 +331,4 @@ Using the example in 7.12, with `C_k = 3,526`, `S0 = 3,497.66`, `T1 = 3,573.33` 
 **Backtest reproduction.** `CYCLE` under [C17](00_INDEX.md#c17-hourly-live-cycle), with `C-LATE` for selection.
 Report the count of `STALE_SETUP` by reason, and compare the `NO_RETEST` counterfactual under both modes. Because
 this strategy waits for a retest, I expect a modest `IDEAL` minus `CYCLE` gap, mostly from `RR_LATE` rejections
-and later invalidation fills. That expectation is untested.
+and later invalidation fills. That expectation is untested. On the candle stage (`D-31`) no `CYCLE` run may start, so this selection does not run there, under [C18](00_INDEX.md#c18-selection-purge-and-retirement).

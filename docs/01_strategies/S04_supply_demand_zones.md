@@ -331,9 +331,9 @@ Questions for `feature-integrator`.
 **Frequency (design estimate, unmeasured).** About 60 to 150 trades per year across BTC and ETH at 1h with the default
 `Q_min`, and fewer at 4h.
 
-**Cost.** Typical `R` about 60 to 120 bp at 1h by my judgement. At the illustrative `RT = 12 bp`, that is about `0.10R`
+**Cost.** Typical `R` about 60 to 120 bp at 1h by my judgement. At the declared `RT = 12 bp`, that is about `0.10R`
 to `0.20R` at 1x, and `0.3R` to `0.6R` at 3x. A gross `+0.2R` on an 80 bp stop dies at `RT = 16 bp`. The close-based
-entry costs a further part of `R` compared with a limit at `prox`, which is a price I accept for honest fills.
+entry costs a further part of `R` compared with a limit at `prox`, which is a price I accept for honest fills. A stop exit pays `stop_slip` in place of `slip`, so 16 bp in all at 1x, under [C16](00_INDEX.md#c16-rounding-and-arithmetic-in-examples).
 
 ## 14. Live on an hourly cycle
 
@@ -374,5 +374,5 @@ time order so touch counts stay correct.
 **Backtest reproduction.** `CYCLE` under [C17](00_INDEX.md#c17-hourly-live-cycle), with `C-LATE` for selection, and the zone
 register replayed by simulated run in time order. Report the count of `STALE_SETUP` by reason, and absorption exit prices
 in both modes. I expect a noticeable `IDEAL` minus `CYCLE` gap here, because good reactions leave `RR_late` behind quickly.
-That is untested. Any choice between 1h and 4h for live is a selection, made on training folds only and logged, under
+That is untested. On the candle stage (`D-31`) no `CYCLE` run may start, so this selection does not run there, under [C18](00_INDEX.md#c18-selection-purge-and-retirement). Any choice between 1h and 4h for live is a selection, made on training folds only and logged, under
 [C18](00_INDEX.md#c18-selection-purge-and-retirement).
