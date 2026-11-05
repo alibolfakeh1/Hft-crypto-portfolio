@@ -70,6 +70,8 @@ the sequence ends. `l` stays available for a new break.
 | c | `C_k > l + b_k` |
 | d | `CLV_k >= 0.50` |
 
+A sequence ends when its level's set rolls, since a bar is evaluated against the set in force at its open, so a retest on the roll bar itself still counts. If two levels retest on one bar, use the one nearest the close.
+
 **Base level.** `l_base = l` is kept for the life of the trade, even after the roll.
 
 ## 4. Knowable times
@@ -138,7 +140,7 @@ the rung's knowable time, so a close at the roll itself does not count toward a 
 
 - At `t_k`: `T1` is the nearest level at least `1.5 * (C_k - S0)` above `C_k`, including `R3` as a candidate.
   `T2` is the next level above that. If none exists, `T2 = T1 + (T1 - l_base)`.
-- At the UTC roll, at the close of the bar ending 00:00: unfilled targets are rebuilt from the new set. If `T1` is
+- At the UTC roll, at the close of the bar ending 00:00: unfilled targets are rebuilt from the new set, with `R3` among the candidates as at `t_k`. If `T1` is
   unfilled, it becomes the nearest level at least `0.5 * ATR_b` above `C_b` and at or above `fill + 1.5 * R`, and `T2`
   is the next above. If `T1` has filled, `T2` becomes the nearest level at least `0.5 * ATR_b` above `C_b`. If none
   exists, the old target stays.

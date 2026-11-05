@@ -159,7 +159,7 @@ exists, the old target stays. Targets may move in either direction. The stop is 
 
 - `k_s` scales with `VR`, as in 7.1.
 - `VR_k > 1.75` blocks new setups. Levels mean little during a volatility shock.
-- On Saturday and Sunday UTC, `T2` is dropped and the whole position exits at `T1`. Volatility and volume are
+- On Saturday and Sunday UTC, `T2` is dropped and the whole position exits at `T1`. The day is that of the bar opening next. This also applies to a position opened before the weekend, a remainder after `T1` then runs on its stop and time stop, and `T2` comes back on Monday. Volatility and volume are
   lower at weekends, especially Saturday ([Hansen et al.](https://ar5iv.labs.arxiv.org/html/2109.12142)),
   so a full rotation is less likely.
 

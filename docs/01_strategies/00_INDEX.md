@@ -98,6 +98,8 @@ Grids are pre-declared in each document and total **64 candidate configurations*
 |---|---|---|---|---|---|---|---|---|---|
 | 8 | 4 | 8 | 8 | 4 | 8 | 4 | 8 | 4 | 8 |
 
+S08's 4 configurations each run once and give two branches, which are read separately, so S08 counts 8. A run of all ten is therefore 60 runs for these 64 lines, and the count stays 64.
+
 Each symbol and each flow variant multiplies this count, and all of it goes to the trial registry. The
 stop and target parameters are deliberately **not** in the grids. They are frozen, because tuning them
 is the fastest way to overfit an exit.
@@ -119,7 +121,7 @@ strategy document may add to them and must state any exception explicitly.
 | Mode | Decision | Entry and close-based exit fill, and when an update acts | Used by |
 |---|---|---|---|
 | `IDEAL` | At the bar close, **labelled zero latency and zero allowance**. Of the volume fields it reads only the `settled_*` columns (`settled_volume`, `settled_buy_volume`, `settled_sell_volume`, `settled_quote_volume`), through the read API of data center finding DC-04, because they hold only what had printed by the close. It reads no plain volume column and no `fill_count`. A row counts in a bar's settled columns only when it was stamped at least the allowance before that bar's close, by the stamp alone. Standing (`gap`, `empty_proof`, `complete`) is read as of the read, and `knowable_time` is not in the view | The next `T_d` open. An update acts from the next `T_d` bar | All strategies, as a research measure, with S07 and S08 as their section 4 says. Never compared with live results. A source whose prices can carry an after-close print gets no `IDEAL` results, only `IDEAL-1M` and `CYCLE`, and anything in this folder that reports or compares `IDEAL` does not apply on that source. The report says `IDEAL` is not available there, and never omits it silently |
-| `IDEAL-1M` | At the bar close. `A >= fill_span_allowance_ms`, compared in one unit, is asserted at the start of a run. Standing is read as of `t + max(latency, A)` | The first 1m bar with `open_time >= t + max(latency, A)`, where `t` is the close and `A` is the allowance. The exit engine walks 1m bars | All strategies, reported beside `IDEAL` everywhere. It is the selection mode for S01 and S06 |
+| `IDEAL-1M` | At the bar close. `A >= fill_span_allowance_ms`, compared in one unit, is asserted at the start of a run. Standing is read as of `t + max(latency, A)` | The first 1m bar with `open_time >= t + max(latency, A)`, where `t` is the close and `A` is the allowance. An update acts from that same 1m bar. The exit engine walks 1m bars | All strategies, reported beside `IDEAL` everywhere. It is the selection mode for S01 and S06 |
 | `CYCLE` | At a run, [C17](#c17-hourly-live-cycle). `A >= fill_span_allowance_ms`, compared in one unit, is asserted at the start of a run | Steps 5 and 6 of C17 | Live-eligible strategies. The only mode compared with live results |
 
 **On official 1-minute candles (`D-31`).** The 1m bars in `IDEAL-1M` are those candles, and its fill rule and 1m walk are unchanged. The assertion on `IDEAL-1M` and `CYCLE` reads
@@ -166,11 +168,13 @@ as venue-independent without that retest.
   and is not this proof. A source with no sequence therefore treats every empty minute as a gap, which costs little on a liquid
   perpetual. The same test applies to the archive at gate G1. On official candles the proof comes from the row itself. A missing row is a gap. A row with zero trades is proof of an empty minute, a third kind.
   Its prices are set to null if the venue carries the last close forward, which is `UNVERIFIED`. A proof or a flag counts from its own knowable time. An empty minute unproven at `t` makes the `T_d` bar closing at `t`
-  not complete as of `t`, so no setup is created at that close, and a later proof creates nothing retroactively.
+  not complete as of `t`, so no setup is created at that close, and a later proof creates nothing retroactively. Prices, indicators and exit rules carry on across such a pending tail, because its prices
+  are known. A gap that proves real takes effect from its own knowable time.
 - **Levels and the bar that built them.** A bar is evaluated against the level set in force at its open. A new
   UTC day or week set first acts on the bar that opens at the roll, so the bar that closes at the roll is never
   tested against a level built from itself. Rules that update an open trade at the close of that roll bar are
-  unchanged: they read the new set at that close and act as any other update does.
+  unchanged: they read the new set at that close and act as any other update does. The roll is the first `T_d` close at which a newer completed UTC day or week can be read. A period that is
+  not complete gives no set and no roll, so no setup reads it and an open trade keeps its targets.
 - **Missing bars.** If a bar needed by a formula is missing, the object is not computed and no setup is created.
   Nothing is forward-filled or backfilled. See [C3](#c3-indicators) for how indicators recover.
 - **A gap during an open position in `IDEAL`.** Mark the trade `GAP_UNRESOLVED` and report it both ways: as if
@@ -187,7 +191,7 @@ of its last input bar.
 |---|---|
 | `TR_k` | `max(H_k - L_k, abs(H_k - C_(k-1)), abs(L_k - C_(k-1)))` |
 | `ATR_k` | Wilder ATR(14) on `T_d`, unless a list or rule names another timeframe. Seed with the mean of the first 14 `TR`. Then `ATR_k = (13*ATR_(k-1) + TR_k) / 14` |
-| `ATRD` | Wilder ATR(14) on UTC daily bars, last completed day only. It changes at 00:00 UTC |
+| `ATRD` | Wilder ATR(14) on UTC daily bars, last completed day only. It changes at 00:00 UTC. A daily bar holding a flagged minute is not complete, so one flagged minute restarts its 14-day seed, and S01, S06 and S09 have no setup on that symbol until then |
 | `VR_k` | `ATR_k / median(ATR_(k-N+1), ..., ATR_k)`, with `N` the number of `T_d` bars in 30 days. Undefined with fewer than `N/2` values in the window |
 | `SRV_k` | Seasonal relative volume: `V_k / median(V of the same weekly slot in each of the previous 8 weeks)`. Undefined with fewer than 4 of those slots |
 | `CLV_k` | `(C_k - L_k) / (H_k - L_k)`, or `0.5` if `H_k = L_k` |
@@ -449,13 +453,16 @@ therefore says little, and only the difference from the placebo is informative.
 
 - A placebo level is drawn at the real level's knowable time, as a distance in `ATR` units from the close at that time.
   A placebo band also keeps the real object's width in `ATR` units.
+- Distances are signed and kept by kind, and are not pooled across kinds, because pooling would change the shape of a level set for a reason other than its meaning. A kind is a named level of one period (daily `P`,
+  weekly `R1`), a pool type (`PDL`, `PWL`, swing low and their mirrors), or a zone or flip side. Objects born together, such as a pivot set or a day's `PDL` and `PDH`, draw one earlier set's whole vector of distances,
+  so the set keeps its real order and spacing. Other objects draw one distance each. Every draw is uniform, with replacement, over the earlier blocks.
 - The distance distribution is built only on earlier blocks, from real levels and the closes at their knowable times. Within the
   first training span, calendar quarters act as blocks, so its first quarter, 2020-Q1 under the fold plan, has no level placebo, and reports say so. The
   first test block, 2024-Q1, may draw on the whole first span.
 - The whole level set is replaced, including levels used as targets, so no real level stays in the placebo's result.
 
-**Strategies with no level (S03, S10).** Entry bars are drawn uniformly over bars passing the strategy's non-signal filters.
-The side is random, at the block's real long and short share, and independent of returns. That share is same-block information. It
+**Strategies with no level (S03, S10).** Entry bars are drawn uniformly, without replacement, over bars passing the strategy's non-signal filters. Each draw takes as many long and as many short entries, per block
+and symbol, as the line's real setups in that block. An entry that fails its stop or target rules is logged and not replaced, and one that meets an open position is skipped under C11. The side is random, at the block's real long and short share, and independent of returns. That share is same-block information. It
 gives the placebo the block's direction, which can only make it harder to beat, and reports say so. S03's stop uses the causal list
 as of that bar, and its targets are in its [section 10](S03_market_structure_bos_choch.md#10-regime-expectations). S10's box is the box
 as of that bar.
@@ -464,7 +471,8 @@ as of that bar.
 [section 10](S07_anchored_vwap_pullback.md#10-regime-expectations). **S09.** The window is moved by a shift drawn independently per day,
 from 1 to 23 hours, and the whole schedule moves with it, in its [section 10](S09_utc_session_range_breakout.md#10-regime-expectations).
 
-**All placebos.** At least 100 draws, declared in advance and reported as a distribution. Redrawing or selecting a draw is forbidden.
+**All placebos.** 200 draws per strategy and symbol, declared here in advance and reported as a distribution. The seed of a draw is the first 8 bytes of the SHA-256 of `C15|<strategy>|<symbol>|<line>|<draw>`, with `draw` from 1 to 200, so no seed is
+picked. Each draw reports mean `Result_B` per trade, gross and net at 1x, with its trade count, and the real line's rank among the draws is reported for both. The real line is compared only over quarters where the placebo exists, and a quarter with none is named. Redrawing or selecting a draw is forbidden.
 The configuration and the mode are the same as the real run. Under `CYCLE`, placebo setups pass through the same run function, checks and
 run times. Comparisons use `Result_B`. Placebo runs are recorded in the trial registry as controls. Within the first training span, every block in this section is a
 calendar quarter. No draw, distance or share reads a date closed under the [read rule](#c18-selection-purge-and-retirement), so a closed block is not an earlier block, and a
@@ -484,6 +492,7 @@ symbols. Its basis is my judgement, `UNVERIFIED`: no source I read gives a figur
 of stop exits only, and no setup, floor or trade list. The 2x and 3x reports multiply it with the fee and `slip`, to 10 bp and 15 bp. At the 48 bp floor, a stop exit costs about
 `0.33R` at 1x, against the `0.25R` of C9's round trip.
 
+A fill is not rounded, as C6 says. `fill`, `R` and figures built from them are shown rounded, so arithmetic on the shown figures can differ by a tick, and a stop or target is rounded from the unrounded value.
 Worked examples run in `IDEAL`, and hold `ATR` flat unless a table shows otherwise. Entries show `slip`, because `R` depends on it.
 Exit prices are shown before exit slippage, and results in `R` and `Result_B` are shown before fees, funding and exit slippage.
 

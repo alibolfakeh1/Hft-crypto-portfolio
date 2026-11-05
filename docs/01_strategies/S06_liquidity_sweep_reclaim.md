@@ -47,7 +47,7 @@ note it because it is the only outcome claim I saw, and it is unfavourable.
 |---|---|
 | `PDL` | Low of the last completed UTC day, in force from the bar that opens at the roll, so a bar cannot sweep a low it set itself |
 | `PWL` | Low of the last completed UTC week, on the same terms |
-| Swing low | In `Sigma(5, 3, 1.0)` on 1h bars with 1h `ATR`, unswept, age at most 7 days, and knowable at least 8 `T_d` bars before the sweep |
+| Swing low | In `Sigma(5, 3, 1.0)` on 1h bars with 1h `ATR`, unswept, age at most 7 days from the close of its extreme bar, and knowable at least 8 `T_d` bars before the sweep |
 
 A pool is consumed by its first sweep or by any close beyond it, logged as `consumed_at`, and gives at most one trade. Pools are a register
 under [C4](00_INDEX.md#c4-swing-pivots-and-registers), read as of the sweep. A swing pool is therefore visible while `valid_from <= t < valid_to`,
@@ -70,7 +70,7 @@ is the highest one that the close reclaimed.
 
 **Day-move filter, long.** `DayOpen - C_r <= 1.25 * ATRD`, with `ATRD` from C3.
 
-**Opposing pools, for targets.** `PDH`, `PWH` and swing highs, as the mirror of the table above.
+**Opposing pools, for targets.** `PDH`, `PWH` and swing highs, as the mirror of the table above, including the delay of 8 `T_d` bars. So a swing confirmed at a recompute is not a candidate at that recompute.
 
 **Pre-sweep high.** `PSH` is the highest high in the 12 bars before `s`.
 

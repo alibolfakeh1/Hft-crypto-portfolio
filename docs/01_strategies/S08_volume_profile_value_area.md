@@ -41,7 +41,7 @@ pages above. **I make no claim about its success rate.**
 ```text
 w     = max(tick, 0.0002 * O_day)           # bin width, using the period's first open
 bin i = [i*w, (i+1)*w)                      # every trade's quantity goes in its bin
-POC   = centre of the bin with the most volume. Tie: nearest the middle of the period's range
+POC   = centre of the bin with the most volume. Tie: nearest the middle of the period's range, then the lower bin
 ```
 
 **Value area.** Start with the `POC` bin. Repeatedly compare the volume of the next bin above and the next bin below the current area, and
@@ -166,7 +166,7 @@ T2_b = VAH - (q / K) * 0.5 * (VAH - POC)
 ```
 
 At the UTC roll, at the close of the bar ending 00:00: if the new day's `VAH` is at least `0.5 * ATR_b` above `C_b`, then `VAH`, `POC` and `T2` come from the new profile
-and `q` restarts at 0. If not, nothing changes.
+and `q` restarts at 0. `T1` stays as it was. If not, nothing changes.
 
 **Acceptance.** `T1 = VAH + 0.5 * VAW`. `T2 = VAH + 1.0 * VAW`. Once only, when `dPOC_b > VAH` and the developing profile is usable: `T2 = VAH + 1.5 * VAW`, as today's
 value has formed above yesterday's. Prior-day values stay frozen at entry for this branch.

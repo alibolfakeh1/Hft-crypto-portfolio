@@ -65,8 +65,8 @@ h    = prox - dist                                             # require 0.1*ATR
 
 **Arrival, demand (DBR).** `O_(base_start-3) - C_(base_start-1) >= 1.0 * ATR_base`. Price came down into the base.
 
-**Search order at each close `e`.** Try departure length 1, then 2, then 3, and take the first that satisfies the
-conditions. Then take the longest valid base ending just before it. If a zone with the same `base_end` already exists,
+**Search order at each close `e`.** Try departure length 1, then 2, then 3, each tested against the longest valid base ending just before it, and take the first that satisfies the
+conditions. If a zone with the same `base_end` already exists,
 do nothing. Supply zones (RBD) are the exact mirror, with `prox = min over base of min(O_i, C_i)` and
 `dist = max(H ...)`.
 
@@ -128,6 +128,8 @@ in the register. This rule applies among entry zones only. Stack zones are a sep
 
 **Short.** The exact mirror at a supply zone.
 
+If two zones qualify on one bar, use the one with the higher `Q_k`, and the older on a tie.
+
 | Setup field | Value |
 |---|---|
 | `side` | Long or short |
@@ -176,7 +178,7 @@ than 2 touches, and `HHz`, the highest high between the zone's birth and `t_k`.
 **Recompute** at each close, for the next unfilled target `T`:
 
 1. If a new supply zone is born with `prox_new` between `C_b + 0.5 * ATR_b` and `T`, then `T = prox_new`.
-2. If the zone that `T` came from is broken upward, `T` becomes the next candidate above `C_b + 0.5 * ATR_b`.
+2. If the zone that `T` came from is broken upward, `T` becomes the next candidate above `C_b + 0.5 * ATR_b`. If there is none, `T` stays.
 
 ### 7.4 Scale-out
 

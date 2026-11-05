@@ -78,7 +78,7 @@ RH = max(H)    RL = min(L)    RW = RH - RL    RM = (RH + RL) / 2
 
 **Short.** The exact mirror, with `C_k < RL - 0.10 * ATR_k` and `O_k - C_k >= 0.5 * (H_k - L_k)`.
 
-One trade per day per symbol, on whichever side breaks first. A later break on the other side is logged and not traded.
+One trade per day per symbol, on whichever side breaks first. A later break on the other side is logged and not traded. The first close meeting the break conditions spends the day's break, even if the setup then fails a later test such as `VR`.
 
 | Setup field | Value |
 |---|---|
@@ -182,13 +182,13 @@ Invented numbers, for checking arithmetic only. BTC, `T_d = 1h`, `ATR = 260`, `V
 - `S_struct = 67,230 - 65 = 67,165`. `R_min = max(260, 324.4)`. `D = 425`. So `S0 = 67,165`.
 - `T1 = max(67,980, 68,121.25) = 68,121.2`. `T2 = max(68,480, 68,652.5) = 68,652.5`.
 - `R_dec = 425`. The collar is 67,720, and the next open of 67,595 is inside it.
-- So `fill = 67,601.8`, `R = 436.8`, `fill + 1R = 68,038.6`, `BE+ = 67,682.9`.
+- So `fill = 67,601.8`, `R = 436.8`, `fill + 1R = 68,038.6`, `BE+ = 67,682.8`.
 
 | `n` | Close | O | H | L | C | Event at this close | Stop after close | Next target |
 |---|---|---|---|---|---|---|---|---|
 | 1 | 15:00 | 67,595 | 67,760 | 67,540 | 67,720 | | 67,165.0 | `T1` 68,121.2 |
 | 2 | 16:00 | 67,720 | 67,930 | 67,680 | 67,890 | Volume check passes. At `h_peak`, `mean_SRV = 1.7`: `T2` raised to 68,980. `k` becomes 2.0 | 67,165.0 | `T1` 68,121.2 |
-| 3 | 17:00 | 67,890 | 68,090 | 67,850 | 68,060 | `C >= fill + 1R`: `BE+`. Chandelier `68,090 - 520` is lower | 67,682.9 | `T1` 68,121.2 |
+| 3 | 17:00 | 67,890 | 68,090 | 67,850 | 68,060 | `C >= fill + 1R`: `BE+`. Chandelier `68,090 - 520` is lower | 67,682.8 | `T1` 68,121.2 |
 | 4 | 18:00 | 68,060 | 68,210 | 68,020 | 68,180 | `H > T1`: 50% out at 68,121.2 (`+1.19R`). Chandelier `68,210 - 520` | 67,690.0 | `T2` 68,980 |
 | 5 | 19:00 | 68,180 | 68,340 | 68,140 | 68,310 | Chandelier | 67,820.0 | `T2` 68,980 |
 | 6 | 20:00 | 68,310 | 68,420 | 68,250 | 68,390 | `k` becomes 1.25. Chandelier `68,420 - 325`. `T2 = 68,420 + 260` | 68,095.0 | `T2` 68,680 |

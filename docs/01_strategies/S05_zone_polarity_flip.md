@@ -58,13 +58,13 @@ score. Written for the long case, which uses a supply zone with `prox` as its lo
 top    = dist                  # upper edge of the old supply zone
 bottom = prox                  # lower edge
 mid    = (top + bottom) / 2
-X      = highest high from k_b until the retest, updated at each close
+X      = highest high from k_b through the trigger, updated at each close
 ```
 
 **Travel.** `X - top >= 1.0 * ATR`, needed before a retest can count.
 
 **Retest window.** `RW` bars after `k_b` (default 48). The first bar after travel with `L <= top` opens the retest. A trigger
-may occur on that bar or on the next 2 bars.
+may occur on that bar or on the next 2 bars. After those 3 bars, no trade comes from that flip.
 
 **Flip death.** Any close below `bottom - 0.25 * ATR`, any close below `mid` during the retest, or the end of the window.
 This is logged as `dead_at`, and during a re-seed its `ATR` is the last defined value, under
@@ -107,7 +107,7 @@ after that.
 | `targets` | `T1`, `T2` |
 | `expiry` | 4 bars after `t_k` |
 
-One trade per flip.
+One trade per flip. If two flips trigger on one bar, use the one whose `top` is nearest the close.
 
 ## 6. Entry trigger for `V0`
 

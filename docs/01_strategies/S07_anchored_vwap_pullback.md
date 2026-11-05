@@ -42,7 +42,7 @@ charts suggest.
 **Anchors.**
 
 - **Major list:** `Sigma(10, 5, 2.0)` on `T_d`. For a long, the anchor at `t_k` is the latest swing low in this list as of `t_k`,
-  while no close has been below its price since the extreme, and its age is at most 21 days. Lists are read as of a time, under
+  while no close has been below its price since the extreme, and its age, from the close of its extreme bar, is at most 21 days. Lists are read as of a time, under
   [C4](00_INDEX.md#c4-swing-pivots-and-registers), so a swing replaced later is still the anchor for every read before its `valid_to`.
 - **Entry anchor.** At entry, the anchor in use is frozen by id as `A0`. A later major swing replacing it in the list does not move
   `A0`, its `sigma0`, the targets or the invalidation line.

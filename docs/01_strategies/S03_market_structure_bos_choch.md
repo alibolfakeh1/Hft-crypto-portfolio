@@ -150,7 +150,7 @@ Candidates at `t_k`: the measured move `MM = SH.price + 1.618 * Leg`, and the ne
 - `T2 = SH.price + 2.618 * Leg`.
 
 **Recompute** at each `BOS_UP` close after entry, using the new `SH` and `Leg`. The threshold for `T1`, if unfilled,
-becomes `fill + 1.25 * R`. `T2` is never set below `C_b + 0.5 * ATR_b`. Targets may move in either direction. The
+becomes `fill + 1.25 * R`, and if no candidate clears it, `T1` stays as it was. `T2` is never set below `C_b + 0.5 * ATR_b`. Targets may move in either direction. The
 Fibonacci ratios have no evidential standing. They are only pre-declared distances in units of the last leg.
 
 ### 7.4 Scale-out
