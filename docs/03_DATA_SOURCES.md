@@ -8,6 +8,11 @@ silence is not read as permission.
 
 Decision `D-17` makes possible commercial use the deciding scenario.
 
+> **Update, 2026-11-05.** The owner has ruled Kraken out (`D-23`), so the recommendation below is kept only as the record
+> of 2026-11-04. The next source is open (`D-24`). The facts about other sources stand. One addition: Tardis's terms say
+> that agreeing to them also means agreeing to the Buyer Terms of Paddle, its reseller for paid subscriptions. Those
+> Buyer Terms were not read: `UNVERIFIED`.
+
 ## Recommendation
 
 **No free source clearly allows possible commercial use today.** Each free venue read either bars it, requires a

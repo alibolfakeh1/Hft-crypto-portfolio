@@ -1,7 +1,7 @@
 # Roadmap
 
 Maintained by `project-manager`. A phase starts only when the gate it depends on has a verdict. There are no
-dates yet, because the reference venue (`D-01`) is still open and the research source depends on a written permission (`D-22`).
+dates yet, because the reference venue (`D-01`) and the research and live sources (`D-24`) are still open.
 
 | Phase | Deliverable | Lead | Reviewers | Gate | Status |
 |---|---|---|---|---|---|
@@ -41,10 +41,10 @@ one is approved.
   `docs/reviews/leak/strategies_recheck_2026-11-04.md` fall due before the first run on market data.
 - **Feature documents:** leak audit `FAIL`. They must be corrected to match the final hourly cycle and the approved source,
   and audited again, before any gate or flow exit is coded. With the data path chosen (`D-22`), `feature-integrator` is correcting them now.
-- **Research data path:** chosen by the owner, `D-22`: Kraken spot if it gives written permission, with Bitstamp as the
-  fallback. No request has been recorded as sent and no source is approved, so all sources stay disabled. The first run on
-  market data waits for a written yes. A pipeline test on Tardis free first-day-of-month files can run once the data
-  center recheck passes.
+- **Research data path:** the owner has ruled Kraken out (`D-23`), so the source is open again (`D-24`). No source is
+  approved and all sources stay disabled. The hourly poll has no source. A pipeline test on Tardis free first-day-of-month
+  files can run once the data center recheck passes (`D-22`). The feature documents assumed Kraken, so their
+  source-specific parts wait for `D-24`.
 - **Network contact:** test runs reached a Bybit host by mistake and received no data. See `D-19`.
 - **Results:** no strategy has been coded or tested, so there are no strategy results of any kind.
 
