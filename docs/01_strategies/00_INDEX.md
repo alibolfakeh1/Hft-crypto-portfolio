@@ -118,9 +118,9 @@ strategy document may add to them and must state any exception explicitly.
 
 | Mode | Decision | Entry and close-based exit fill, and when an update acts | Used by |
 |---|---|---|---|
-| `IDEAL` | At the bar close, **labelled zero latency and zero allowance** | The next `T_d` open. An update acts from the next `T_d` bar | All strategies, as a research measure. Never compared with live results |
-| `IDEAL-1M` | At the bar close | The first 1m bar with `open_time >= t + max(latency, A)`, where `t` is the close and `A` is the allowance. The exit engine walks 1m bars | All strategies, reported beside `IDEAL` everywhere. It is the selection mode for S01 and S06 |
-| `CYCLE` | At a run, [C17](#c17-hourly-live-cycle) | Steps 5 and 6 of C17 | Live-eligible strategies. The only mode compared with live results |
+| `IDEAL` | At the bar close, **labelled zero latency and zero allowance**. Of the volume fields it reads only the `settled_*` columns (`settled_volume`, `settled_buy_volume`, `settled_sell_volume`, `settled_quote_volume`), through the read API of data center finding DC-04, because they hold only what had printed by the close. It reads no plain volume column and no `fill_count` | The next `T_d` open. An update acts from the next `T_d` bar | All strategies, as a research measure. Never compared with live results. A source whose prices can carry an after-close print gets no `IDEAL` results, only `IDEAL-1M` and `CYCLE`, and anything in this folder that reports or compares `IDEAL` does not apply on that source |
+| `IDEAL-1M` | At the bar close. `A >= fill_span_allowance_ms`, compared in one unit, is asserted at the start of a run | The first 1m bar with `open_time >= t + max(latency, A)`, where `t` is the close and `A` is the allowance. The exit engine walks 1m bars | All strategies, reported beside `IDEAL` everywhere. It is the selection mode for S01 and S06 |
+| `CYCLE` | At a run, [C17](#c17-hourly-live-cycle). `A >= fill_span_allowance_ms`, compared in one unit, is asserted at the start of a run | Steps 5 and 6 of C17 | Live-eligible strategies. The only mode compared with live results |
 
 One fill model holds for a whole sample within a mode. There is no switch to finer data where coverage
 happens to exist. `latency` and `A` are declared in [C17](#c17-hourly-live-cycle). C6 and C7 are written in
@@ -136,13 +136,16 @@ as venue-independent without that retest.
 
 ### C2. Bars and calendar
 
-- A bar covers `(open_time, close_time]` and is knowable at `close_time`. Bar `k` has `O_k, H_k, L_k,
-  C_k, V_k` and close time `t_k`.
+- A bar covers `(open_time, close_time]` and is knowable at `close_time`. A bar built from rows with one stamp over an
+  interval is knowable at its close plus the source's declared span. The span is `fill_span_allowance_ms`, `UNVERIFIED` until
+  measured on the approved source. Wherever this folder says a bar, or a value built from one, is knowable at a close, that
+  later time holds on such a source, and `IDEAL` reads such a bar only as the [mode table](#5-common-conventions) allows.
+  Bar `k` has `O_k, H_k, L_k, C_k, V_k` and close time `t_k`.
 - Bars sit on a fixed UTC grid. A 1h bar closes on the hour, a 4h bar at 00, 04, ..., 20 UTC.
 - A UTC day is `(00:00, 24:00]`. A UTC week runs from Monday 00:00 to the next Monday 00:00.
 - `T_d` is the strategy's decision timeframe. `n` counts bars since entry, and the fill bar is `n = 1`.
 - **Bar source.** Canonical bars are built from trades under decision `D-12`. In every mode and for both tiers, 1m bars
-  come from trades and `T_d` bars are aggregated from those 1m bars, so `IDEAL` and `CYCLE` read the same bars. In research
+  come from trades and `T_d` bars are aggregated from those 1m bars, so `IDEAL` and `CYCLE` read the same bars, apart from the volume fields in the mode table. In research
   the trades come from the archive. On the live path they come from the hourly poll of the same venue, and the same code
   builds the bars. This trade feed is the one candle source of a tier `T0` strategy. Official venue bars are only a
   reconciliation check at gate G1.
@@ -183,8 +186,12 @@ of its last input bar.
 **Warm-up and recovery.**
 
 - Recursive values warm up from a canonical start date, declared in configuration, and carry their state forward.
-  A live run keeps that state, and a rebuild after a cache miss replays from the canonical start, so live and
-  backtest values match exactly.
+  A live run keeps that state, and a rebuild after a cache miss replays from the canonical start. Live and backtest values
+  match exactly only when no trade arrived late or went missing and both paths deliver rows of one shape. A late trade enters
+  the rebuilt bar and every recursive value after it, though the live run that processed that bar never saw it. A polled 1m
+  row therefore carries `emission`: `first` when a run emitted it as new, and `rebuild` when it came from a run catching up
+  after a lost cache, which cannot show what an earlier run saw. A [gate G8 replay](#c17-hourly-live-cycle) never reads a
+  `rebuild` row.
 - After a gap in a timeframe's bars, `ATR` on that timeframe is undefined until 14 complete bars have followed the
   gap, and it is then re-seeded with the mean of those 14 `TR`.
 - Any condition using an undefined value fails, so no setup is created. At a close where an open position's stop or
@@ -499,9 +506,9 @@ committed state from the previous run. It sees no book, so no book feature can g
 
 | Constant | Value | Note |
 |---|---|---|
-| Nominal start | Minute 7 of each hour | Avoids the top of the hour |
+| Nominal start | Minute 7 of each hour | Avoids the top of the hour. Settled at 7 for leak audit finding DC-07, and the poll's cron and `nominal_minute` in configuration state the same minute. `GATE_SPEC.md` computes its look counts from it. GitHub publishes no delay by minute, so whether top-of-the-hour load still reaches minute 7 is `UNVERIFIED` until `C-MEASURED` |
 | `latency` | 500 ms | Time from commit to the first possible fill or update |
-| `A` | 10 s, `UNVERIFIED` | Time for a closed bar or a trade to become readable. To be measured later from a GitHub runner |
+| `A` | 10 s, `UNVERIFIED` | Time for a closed bar or a trade to become readable. To be measured later from a GitHub runner. Asserted against `fill_span_allowance_ms` as the [mode table](#5-common-conventions) says |
 | `D_run` | 60 s for tier `T0`, 180 s for tier `T1` | Declared run duration, used in backtests in place of a real commit time. Both tiers now fetch the same trades, so the `T0` value has lost its basis. C-10 re-bases it on that same fetch. Before the first run, that is not a counted change |
 | Fetch offset | 0 s for the symbol's trade feed, until C-10 declares it. Other sources are declared in `GATE_SPEC.md` | In backtests, `t_poll[source] = run_start + its offset` |
 | Fill wait | 2 minutes | Longest wait in step 5 |
@@ -651,7 +658,7 @@ The entry then goes out under the [C6](#c6-entry-fill-r-and-size) collar, around
 These delay and outage values are my assumptions and are not GitHub figures. The seed count and the seed list are declared in configuration before the
 first run, with at least 5 seeds for each random scenario. A change to them is a counted trial. Report the spread across seeds. Selecting a seed is forbidden.
 
-6. For gate G8, replay the live period with the **actual** run timestamps. The trade list must match the ledger exactly, and each mismatch goes in
+6. For gate G8, replay the live period with the **actual** run timestamps and the as-seen inputs in `decisions/`, never rebuilt bars. The trade list must match the ledger exactly, and each mismatch goes in
    the paper versus simulation report.
 7. Report the `IDEAL` minus `CYCLE` difference in `Result_B` per trade as the cost of the cycle, and `IDEAL-1M` beside both. `R` may be shown too.
 

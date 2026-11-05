@@ -19,7 +19,7 @@ from a venue stays under the venue's own terms (Tardis clause 9.7).
 |---|---|
 | Primary research source | Kraken spot, BTC/USD and ETH/USD: Kraken's own free trade and candle files, then REST catch-up |
 | Hourly live source | Kraken spot, public `Trades` REST endpoint with `since`. Same venue as research |
-| Condition | Eligibility under Kraken's terms is for the owner to confirm first. Then written permission from Kraken (marketdata@kraken.com) **before** any download or poll. It should name: private research, a public report of derived statistics, a public channel of paper positions, those for money, real trading using derived results, and hourly automated polling from a hosted runner |
+| Condition | Eligibility under Kraken's terms is for the owner to confirm first. Then written permission from Kraken (marketdata@kraken.com) **before** any download or poll. It should name: private research, a public report of derived statistics, a public channel of paper positions, those for money, real trading using derived results, hourly automated polling from a hosted runner, keeping polled trades in a GitHub Actions cache, and publishing the as-seen bar values behind each paper decision in this public repository |
 | Fallback | Bitstamp for both, under its commercial Data License Agreement (partners@bitstamp.net), with history bought from Tardis. Send Bitstamp the same request at the same time. Suggested rule: no written yes from Kraken in 30 days means moving to the fallback |
 | Until a reply arrives | Pipeline work only, on Tardis free first-day-of-month CSV files, which are licensed by clause 9.4. This needs the owner's agreement, because `D-17` holds data downloads. Not enough days for a backtest |
 

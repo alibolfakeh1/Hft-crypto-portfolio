@@ -26,7 +26,8 @@ Hourly live poll ───┘                                                   
 ```
 
 - **Historical path:** daily archive files, used for backtests and reports.
-- **Live path:** recent trades polled once an hour from public REST sources, used for live paper positions.
+- **Live path:** recent trades polled once an hour from public REST sources, used for live paper positions. They go
+  straight to the curated zone, as `trades_live`, with no raw copy.
 - **One codebase.** Bars and features are built by the same code on both paths. Each day, bars built live are
   reconciled against bars built from that day's archive, and any difference is reported.
 
@@ -35,7 +36,7 @@ Hourly live poll ───┘                                                   
 ```text
 DATA_ROOT/
   raw/archive/<venue>/<dataset>/<symbol>/date=YYYY-MM-DD/    files exactly as delivered, with checksums
-  raw/live/<venue>/<channel>/<symbol>/date=YYYY-MM-DD/       polled live data with receive time
+  raw/live/<venue>/<channel>/<symbol>/date=YYYY-MM-DD/       live recordings. Not written under D-15
   curated/<dataset>/venue=<v>/symbol=<s>/month=YYYY-MM/      clean Parquet with one schema per dataset
   features/<feature_id>/<version>/symbol=<s>/month=YYYY-MM/  computed features, versioned
   results/runs/<run_id>/                                     backtest and report outputs
@@ -49,11 +50,12 @@ DATA_ROOT/
 | Zone | Class | Rule |
 |---|---|---|
 | `raw/archive` | `RE-DOWNLOADABLE` | Never edited. Deleted by policy once curated data passes its checks |
-| `raw/live` | `RE-DOWNLOADABLE` for a limited time | Never edited. Deleted once curated, since the source keeps recent history. A gap longer than that history is permanent |
+| `raw/live` | `IRREPLACEABLE` | Never edited. Not written while the system runs on GitHub only (`D-15`), because it would share the fate of the poll's cache. An always-on machine would record here, under the `T3` row of the lifecycle document |
 | `curated` | `DERIVED` | Rebuilt rather than patched |
+| `curated/trades_live`, `curated/bars_*_live` | `IRREPLACEABLE` | Polled trades with their receive times, and bars as first emitted. Never deleted automatically and never patched. A rebuild after a lost cache gets new receive times and is marked `rebuild` |
 | `features` | `DERIVED` | A changed definition means a new version, never an overwrite |
 | `ledger`, `decisions` | `IRREPLACEABLE` | Kept forever, with an off-site copy |
-| `quarantine` | Depends on its source | Reviewed by `data-steward`. Never used for research |
+| `quarantine` | Depends on its source. On GitHub only archive files reach it, so `RE-DOWNLOADABLE` | Reviewed by `data-steward` from its published record. On GitHub the file itself leaves with the runner. Never used for research |
 
 ## 4. Rules learned from the first real data
 
@@ -90,13 +92,17 @@ By the owner's decision (`D-15`), the whole system runs on GitHub, with no serve
 |---|---|
 | Daily historical pipeline | Scheduled Actions job, with a time budget of about 60 minutes. Backfill continues across runs |
 | Hourly live cycle | Scheduled Actions job, short, with no overlapping runs |
-| `raw` zone | The runner's disk, for one job only. The exchange archives are the real raw store |
-| `curated`, `features`, `catalog` | Actions cache, with a budget of 8 GB against the default 10 GB limit. If lost, catch-up rebuilds it from the archives |
+| `raw` and `quarantine` zones | The runner's disk, for one job only. The exchange archives are the real raw store. A record of each quarantined file goes in the run log |
+| `curated`, `features`, `catalog` | Actions cache, with a budget of 4 GB against the default 10 GB limit. If lost, catch-up rebuilds it from the archives |
+| Polled trades and bars, and the poll's own catalog | A separate Actions cache, with a budget of 1 GB. If lost, the poll fetches the trades again and marks its bars `rebuild`. First receive times and first-emitted bars are then gone for good, and the published run log keeps what it holds of their hashes |
 | `ledger`, `decisions`, status, run log | The `results` branch in git. Small, append-only and public |
 | State between hourly runs: recent bars, running VWAP totals, profile bins | Actions cache, not git, because it is derived market data. A run rebuilds it deterministically after a cache miss, or logs `DATA_GAP` |
 | Report | GitHub Pages |
 | Tests and code checks | Actions |
 | Alerts | A separate watchdog workflow, through Telegram |
+
+Each save makes a new copy before the old one is pruned, so two copies of each cache can exist at once. With both
+budgets full that is 10 GB, the whole limit, with no margin. These budgets stand until measured sizes replace them.
 
 ### What running only on GitHub gives up
 
@@ -162,8 +168,10 @@ failure does not go unnoticed.
 | GitHub disables a schedule after 60 days without activity (public repositories) | Scheduled runs stop | Regular result commits should keep the repository active. To be confirmed in practice |
 | Polling source unavailable | Gap recorded | The next run catches up from the source's recent history. A longer gap is permanent, and affected windows are marked invalid |
 | Actions cache lost or evicted | Curated data is missing | Catch-up rebuilds it from the archives. The report shows partial coverage until then |
+| The poll's cache lost or evicted | First receive times and first-emitted bars are gone for good, with any run log lines not yet published | The poll fetches the trades again and logs `cache_lost`. Its bars are marked `rebuild`, and replays never read them as what a run saw. Replays read `decisions/` |
 | GitHub Actions outage | Everything waits | Catch-up on return. An `OUTAGE` event goes into the ledger and the channel is told. Open positions are reassessed at the first valid price |
-| Cache over budget | Oldest entries are pruned | The newest copy always stays |
+| Cache over budget | New backfills stop at 80% and ingest holds its work at 95%. The poll keeps running. Nothing in the budget is deleted automatically yet | The owner is alerted and decides |
+| Total cache use over GitHub's limit | GitHub chooses what to evict, and it may be the poll's cache | Treated as a lost cache. Pruning superseded copies after each save is what keeps the total down |
 | GitHub restricts the jobs | Everything stops | The code is portable and the ledger is in git, so the system can move |
 | Exchange changes a format | Validation fails, data is quarantined | Alert. Fix the adapter, then rebuild |
 
@@ -172,7 +180,8 @@ failure does not go unnoticed.
 `data-steward` owns the policy, the deletion code and the daily review. Routine deletion itself is done by a reviewed
 scheduled job, because it has to run reliably with nobody present. The job runs every deletion through the protocol
 in the lifecycle document. Anything outside its rules, such as irreplaceable data at a high watermark, goes to the
-agent and then to the owner.
+agent and then to the owner. For now the job only plans, because no rule is reviewed yet. See
+[the data lifecycle rulings](reviews/data/data_center_rulings_2026-11-04.md).
 
 ## 8. Sizing
 

@@ -1,7 +1,7 @@
 # Roadmap
 
 Maintained by `project-manager`. A phase starts only when the gate it depends on has a verdict. There are no
-dates yet, because the server and the reference venue are still open decisions.
+dates yet, because the reference venue (`D-01`) and the research data path (`D-20`) are still open decisions.
 
 | Phase | Deliverable | Lead | Reviewers | Gate | Status |
 |---|---|---|---|---|---|
@@ -27,11 +27,40 @@ dates yet, because the server and the reference venue are still open decisions.
 
 ## Current status
 
-Updated 2026-11-04. The data center is being built, and all data sources are disabled until one is approved.
+Updated 2026-11-04. The first data center build is finished and has not passed review. Its code review and its leak
+audit both returned `FAIL`. The fixes are in commit `dafe3f2`, and `python-reviewer` and `leak-auditor` are rechecking
+them now. No verdict has changed, so both stand at `FAIL` until the recheck reports. All data sources are disabled until
+one is approved.
 
+- **Data center reviews:** `docs/reviews/code/data_center_2026-11-04.md` and `docs/reviews/leak/data_center_2026-11-04.md`.
+  The developer's answer to each finding is in `docs/reviews/code/data_center_fixes_2026-11-04.md`. That file is the
+  writer's account, and no reviewer has confirmed it yet.
 - **Strategy documents:** leak audit `PASS WITH CONDITIONS`, after fixes and three rechecks. Their text conditions are
-  closed, so the run logic may be coded. Conditions C-3, C-4, C-5, C-7 and C-10 in
+  closed. Coding the run logic now waits for the first two rows of the table below, because the data center audit holds
+  back strategy, feature and `decide` code until they are met. Conditions C-3, C-4, C-5, C-7 and C-10 in
   `docs/reviews/leak/strategies_recheck_2026-11-04.md` fall due before the first run on market data.
 - **Feature documents:** leak audit `FAIL`. They must be corrected to match the final hourly cycle and the approved source,
-  and audited again, before any gate or flow exit is coded.
+  and audited again, before any gate or flow exit is coded. The corrections wait for the research data path, `D-20`.
+- **Research data path:** waiting for the owner, `D-20`. It blocks the first run on market data.
+- **Network contact:** test runs reached a Bybit host by mistake and received no data. See `D-19`.
 - **Results:** no strategy has been coded or tested, so there are no strategy results of any kind.
+
+### Conditions from the data center leak audit
+
+From section 5 of `docs/reviews/leak/data_center_2026-11-04.md`. "Answered" means the developer reports a change in
+`dafe3f2`. It does not mean the condition is met, which only the recheck can say.
+
+| Falls due | Condition | Owner | State |
+|---|---|---|---|
+| Before any strategy, feature or `decide` code | DC-01, DC-02, DC-04, DC-05, DC-07, DC-11 and DC-12 in code | `developer` | Answered, recheck running. Parts of DC-01, DC-04 and DC-07 wait for `decide` and `settle`, which do not exist yet |
+| Before any strategy, feature or `decide` code | DC-03: the charter and C2 text, with its configuration keys and columns | `project-manager`, `strategy-architect`, `developer` | Charter sentence added in section 3 item 1. C2 sentence with `strategy-architect`. Keys and columns answered, recheck running |
+| Before a source is enabled | DC-06 and DC-08 | `developer` | Answered, recheck running |
+| Before a source is enabled | The row-shape check of ruling 2 on that source, and `continuity` declared | `data-steward` | Pending, because no source is approved (`D-20`). The configuration holds first values for `stamp_kind`, `fill_span_allowance_ms` and `continuity`. All are `UNVERIFIED` on a real feed |
+| Before the first `V0` run | The window `boundary_window_ms` frozen under C12 | `project-manager` | **Pending. It cannot be frozen until a source is approved (`D-20`), and no value is chosen.** The value now in `configs/pipeline.toml` is a placeholder and does not meet this condition. Under ruling 7 the window comes from data outside any test block, so the fold plan (C-7) comes first, and a later change is a counted trial. Ruling 7 also asks that it share one source-level constant with the DC-03 span allowance, and says only a recheck remains once the DC-08 fix stands. `leak-auditor` rules on that |
+| Before the first `V0` run | C-5 extended to the tolerances | `project-manager` | Pending. No frozen commit is recorded. It comes after the window is frozen, and it also covers the configured start dates and `poll.start_date`, under ruling 7. `max_quiet_s`, which the fixes added after the audit, is treated as one of the tolerances. C-7's fold plan also records which dates were looked at during the build |
+| Before gate G1 on the chosen source | DC-09 and DC-13 | `developer`, `data-steward` | Answered, recheck running. The DC-13 allowances are placeholders, `UNVERIFIED` until measured on the approved source |
+| Before gate G1 on the chosen source | Empty minutes with and without proof reported per source | `developer`, `data-steward` | Required by the charter, section 5. The report is not built. Its column, `empty_proof`, is answered, recheck running |
+| Before the first `CYCLE` run | DC-10, and minute 7 or 23 settled | `developer`, `strategy-architect` | DC-10 answered, recheck running, with its G8 replay part still to come. The hourly workflow now runs at minute 7, the value C17 freezes |
+| With the next pass over these files | DC-14 and DC-15 | `developer` | Answered, recheck running |
+
+The audit requires a re-audit of the changes for DC-01 to DC-08, DC-11 and DC-12, with its probes rerun.
