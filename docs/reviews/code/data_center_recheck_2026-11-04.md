@@ -9,6 +9,8 @@ This answers [the code review](data_center_2026-11-04.md) and tests the claims i
 generated, nothing touched the network, and every probe ran in a temporary directory outside the repository. This report
 says nothing about any strategy or result.
 
+**Addition of 2026-11-05: section 14 rechecks N-01 to N-18 at `cf1880f`, and its verdict is `PASS WITH CONDITIONS`. The sections below stand as written at `dafe3f2`.**
+
 ## 1. Verdict: `FAIL`
 
 The verdict rests on one finding. **F-18 is reopened: the fix to the watchdog made the owner's only alarm fail silently,
@@ -453,3 +455,67 @@ calls that reached a real network tool: 0
 - **Three-way line coverage of F-22.** I relied on the named tests for `compare_live_with_archive`, the lateness log and the 95% watermark. I did not attack them.
 - **Whether the code the rulings ask for is right,** since it is not written.
 - **A review of `AGENTS.md`, `.codex/` or `docs/02_features/GATE_SPEC.md`,** which are outside this work.
+
+## 14. Addition, 2026-11-05: N-01 to N-18 at `cf1880f`
+
+Against the round of 2026-11-05 in [the developer's answer](data_center_fixes_2026-11-04.md), treated as claims. Run from a frozen copy of `cf1880f`, because the working tree was changing. The reported `1657 passed, 2 skipped` is the developer's, and I did not repeat the full suite.
+
+### Verdict: `PASS WITH CONDITIONS`
+
+F-18 is closed, and with it the reason for the `FAIL` in section 1. Every N finding but N-17 is fixed in what I could run. The conditions are few:
+
+1. **N-03 can only be proved on GitHub.** Look at the first scheduled run by hand.
+2. **N-17 still needs its G1 ruling.** It does not touch the candle stage, where a missing row is a gap.
+3. **N-05's value is for `project-manager` to record,** as a trial or not, and 5 bp is still a placeholder until measured.
+
+### Per finding
+
+| ID | Verdict | What I ran |
+|---|---|---|
+| N-01 | `PASS` | The real `watchdog.py` and its real `http_call`, against a loopback server. 403, 429, 500, 200 with `ok` false, and 200 not JSON: exit 1, no digest kept, the next run sends again, then stays quiet. One owner's failure is theirs alone, and only they are sent again. The token is in no note |
+| N-02 | `PASS` | 401, 500, corrupt JSON, a list, no `generated_at`, no alerts list: an alert each time. A true 404 is a note, then an alert past the age limit, or at once past `WATCHDOG_EXPECT_RESULT_AFTER`, which someone must set. While a result is stale, the age in the text means a new alert on each of the two daily runs, which is bounded and acceptable |
+| N-03 | `PASS WITH CONDITIONS` | On text only: publish, deploy, prune and save all read `github.event_name == 'schedule' \|\| ...`, and the prune takes the branch from `REF_NAME`. Not provable here. `gh cache list ... \| while` still has no `pipefail`, so a failed list is still a quiet no-op, and that default is `UNVERIFIED` |
+| N-04 | `PASS` | A stray part name: run `ok`, row `ok`. Named tests ran |
+| N-05 | `PASS WITH CONDITIONS` | Value 0.0005. My reconcile probe now gives 34 checks and 0 deviations: a last price +1.9% fails, is excluded, and keeps its raw |
+| N-06 | `PASS WITH CONDITIONS` | My routes against the new guard, on loopback. Refused: module level, session and module fixtures, `connect`, `connect_ex`, the `_socket` base class, `sendto`, both `gethostbyname` forms, `getaddrinfo`, `urlopen`, a thread, a Python child, and `curl`, `powershell` and `ssh` as children. `git` to a remote: `transport 'https' not allowed`. **Two left, both Low:** a Python child started with `-I` ignores `PYTHONPATH` and connected, and polars stays below the hook, with only the source scan covering it. Nothing in the suite does either, by the scan and by my earlier tally |
+| N-07 | `PASS` | The same case now exits 2: "the live root's catalog holds generated data" |
+| N-08 | `PASS` | `candles` from `kraken`, `bybit`, a disabled `binance` and an unknown name: all `SourceNotApproved`, with nothing read |
+| N-09 | `PASS` | Named tests ran, and the fix is narrow |
+| N-10 | `PASS` | 400 fuzzed book files: only `ValidationError` or accepted, and no `zlib.error` |
+| N-11 | `PASS` | 2,000 fuzzed files: no accepted frame holds a non-finite number |
+| N-12 | `PASS` | Named test read and run. `live_dataset` on an empty read still has no columns, a stated departure I accept since each dataset differs |
+| N-13 | `PASS` | Named test read and run: a mid-month `since` gives 2 rows, a later month none |
+| N-14 | `PASS` | A dry run on an existing empty folder: exit 2, nothing written |
+| N-15 | `PASS` | Ids [100,102,101,103]: stored [100,101,102,103], 0 repeated |
+| N-16 | `PASS` | `run_log/sub/x.jsonl`, `ledger/sub/x.json`, `decisions/sub/x.json`: exit 1, nothing on the branch |
+| N-17 | Open | Not done, as stated. Better than before: a 10-minute hole with no sequence and no candles now reads `unreconciled`, with its raw kept, and it is no longer `pass`. Catalog gaps still 0 |
+| N-18 | `PASS` | My case again, 7 days, budget 3 files. Retries due every run: finished in 6 runs, from 11. Newest three days always failing: 10 tasks done by run 5, where before no older day was ever reached. The alert after three runs is in a named test I ran |
+
+### Changes the fixes file lists as outside its scope
+
+| File | What I checked | Result |
+|---|---|---|
+| `config.py` | `LAST_OPENED_DATE` is a constant, `APPROVED_ROUTES` opens one host for one source, and `ARCHIVE_ONLY_SOURCES` holds `binance`. Named route tests ran | Holds. The route accepts any USD-M perpetual symbol, as disclosed, and `[universe]` is what limits it |
+| `synthetic.py` | The `official_1m` path, and `candle_allowance_ms = 250` for generated data only. I ran the engine's edge separately: with `knowable = close + 10 s` and a delay of 10 s, a candle is known at its decision | Holds. The 250 ms never reaches real data. A real value of 10 s sits exactly on the `<=` edge, and it passes |
+| `reports/benchmark.py` | `compute_span_stats` by hand: total 8.9%, Sharpe 5.515131 on 365 days, drawdown -10%. Read for holes: a return across a hole is not a one-day return | Holds |
+| `reports/site.py` | The added lines are escaped text on the page | Holds |
+| Tests a ruling replaced | Read: `test_bad_klines_are_refused` loses `high is below`, as ruling 7 asks. The R6.1 retention test is stricter. The `test_safety.py` rule allows exactly `HTTPException` from `http.client`, in `fetch.py` only. `test_retention` gains checks | None was weakened beyond what its ruling states, on those I read. I did not read all of `test_report.py` and `test_ingest.py`'s rewritten tests |
+
+### Commands
+
+```text
+$ python -m pytest -q -x tests/test_workflows.py tests/data/test_source_switches.py tests/data/test_safety.py ...
+no failure in the first two files. It stopped in test_safety.py at test_generated_output_is_ignored_by_git, which needs a git checkout, and my frozen copy is not one
+$ python -m pytest -q tests/data/test_safety.py tests/data/test_reader.py tests/data/test_parsers.py tests/data/test_book_replay.py tests/data/test_ingest.py -k "<those files, and the N-04 and N-18 tests>"
+156 passed, 3 skipped, 76 deselected in 51.18s
+$ ruff check src tests
+Found 4 errors. All E501, line too long, in tests/child_guard/sitecustomize.py lines 3, 5, 6 and 10
+$ ruff format --check src tests
+99 files already formatted
+$ mypy src     (from a short-path environment, because mypy in .venv does not start on this machine's long path)
+Success: no issues found in 63 source files
+```
+
+The four E501 lines are not a correctness matter in themselves, but `.github/workflows/ci.yml:40` runs `ruff check .`, so CI fails on them at this commit. Run from the frozen copy with its own `pyproject.toml`.
+
+**Not checked:** the full suite, anything on GitHub, real data, and the steward's later items, which the fixes file leaves open.
