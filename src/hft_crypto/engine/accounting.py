@@ -51,6 +51,22 @@ class FundingCharge:
 
 
 @dataclass(frozen=True, slots=True)
+class FundingGap:
+    """A settlement passed while the position was open, whose rate is missing. C17: logged, and not assumed.
+
+    It books nothing. `notional` is what a rate would apply to, so a report can state what stays unresolved.
+    """
+
+    settle_us: int
+    qty: float
+    mark: float
+
+    @property
+    def notional(self) -> float:
+        return self.qty * self.mark
+
+
+@dataclass(frozen=True, slots=True)
 class CashEvent:
     """One booked flow. `gross` is before slippage, `price_pnl` after it, and fees and funding are costs."""
 

@@ -68,8 +68,9 @@ STATE_PENDING = "pending"
 # A clean day that nothing outside its own files has checked. It is never reported as passed, under charter
 # G1.
 STATUS_UNRECONCILED = "unreconciled"
-# What a day's raw file, or a report, may rely on, as far as its own checks can say.
-USABLE_DAY_STATUSES = frozenset({"pass", STATUS_UNRECONCILED})
+# On bars from trades, the days a report may use, as far as their own checks can say.
+TRADE_DAY_STATUSES = frozenset({"pass", STATUS_UNRECONCILED})
+HOLE_REASON = "the row giving this day's open or close is missing or failed"
 ALLOWANCE_EVENTS = "catalog/allowance_events.jsonl"
 
 
@@ -366,6 +367,35 @@ def _candle_part(ctx: JobContext, venue: str, symbol: str, day: dt.date) -> Path
     return daily if daily.is_file() else ctx.root.curated_month_part(OFFICIAL, venue, symbol, day)
 
 
+def day_is_usable(status: str, detail: dict[str, Any] | None) -> bool:
+    """Whether a report may use a day.
+
+    **RA-01.** On candles a flagged minute excludes nothing. An outage is likely to fall on a stressed day, so
+    leaving out the day would select the sample by a data event. The day states how many minutes it flagged,
+    and `warn` stays as an alert. It is a hole only when the row giving its open or close is missing or
+    failed.
+
+    On bars from trades the status still decides, because there a `warn` is a disagreement with the venue's
+    own candles over the whole day (F-04). That path is re-audited before stage 2.
+    """
+    if detail is not None and "hole" in detail:
+        return status in {*TRADE_DAY_STATUSES, STATUS_WARN} and not detail["hole"]
+    return status in TRADE_DAY_STATUSES
+
+
+def _day_flags(bars: pl.DataFrame) -> tuple[int, bool]:
+    """How many minutes a day flagged, and whether the row giving its open or its close is one of them.
+
+    A minute proved empty gives no price and is not flagged, so the rows giving the open and the close are the
+    first and last that are not proved empty.
+    """
+    flagged = int(bars["gap"].sum())
+    giving = bars.filter(pl.col("gap") | (pl.col("trade_count") > 0))
+    if giving.is_empty():
+        return flagged, True
+    return flagged, bool(giving["gap"][0]) or bool(giving["gap"][-1])
+
+
 def _derive_from_candles(
     ctx: JobContext, venue: str, symbol: str, day: dt.date, source: SourceSpec
 ) -> DeriveOutcome:
@@ -415,8 +445,9 @@ def _derive_from_candles(
         {"reason": "the bars are the official candles, so there is nothing to check them against"},
         now=ctx.now_iso(),
     )
-    if reasons:
-        _record_exclusion(ctx, venue, symbol, day, "; ".join(reasons), None)
+    flagged_minutes, hole = _day_flags(bars)
+    if hole:
+        _record_exclusion(ctx, venue, symbol, day, HOLE_REASON, None)
     else:
         ctx.catalog.resolve_exclusions(venue, symbol, day.isoformat(), now=ctx.now_iso())
     _write_day_outputs(
@@ -432,6 +463,8 @@ def _derive_from_candles(
             "reconciled": False,
             "bar_source": SOURCE_OFFICIAL,
             "reasons": reasons,
+            "flagged_minutes": flagged_minutes,
+            "hole": hole,
         },
         parents=[ctx.relative(part)],
         tier="T0",

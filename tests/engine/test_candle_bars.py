@@ -20,6 +20,7 @@ from engine_helpers import (
     DAY,
     DELAY_US,
     MINUTE,
+    candles_from,
     generated_trades,
     run_stream,
     sim_params,
@@ -40,54 +41,6 @@ CANDLE_ALLOWANCE_US = 10_000_000
 RUNNING = ("S01", "S02", "S03", "S04", "S05", "S06", "S09", "S10")
 NOT_ON_CANDLES = ("S07", "S08")
 NOT_DECISIONS = frozenset({"GAP_UNRESOLVED", "ENTRY_UNFILLED_AT_END"})
-
-
-def candles_from(trades: pl.DataFrame, *, first_open_us: int, minutes: int) -> pl.DataFrame:
-    """Candles over `[open, open + 60 s)`, so a print exactly on a boundary falls in the later one.
-
-    A minute with no trades carries the last close forward, as a venue may, and reports a count of zero.
-    """
-    stamps = trades["ts"].dt.timestamp("us").to_numpy()
-    prices = trades["price"].to_numpy()
-    qty = trades["qty"].to_numpy()
-    slots = (stamps - first_open_us) // MINUTE
-    keep = (slots >= 0) & (slots < minutes)
-    slots, prices, qty = slots[keep], prices[keep], qty[keep]
-    order = np.lexsort((np.arange(slots.size), slots))
-    slots, prices, qty = slots[order], prices[order], qty[order]
-    starts = np.searchsorted(slots, np.arange(minutes), side="left")
-    ends = np.searchsorted(slots, np.arange(minutes), side="right")
-    rows: dict[str, list[Any]] = {
-        key: [] for key in ("open", "high", "low", "close", "volume", "quote_volume", "trade_count")
-    }
-    last = float(prices[0])
-    for begin, end in zip(starts.tolist(), ends.tolist(), strict=True):
-        if end > begin:
-            chunk = prices[begin:end]
-            amount = qty[begin:end]
-            rows["open"].append(float(chunk[0]))
-            rows["high"].append(float(chunk.max()))
-            rows["low"].append(float(chunk.min()))
-            rows["close"].append(float(chunk[-1]))
-            rows["volume"].append(float(amount.sum()))
-            rows["quote_volume"].append(float((chunk * amount).sum()))
-            rows["trade_count"].append(int(end - begin))
-            last = float(chunk[-1])
-        else:
-            for key in ("open", "high", "low", "close"):
-                rows[key].append(last)
-            rows["volume"].append(0.0)
-            rows["quote_volume"].append(0.0)
-            rows["trade_count"].append(0)
-    opens = first_open_us + np.arange(minutes, dtype=np.int64) * MINUTE
-    return pl.DataFrame(
-        {
-            "open_time": pl.Series(opens, dtype=pl.Int64).cast(UTC_TIME),
-            **{key: pl.Series(rows[key], dtype=pl.Float64) for key in rows if key != "trade_count"},
-            "trade_count": pl.Series(rows["trade_count"], dtype=pl.Int64),
-            "taker_buy_volume": pl.Series([value / 2.0 for value in rows["volume"]], dtype=pl.Float64),
-        }
-    )
 
 
 def bars_from(candles: pl.DataFrame, *, first_close_us: int, last_close_us: int) -> pl.DataFrame:

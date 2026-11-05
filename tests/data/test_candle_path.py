@@ -12,6 +12,7 @@ import json
 import re
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 import pytest
@@ -28,15 +29,15 @@ from hft_crypto.bars.core import SOURCE_OFFICIAL, DateGuardError
 from hft_crypto.config import PipelineConfig
 from hft_crypto.data.atomic import read_parquet
 from hft_crypto.data.context import JobContext
-from hft_crypto.data.derive import derive_day, official_dataset
+from hft_crypto.data.derive import day_is_usable, derive_day, official_dataset
 from hft_crypto.data.fetch import check_url
 from hft_crypto.data.health import build_health
 from hft_crypto.data.ingest import IngestOptions, Task, plan_tasks, run_ingest
 from hft_crypto.data.parsers import ValidationError, parse_klines
 from hft_crypto.data.reader import MarketReader, RunClock
 from hft_crypto.data.sources import archive_candidates
-from hft_crypto.reports.report import write_report
-from hft_crypto.timeutil import day_start_us
+from hft_crypto.reports.report import build_benchmark, write_report
+from hft_crypto.timeutil import day_start_us, to_us
 
 BTC = "BTCUSDT"
 NOW = dt.datetime(2026, 11, 5, 10, tzinfo=dt.UTC)
@@ -294,7 +295,11 @@ def test_a_bad_row_flags_its_minute_and_warns_the_day_and_keeps_the_rest(
     )
     assert record is not None
     assert record.check_status == "warn"
-    assert [row["date"] for row in ctx.catalog.exclusions()] == [bad_day.isoformat()]
+    # RA-01: the minute is flagged and the day says so. A flagged minute excludes nothing.
+    assert record.check_detail is not None
+    assert record.check_detail["flagged_minutes"] == 1
+    assert record.check_detail["hole"] is False
+    assert ctx.catalog.exclusions() == []
     other = ctx.catalog.get_file(
         ctx.relative(ctx.root.curated_part(official_dataset(1), "binance", BTC, dt.date(2023, 11, 4)))
     )
@@ -443,3 +448,130 @@ def test_the_shipped_plan_has_no_trade_dataset_in_stage_one(tmp_path: Path) -> N
     assert {task.spec.kind for task in tasks} == {"klines", "fundingRate"}
     light = plan_tasks(ctx, IngestOptions(include_book=False))
     assert {task.spec.kind for task in light} == {"klines", "fundingRate"}
+
+
+# ---- RA-01: a flagged minute does not exclude a day --------------------------------------------------------
+
+
+def _falling_month(*, drop: tuple[int, ...] = (), empty: tuple[int, ...] = ()) -> str:
+    """Twelve days at 100, except the seventh, which falls to 75 and stays there. `drop` removes rows by
+    minute, and `empty` makes a row a proved empty minute, with a count of zero.
+    """
+    lines = [
+        "open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,"
+        "taker_buy_quote_volume,ignore"
+    ]
+    start_ms = day_start_us(NOV) // 1000
+    for minute in range(12 * 1440):
+        if minute in drop:
+            continue
+        day = minute // 1440
+        price = 100.0 if day < 6 else 75.0
+        if day == 6:
+            price = 100.0 - 25.0 * (minute % 1440) / 1439.0
+        price = round(price, 4)
+        stamp = start_ms + minute * 60_000
+        count = 0 if minute in empty else 3
+        volume = 0.0 if minute in empty else 2.0
+        close_ms = stamp + 59_999
+        lines.append(
+            f"{stamp},{price},{price},{price},{price},{volume},{close_ms},200.0,{count},{volume / 2},100.0,0"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _ingest_month(tmp_path: Path, name: str, text: str) -> tuple[JobContext, PipelineConfig]:
+    config = _config()
+    fetcher = FakeFetcher()
+    target = archive_candidates(config, config.dataset("binance.klines"), BTC, NOV)[0]
+    fetcher.publish(
+        target.url, zip_bytes(target.filename.replace(".zip", ".csv"), text), name=target.filename
+    )
+    ctx = make_context(tmp_path / name, now=NOW, config=config)
+    summary = run_ingest(ctx, fetcher, IngestOptions(dataset_ids=("binance.klines",)))
+    assert summary.errors == []
+    return ctx, config
+
+
+def _benchmark(ctx: JobContext, config: PipelineConfig) -> Any:
+    found, _ = build_benchmark(ctx.root, config, ctx.catalog, BTC, to_us(NOW))
+    assert found is not None
+    return found
+
+
+FALL_DAY = 6  # the seventh day, counted from 0
+_TAIL_DAYS = {(NOV + dt.timedelta(days=offset)).isoformat() for offset in range(12, 30)}
+
+
+def _excluded(ctx: JobContext) -> set[str]:
+    return {row["date"] for row in ctx.catalog.exclusions()}
+
+
+MIDDAY = FALL_DAY * 1440 + 13 * 60 + 5
+
+
+def test_ra01_the_auditor_s_case_one_missing_candle_leaves_the_benchmark_as_it_was(tmp_path: Path) -> None:
+    """A fall of 25 percent on the seventh day, and one candle missing at 13:05 that day. Excluding the day
+    took its one-day returns away and turned a Sharpe of about -4 into about +5. An outage is likely on a
+    stressed day.
+    """
+    clean_ctx, config = _ingest_month(tmp_path, "clean", _falling_month())
+    gapped_ctx, _ = _ingest_month(tmp_path, "gapped", _falling_month(drop=(MIDDAY,)))
+    clean = _benchmark(clean_ctx, config)
+    gapped = _benchmark(gapped_ctx, config)
+    assert clean.stats["sharpe"] < 0
+    for key in ("sharpe", "annualised_volatility", "total_return", "daily_returns"):
+        assert gapped.stats[key] == pytest.approx(clean.stats[key])
+    assert gapped.days_used == clean.days_used == 12
+    # The file holds twelve days, so the rest of the month has no rows at all, and each of those is a hole.
+    assert gapped.days_excluded == clean.days_excluded == len(_TAIL_DAYS)
+    assert _excluded(gapped_ctx) == _TAIL_DAYS
+    assert gapped.stats["minutes_flagged_in_days_used"] == 1
+    assert clean.stats["minutes_flagged_in_days_used"] == 0
+
+
+def test_ra01_the_day_states_its_flagged_minutes_and_warn_stays_as_an_alert(tmp_path: Path) -> None:
+    ctx, _ = _ingest_month(tmp_path, "r", _falling_month(drop=(MIDDAY, MIDDAY + 1)))
+    day = NOV + dt.timedelta(days=FALL_DAY)
+    record = ctx.catalog.get_file(
+        ctx.relative(ctx.root.curated_part(official_dataset(1), "binance", BTC, day))
+    )
+    assert record is not None
+    assert record.check_status == "warn"
+    assert record.check_detail is not None
+    assert (record.check_detail["flagged_minutes"], record.check_detail["hole"]) == (2, False)
+
+
+@pytest.mark.parametrize(
+    "minute",
+    [FALL_DAY * 1440, FALL_DAY * 1440 + 1439],
+    ids=["the row giving its open", "the row giving its close"],
+)
+def test_ra01_a_day_is_a_hole_only_when_the_row_giving_its_open_or_close_is_missing(
+    tmp_path: Path, minute: int
+) -> None:
+    ctx, config = _ingest_month(tmp_path, "r", _falling_month(drop=(minute,)))
+    day = NOV + dt.timedelta(days=FALL_DAY)
+    assert _excluded(ctx) == {day.isoformat(), *_TAIL_DAYS}
+    found = _benchmark(ctx, config)
+    assert found.days_used == 11
+    assert found.days_excluded == 1 + len(_TAIL_DAYS)
+
+
+def test_ra01_a_first_minute_proved_empty_is_no_hole_since_the_next_row_gives_the_open(
+    tmp_path: Path,
+) -> None:
+    ctx, config = _ingest_month(tmp_path, "r", _falling_month(empty=(FALL_DAY * 1440,)))
+    assert _excluded(ctx) == _TAIL_DAYS
+    assert _benchmark(ctx, config).days_used == 12
+
+
+def test_ra01_the_status_alone_decides_nothing_on_candles() -> None:
+    assert day_is_usable("warn", {"hole": False, "flagged_minutes": 3}) is True
+    assert day_is_usable("warn", {"hole": True, "flagged_minutes": 1}) is False
+    assert day_is_usable("unreconciled", {"hole": False, "flagged_minutes": 0}) is True
+    assert day_is_usable("fail", {"hole": False, "flagged_minutes": 0}) is False
+    assert day_is_usable("provisional", {"hole": False}) is False
+    # Bars from trades have no such detail, and there a warn is a disagreement over the whole day (F-04).
+    assert day_is_usable("warn", {"reasons": []}) is False
+    assert day_is_usable("pass", None) is True

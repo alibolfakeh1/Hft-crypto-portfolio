@@ -9,6 +9,13 @@ looks good.
 generated run is logged too, with `counts_as_trial` false, because C12 says synthetic engineering tests do not
 count.
 
+**A run is not always one line.** S08's two branches are read separately, so one S08 run counts as two lines
+and a run of all ten is 60 runs for 64 lines per symbol. On candles S07 and S08 run nothing, and count as no
+line, so the candle stage stays 52 lines per symbol. `lines_counted` holds this on every row.
+
+**A C15 draw is a control.** It is logged like any run and is not a trial. A run of a line's draws is one
+counted `V0` against C15 reading, per strategy, under section 5 of the fold plan.
+
 C12 also holds `RT` and stop slippage here: they are declared before the first market run, and a market run
 refuses to start without them, or with values that differ.
 """
@@ -45,8 +52,14 @@ def trial_row(
     code_version: str,
     config_hash: str,
     manifest_hash: str,
+    lines_counted: int,
+    draw: int | None = None,
+    control: bool = False,
 ) -> dict[str, Any]:
-    """What identifies one trial. No clock in here, so this row is the same on every identical run."""
+    """What identifies one trial. No clock in here, so this row is the same on every identical run. A C15 draw
+    and a `V0S` run are controls, and count as no trial.
+    """
+    control = control or draw is not None
     identity = {
         "strategy": strategy,
         "line": line,
@@ -59,6 +72,7 @@ def trial_row(
         "costs": costs,
         "config_hash": config_hash,
         "manifest_hash": manifest_hash,
+        **({"draw": draw} if control else {}),
     }
     return {
         **identity,
@@ -66,10 +80,11 @@ def trial_row(
         "is_default": is_default,
         "in_portfolio": in_portfolio,
         "data_kind": data_kind,
-        "counts_as_trial": data_kind == "MARKET",
+        "counts_as_trial": data_kind == "MARKET" and lines_counted > 0 and not control,
+        "lines_counted": 0 if control else lines_counted,
         "risk_state": risk_state,
         "code_version": code_version,
-        "control": False,
+        "control": control,
         "used_for_selection": False,
     }
 
@@ -117,13 +132,33 @@ class TrialRegistry:
                 f"this run's costs {values} differ from the registry's {current}, so it is refused"
             )
 
+    def _distinct(self) -> dict[str, dict[str, Any]]:
+        return {
+            row["trial_key"]: row
+            for row in self._rows()
+            if row.get("event") == "trial_started" and row.get("counts_as_trial")
+        }
+
     def distinct_trials(self) -> int:
-        """Distinct trials that count, so generated runs add none and a repeat adds none."""
+        """Distinct lines that count, so generated runs add none, a repeat adds none, and S08 adds two."""
+        return sum(int(row["lines_counted"]) for row in self._distinct().values())
+
+    def distinct_runs(self) -> int:
+        """Distinct runs behind those lines. A run of all ten is 60 of these for 64 lines, per symbol."""
+        return len(self._distinct())
+
+    def placebo_readings(self) -> int:
+        """Counted `V0` against C15 readings: one per strategy, line and data, whatever the symbols. Only a
+        row with a draw is a C15 reading. A `V0S` run is a control with no draw, and is none.
+        """
         return len(
             {
-                row["trial_key"]
+                (row["strategy"], row["line"], row["config_hash"], row["manifest_hash"])
                 for row in self._rows()
-                if row.get("event") == "trial_started" and row.get("counts_as_trial")
+                if row.get("event") == "trial_started"
+                and row.get("control")
+                and row.get("draw") is not None
+                and row.get("data_kind") == "MARKET"
             }
         )
 

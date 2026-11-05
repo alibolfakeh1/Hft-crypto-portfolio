@@ -107,13 +107,11 @@ class SwingList:
                 return entry
         return None
 
-    def latest_two(self, kind: str, before_us: int | None = None) -> tuple[Swing | None, Swing | None]:
-        """The two latest of a kind, optionally only those confirmed before a moment."""
+    def latest_two(self, kind: str) -> tuple[Swing | None, Swing | None]:
+        """The two latest of a kind as of now."""
         found: list[Swing] = []
         for entry in reversed(self.entries):
             if entry.kind != kind or entry.valid_to is not None:
-                continue
-            if before_us is not None and entry.valid_from >= before_us:
                 continue
             found.append(entry)
             if len(found) == 2:

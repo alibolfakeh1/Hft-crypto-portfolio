@@ -3,8 +3,7 @@
 Readings the document leaves open, each reported:
 - `X` updates at each close through the trigger, as section 4 says, though section 3 says "until the retest".
 - Once a retest's three bars have passed with no trigger, the flip can give no trade, and it stays in the
-register
-  until its window ends.
+  register until its window ends.
 - Two flips triggering on one bar: the one nearest the close.
 """
 
@@ -34,6 +33,7 @@ from hft_crypto.strategies.base import (
     sided_clv,
 )
 from hft_crypto.strategies.registers import SwingList, against, towards
+from hft_crypto.strategies.sources import LevelSource
 from hft_crypto.strategies.zones import Zone, ZoneBook
 
 _SCALE_T1 = 1.0 / 3.0
@@ -59,6 +59,7 @@ class _Flip:
     retest_low: float = 0.0
     dead_at: int | None = None
     traded: bool = False
+    travelled: bool = False
 
 
 @dataclass
@@ -73,6 +74,9 @@ class _Memo:
 
 class S05ZonePolarityFlip(Strategy):
     id = "S05"
+    # 7.10.
+    v0s_m = 2.5
+    v0s_hold_bars: ClassVar[dict[int, int]] = {60: 48, 240: 24}
     h_max_hours: ClassVar[dict[int, float]] = {60: 72.0, 240: 144.0}
     requirements = (
         "ATR(14) on the decision timeframe, defined at the zone's base",
@@ -81,10 +85,14 @@ class S05ZonePolarityFlip(Strategy):
         "A zone that formed and then broke, retested from the other side",
     )
 
-    def __init__(self, params: dict[str, Any]) -> None:
+    def __init__(self, params: dict[str, Any], source: LevelSource | None = None) -> None:
         super().__init__(params)
         self.window = int(params["rw"])
+        # The real register decides when a flip is born, which is the moment a placebo band is drawn.
         self.book = ZoneBook(self.timeframe_minutes)
+        self._source = source or LevelSource()
+        # Each entry zone's `prox`, as a target in 7.3 reads it.
+        self._zone_prox: dict[str, float | None] = {}
         self.swings = SwingList(3, 2, 1.0)
         self.flips: list[_Flip] = []
         self._new_swings: list[Any] = []
@@ -92,6 +100,9 @@ class S05ZonePolarityFlip(Strategy):
     def on_close(self, market: MarketView) -> list[Proposal]:
         bar = market.bar
         self.book.update(market.bars)
+        for zone in self.book.new_entry:
+            placed = self._source.vector(f"ZONE:{zone.side}", {"prox": zone.prox}, bar)
+            self._zone_prox[zone.id] = None if placed is None else placed["prox"]
         self._new_swings = self.swings.update(market.bars)
         triggers = self._advance_flips(bar)
         self._new_flips(bar)
@@ -105,7 +116,9 @@ class S05ZonePolarityFlip(Strategy):
         if bar.vr is not None and bar.vr > 2.0:
             self.note("VR_BLOCK")
             return []
-        for flip in sorted(triggers, key=lambda item: abs(item.side * bar.c - item.top)):
+        if triggers:
+            # C5: the pick among flips on one bar is final, so a setup that then fails tries no other flip.
+            flip = min(triggers, key=lambda item: abs(item.side * bar.c - item.top))
             proposal = self._setup(market, bar, flip)
             if proposal is not None:
                 return [proposal]
@@ -121,10 +134,24 @@ class S05ZonePolarityFlip(Strategy):
             side = -zone.side  # a supply zone broken upward gives a long
             if not self._eligible(zone, bar, side, atr):
                 continue
-            top = side * zone.dist
-            bottom = side * zone.prox
+            placed = self._source.vector(f"FLIP:{side}", {"top": zone.dist}, bar)
+            if placed is None:
+                continue
+            move = placed["top"] - zone.dist
+            top = side * (zone.dist + move)
+            bottom = side * (zone.prox + move)
+            extreme = sided(bar, side)[1]
             self.flips.append(
-                _Flip(zone.id, side, top, bottom, (top + bottom) / 2.0, sided(bar, side)[1], bar.index)
+                _Flip(
+                    zone.id,
+                    side,
+                    top,
+                    bottom,
+                    (top + bottom) / 2.0,
+                    extreme,
+                    bar.index,
+                    travelled=extreme - top >= 1.0 * atr,
+                )
             )
 
     def _eligible(self, zone: Zone, bar: Bar, side: int, atr: float) -> bool:
@@ -146,7 +173,11 @@ class S05ZonePolarityFlip(Strategy):
             if flip.dead_at is not None or flip.traded or atr is None:
                 continue
             _, high, low, close = sided(bar, flip.side)
+            # Section 3: the bar that completes travel cannot open the retest, because one bar does not show
+            # whether its high or its low came first.
+            travelled_before = flip.travelled
             flip.extreme = max(flip.extreme, high)
+            flip.travelled = travelled_before or flip.extreme - flip.top >= 1.0 * atr
             in_retest = flip.retest_start is not None
             if close < flip.bottom - 0.25 * atr or (in_retest and close < flip.mid):
                 flip.dead_at = bar.close_us
@@ -155,11 +186,15 @@ class S05ZonePolarityFlip(Strategy):
                 flip.dead_at = bar.close_us
                 continue
             if flip.retest_start is None:
-                # The first bar after travel with its low back at the top opens the retest.
-                if flip.extreme - flip.top >= 1.0 * atr and low <= flip.top and bar.index > flip.break_index:
+                # C2: a bar with no trade touches nothing, so it cannot open the retest. It still counts.
+                if bar.has_price and travelled_before and low <= flip.top and bar.index > flip.break_index:
                     flip.retest_start = bar.index
                     flip.retest_low = low
-            else:
+                    if close < flip.mid:
+                        # Section 3: any close below `mid` during the retest, and this bar is in it.
+                        flip.dead_at = bar.close_us
+                        continue
+            elif bar.has_price:
                 flip.retest_low = min(flip.retest_low, low)
             if flip.retest_start is None or bar.index - flip.retest_start > _RETEST_EXTRA:
                 continue
@@ -260,7 +295,10 @@ class S05ZonePolarityFlip(Strategy):
         for zone in self.book.new_entry:
             if zone.side != -side or not zone.active or self.book.quality(zone, bar) < _ELIGIBLE_Q:
                 continue
-            price = side * zone.prox
+            prox = self._zone_prox.get(zone.id)
+            if prox is None:
+                continue
+            price = side * prox
             if close + 0.5 * atr <= price < target:
                 decision.targets.append(TargetMove("T2", side * price, "OPPOSING_ZONE"))
                 target = price

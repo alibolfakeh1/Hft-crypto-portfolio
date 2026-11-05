@@ -92,6 +92,10 @@ class _Memo:
 
 class S07AnchoredVwapPullback(Strategy):
     id = "S07"
+    # 7.10.
+    v0s_m = 2.0
+    v0s_hold_bars: ClassVar[dict[int, int]] = {60: 48}
+    needs_trades = True
     h_max_hours: ClassVar[dict[int, float]] = {60: 120.0}
     requirements = (
         "Trades, tier T1. On candles this strategy gives no result",
@@ -243,7 +247,9 @@ class S07AnchoredVwapPullback(Strategy):
         memo: _Memo = position.memo
         _, _, _, close = sided(bar, side)
         line = side * memo.a0.line
-        memo.below = memo.below + 1 if close < line else 0
+        # 7.8: a bar with no trade is neither one of the two closes nor a break between them.
+        if bar.has_price:
+            memo.below = memo.below + 1 if close < line else 0
         if memo.below >= 2:
             return Management(exit_reason=INVALIDATION, exit_note="TWO_CLOSES_BELOW_A0")
         n = position.n

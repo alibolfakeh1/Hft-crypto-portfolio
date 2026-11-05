@@ -20,8 +20,9 @@ from hft_crypto.strategies.s07_anchored_vwap_pullback import S07AnchoredVwapPull
 from hft_crypto.strategies.s08_volume_profile_value_area import S08VolumeProfileValueArea
 from hft_crypto.strategies.s09_session_range_breakout import S09SessionRangeBreakout
 from hft_crypto.strategies.s10_volatility_compression import S10VolatilityCompression
+from hft_crypto.strategies.sources import LevelSource
 
-_BUILDERS: dict[str, Callable[[dict[str, Any]], Strategy]] = {
+_CLASSES: dict[str, type[Strategy]] = {
     "S01": S01FloorPivotRejection,
     "S02": S02PivotBreakoutRetest,
     "S03": S03MarketStructure,
@@ -33,6 +34,15 @@ _BUILDERS: dict[str, Callable[[dict[str, Any]], Strategy]] = {
     "S09": S09SessionRangeBreakout,
     "S10": S10VolatilityCompression,
 }
+_BUILDERS: dict[str, Callable[[dict[str, Any]], Strategy]] = dict(_CLASSES)
+_LEVEL_BUILDERS: dict[str, Callable[[dict[str, Any], LevelSource], Strategy]] = {
+    "S01": S01FloorPivotRejection,
+    "S02": S02PivotBreakoutRetest,
+    "S04": S04SupplyDemandZones,
+    "S05": S05ZonePolarityFlip,
+    "S06": S06LiquiditySweepReclaim,
+    "S08": S08VolumeProfileValueArea,
+}
 
 
 def available_strategies() -> tuple[str, ...]:
@@ -41,3 +51,12 @@ def available_strategies() -> tuple[str, ...]:
 
 def build_strategy(strategy_id: str, params: dict[str, Any]) -> Strategy:
     return _BUILDERS[strategy_id](params)
+
+
+def strategy_class(strategy_id: str) -> type[Strategy]:
+    return _CLASSES[strategy_id]
+
+
+def build_level_strategy(strategy_id: str, params: dict[str, Any], source: LevelSource) -> Strategy:
+    """A strategy with levels or bands, taking them from a given source. C15 is its only other user."""
+    return _LEVEL_BUILDERS[strategy_id](params, source)

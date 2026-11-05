@@ -18,14 +18,12 @@ from engine_helpers import (
     DAY,
     GENERATED_CONFIG,
     MINUTE,
-    generated_trades,
-    minute_bars,
+    default_only_config,
     utc,
+    write_generated_root,
 )
 from hft_crypto.bars.core import UTC_TIME, TimingContractError
 from hft_crypto.config import ConfigError, load_pipeline_config
-from hft_crypto.data.atomic import atomic_write_parquet
-from hft_crypto.data.catalog import Catalog
 from hft_crypto.data.derive import BARS_1M, TRADES
 from hft_crypto.data.zones import SYNTHETIC_MARKER, DataRoot
 from hft_crypto.engine.__main__ import main
@@ -34,6 +32,7 @@ from hft_crypto.engine.config import DateRange, load_engine_config, parse_engine
 from hft_crypto.engine.fold_plan import check_range, span_labels
 from hft_crypto.engine.registry import REGISTRY_PATH, TrialRegistry
 from hft_crypto.engine.run import RunOutcome, read_cut, required_allowance, run_engine
+from hft_crypto.strategies.v0s import VARIANT_V0S
 from hft_crypto.timeutil import date_of_us
 from hft_crypto.versioning import stable_hash
 
@@ -41,54 +40,14 @@ VENUE = "synthetic"
 SYMBOLS = ("SYNTHBTC", "SYNTHETH")
 FIRST = dt.date(2000, 1, 3)
 DAYS = 70
-FILES = ("run", "strategy_asset", "strategy", "portfolio", "trades", "equity", "events", "trials")
-
-
-def default_only_config(base: Path) -> Path:
-    """The shipped file, with only the default lines, so each test here stays quick."""
-    text = GENERATED_CONFIG.read_text(encoding="utf-8").replace('lines = "all"', 'lines = "default_only"')
-    path = base / "default_only.toml"
-    path.write_text(text, encoding="utf-8")
-    return path
-
-
-def write_generated_root(path: Path, *, first: dt.date = FIRST, days: int = DAYS, seed: int = 41) -> DataRoot:
-    """A root holding generated bars and trades, written where the reader looks for them."""
-    root = DataRoot(path)
-    root.guard.check(SYNTHETIC_MARKER).write_text("Generated test data. Not market data.\n", encoding="utf-8")
-    catalog = Catalog(root.catalog_path)
-    catalog.set_meta("data_kind", "SYNTHETIC")
-    catalog.close()
-    start = utc(first.year, first.month, first.day)
-    for index, symbol in enumerate(SYMBOLS):
-        trades = generated_trades(
-            seed=seed + index, start_us=start, days=days, start_price=1000.0 if index == 0 else 100.0
-        )
-        bars = minute_bars(
-            trades, first_close_us=start + MINUTE, last_close_us=start + days * DAY
-        ).with_columns(pl.lit(VENUE).alias("venue"), pl.lit(symbol).alias("symbol"))
-        for offset in range(days):
-            day = first + dt.timedelta(days=offset)
-            low = pl.lit(start + offset * DAY, dtype=pl.Int64).cast(UTC_TIME)
-            high = pl.lit(start + (offset + 1) * DAY, dtype=pl.Int64).cast(UTC_TIME)
-            atomic_write_parquet(
-                root.curated_part(BARS_1M, VENUE, symbol, day),
-                bars.filter((pl.col("open_time") >= low) & (pl.col("open_time") < high)),
-                guard=root.guard,
-            )
-            atomic_write_parquet(
-                root.curated_part(TRADES, VENUE, symbol, day),
-                trades.filter((pl.col("ts") >= low) & (pl.col("ts") < high)),
-                guard=root.guard,
-            )
-    return root
+FILES = ("run", "strategy_asset", "strategy", "portfolio", "trades", "equity", "events", "trials", "placebo")
 
 
 @pytest.fixture(scope="module")
 def generated(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Any]]:
     base = tmp_path_factory.mktemp("engine")
     root_path = base / "root"
-    write_generated_root(root_path)
+    write_generated_root(root_path, first=FIRST, days=DAYS)
     value = DateRange(FIRST, FIRST + dt.timedelta(days=DAYS - 1))
     config = default_only_config(base)
     outcome = run_engine(data_root=str(root_path), config_path=config, date_range=value, out_dir=base / "one")
@@ -293,7 +252,11 @@ def test_every_stream_of_every_run_is_registered_before_and_after(generated: dic
     finished = [row for row in rows if row["event"] == "trial_finished"]
     assert len(started) >= len(outcome.streams)
     assert len(started) == len(finished)
-    assert all(row["mode"] == "IDEAL-1M" and row["variant"] == "V0" for row in rows)
+    assert all(row["mode"] == "IDEAL-1M" for row in rows)
+    # C13: each V0 stream has a V0S control beside it, logged as a control.
+    assert all(row["variant"] == "V0" or (row["variant"] == VARIANT_V0S and row["control"]) for row in rows)
+    v0s = sum(1 for row in started if row["variant"] == VARIANT_V0S)
+    assert v0s == sum(1 for row in started if row["variant"] == "V0") >= len(outcome.streams)
     assert all(row["costs"]["rt_bps"] == 12.0 and row["costs"]["stop_slip_bps"] == 5.0 for row in rows)
     assert all(row["date_range"] == {"start": "2000-01-03", "end": "2000-03-12"} for row in rows)
     assert {row["strategy"] for row in started} >= {stream.strategy for stream in outcome.streams}
@@ -382,9 +345,8 @@ def test_the_overlap_between_assets_is_reported(generated: dict[str, Any]) -> No
 
 def test_what_is_not_built_is_stated(generated: dict[str, Any]) -> None:
     run = _load(generated["out"], "run")
-    assert {"V0S", "counterfactuals", "netted_portfolio", "deflated_sharpe", "selection"} <= set(
-        run["not_built"]
-    )
+    assert {"counterfactuals", "netted_portfolio", "deflated_sharpe", "selection"} <= set(run["not_built"])
+    assert "V0S" not in run["not_built"]
     assert "not available" in run["header"]["modes"]["IDEAL"]
     assert "C-10" in run["header"]["modes"]["CYCLE"]
 
@@ -596,8 +558,13 @@ def test_every_grid_line_runs_is_logged_and_the_default_is_marked(tmp_path: Path
         assert sum(1 for row in mine if row["is_default"]) == 2
     lines = root.guard.check(REGISTRY_PATH).read_text(encoding="utf-8").splitlines()
     started = [json.loads(line) for line in lines if '"trial_started"' in line]
-    assert len(started) == 120
-    assert len({row["trial_key"] for row in started}) == 120
+    v0 = [row for row in started if row["variant"] == "V0"]
+    assert len(v0) == 120
+    assert len({row["trial_key"] for row in v0}) == 120
+    # A V0S control beside each, with its own key.
+    v0s = [row for row in started if row["variant"] == VARIANT_V0S]
+    assert len(v0s) == 120 and all(row["control"] for row in v0s)
+    assert len({row["trial_key"] for row in started}) == 240
 
 
 def test_read_days_must_be_stated() -> None:
@@ -690,7 +657,9 @@ def test_the_market_configuration_is_otherwise_complete_and_names_only_the_first
     assert config.costs.rt_bps == 12.0
     assert config.costs.stop_slip_bps == 5.0
     assert config.costs.stop_slip_state == "declared"
-    assert config.risk.state == "placeholder"
+    # EN-07: D-39 answers D-28, so the limits are declared, and the basis names D-39.
+    assert config.risk.state == "declared"
+    assert "D-39" in config.risk.basis
     assert "Not associated with or endorsed by Binance" in config.credit_line
 
 

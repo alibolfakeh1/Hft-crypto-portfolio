@@ -26,7 +26,14 @@ from typing import Any
 import numpy as np
 
 from hft_crypto.bars.core import TimingContractError
-from hft_crypto.engine.accounting import Booked, CashEvent, ExitLeg, FundingCharge, book_trade
+from hft_crypto.engine.accounting import (
+    Booked,
+    CashEvent,
+    ExitLeg,
+    FundingCharge,
+    FundingGap,
+    book_trade,
+)
 from hft_crypto.engine.config import CostConfig
 from hft_crypto.engine.exits import ratchet
 from hft_crypto.engine.fills import (
@@ -55,6 +62,8 @@ VARIANT = "V0"
 BAR_NOT_COMPLETE = "BAR_NOT_COMPLETE_AS_OF_CLOSE"
 LEFT_OUT_UNOPENED = "LEFT_OUT_REACHES_UNOPENED_DATE"
 LEFT_OUT_READ_DAY = "LEFT_OUT_REACHES_READ_DAY"
+ENTRY_COLLAR = "ENTRY_COLLAR"
+ENTRY_ACROSS_GAP = "ENTRY_ACROSS_GAP"
 _QTY_EPSILON = 1e-9
 
 
@@ -86,10 +95,35 @@ class SimParams:
 
 @dataclass(frozen=True)
 class FundingEvent:
-    """One settlement: its time, the rate published then, and when that rate became knowable."""
+    """One settlement: its time and the rate published then. A rate of None means the file has none for it."""
 
     settle_us: int
-    rate: float
+    rate: float | None
+
+
+@dataclass(frozen=True)
+class SymbolData:
+    """Everything one run holds for one symbol."""
+
+    tape: MinuteTape
+    trades: TradeTape | None
+    funding: tuple[FundingEvent, ...]
+
+
+def left_out_reason(
+    signal_us: int,
+    h_max_us: int,
+    span_end_us: int | None,
+    read_days_us: tuple[tuple[int, int], ...],
+) -> str | None:
+    """C18's `reaches`, on the maximum hold, so leaving a setup out does not depend on how it would end."""
+    reach = signal_us + h_max_us
+    if span_end_us is not None and reach >= span_end_us:
+        return LEFT_OUT_UNOPENED
+    for start, end in read_days_us:
+        if start <= reach and signal_us < end:
+            return LEFT_OUT_READ_DAY
+    return None
 
 
 @dataclass
@@ -105,6 +139,21 @@ class _Scheduled:
     effective_us: int
     stop: float | None = None
     move: TargetMove | None = None
+    stop_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class RefusedEntry:
+    """An entry decided and then not filled. The portfolio's cap reserves its room until `refused_from_us`."""
+
+    strategy: str
+    symbol: str
+    signal_us: int
+    decided_as_of_us: int
+    q0: float
+    decision_price: float
+    refused_from_us: int
+    reason: str
 
 
 @dataclass
@@ -114,6 +163,8 @@ class _Pending:
     signal_us: int
     decided_as_of_us: int
     not_before_us: int
+    # The next minute the entry may fill in. It moves on only across a minute proved to have no trades.
+    next_minute_us: int
 
 
 @dataclass
@@ -145,6 +196,8 @@ class _Position:
     scheduled: list[_Scheduled] = field(default_factory=list)
     exits: list[ExitLeg] = field(default_factory=list)
     funding: list[FundingCharge] = field(default_factory=list)
+    funding_gaps: list[FundingGap] = field(default_factory=list)
+    stop_reason_in_force: str | None = None
     stop_path: list[dict[str, Any]] = field(default_factory=list)
     target_path: list[dict[str, Any]] = field(default_factory=list)
     last_row: int = 0
@@ -204,6 +257,7 @@ class TradeRecord:
     line: str
     is_default: bool
     in_portfolio: bool
+    funding_gaps: tuple[FundingGap, ...] = ()
 
     def book(self, scale: float = 1.0) -> tuple[list[CashEvent], Booked]:
         return book_trade(
@@ -237,6 +291,7 @@ class StreamResult:
     counters: dict[str, int]
     trades: list[TradeRecord]
     events: list[dict[str, Any]]
+    refused_entries: list[RefusedEntry] = field(default_factory=list)
 
 
 class Simulator:
@@ -270,6 +325,7 @@ class Simulator:
         self._cursor = 0
         self.events: list[dict[str, Any]] = []
         self.finished: list[TradeRecord] = []
+        self.refused_entries: list[RefusedEntry] = []
         self.counters: Counter[str] = Counter()
         self.setups = 0
         # A memoryview reads one plain value at a time far faster than an array, and copies nothing.
@@ -329,6 +385,7 @@ class Simulator:
             counters=dict(sorted(self.counters.items())),
             trades=self.finished,
             events=self.events,
+            refused_entries=self.refused_entries,
         )
 
     def _log(self, kind: str, *, knowable_us: int, **fields: Any) -> None:
@@ -373,7 +430,9 @@ class Simulator:
     def _take(self, proposal: Proposal, bar: Bar, strategy: Strategy, decided_as_of: int) -> None:
         if bar.atr is None:
             raise TimingContractError(f"{strategy.id} proposed a setup at a close with no ATR")
-        out_because = self._left_out(bar.close_us, strategy.h_max_us)
+        out_because = left_out_reason(
+            bar.close_us, strategy.h_max_us, self.params.span_end_us, self.params.read_days_us
+        )
         if out_because is not None:
             # FP-06: never simulated, so the strategy stays flat across it and no later setup's fate rests on
             # it. FP-07: by C18's `reaches`, on the maximum hold, so leaving it out does not depend on how it
@@ -450,18 +509,9 @@ class Simulator:
             signal_us=bar.close_us,
             decided_as_of_us=decided_as_of,
             not_before_us=decided_as_of,
+            next_minute_us=ceil_minute(decided_as_of),
         )
         strategy.notify_sent(proposal)
-
-    def _left_out(self, signal_us: int, h_max_us: int) -> str | None:
-        reach = signal_us + h_max_us
-        span_end = self.params.span_end_us
-        if span_end is not None and reach >= span_end:
-            return LEFT_OUT_UNOPENED
-        for start, end in self.params.read_days_us:
-            if start <= reach and signal_us < end:
-                return LEFT_OUT_READ_DAY
-        return None
 
     def _manage(self, position: _Position, bar: Bar, market: MarketView, decided_as_of: int) -> None:
         if position.pending_exit_us is not None:
@@ -493,7 +543,7 @@ class Simulator:
         if result.reason is not None:
             old = position.stop_planned
             position.stop_planned = result.stop
-            position.scheduled.append(_Scheduled(effective, stop=result.stop))
+            position.scheduled.append(_Scheduled(effective, stop=result.stop, stop_reason=result.reason))
             row = {
                 "computed_at_us": bar.close_us,
                 "effective_from_us": effective,
@@ -550,25 +600,64 @@ class Simulator:
         if position is not None:
             self._walk_position(position, row)
 
-    def _try_fill(self, pending: _Pending, row: int) -> None:
-        reference = self._o[row]
-        if reference != reference:  # NaN: this minute has no price, so the fill uses the first that does
-            return
+    def _flagged_by_now(self, row: int) -> bool:
+        """A flag on this minute, known by the time its own close can be read. A later one cannot stop a
+        fill."""
+        tape = self.tape
+        return (
+            bool(tape.gap[row]) and int(tape.knowable_us[row]) <= self._close_us[row] + self.params.delay_us
+        )
+
+    def _refuse_entry(self, pending: _Pending, row: int, reason: str) -> None:
         self._pending = None
         plan = pending.plan
-        proposal = pending.proposal
+        self.refused_entries.append(
+            RefusedEntry(
+                self.strategy.id,
+                self.tape.symbol,
+                pending.signal_us,
+                pending.decided_as_of_us,
+                plan.q0,
+                plan.decision_price,
+                pending.next_minute_us,
+                reason,
+            )
+        )
+
+    def _try_fill(self, pending: _Pending, row: int) -> None:
+        reference = self._o[row]
+        plan = pending.plan
         event_us = self._close_us[row]
+        if self._open_us[row] != pending.next_minute_us or self._flagged_by_now(row):
+            # EN-06: nothing can be known of a price inside a hole. Waiting across one would drop the setup on
+            # an adverse move, through the collar, and improve its fill on a favourable one.
+            self.counters["entry_across_gap"] += 1
+            self._log(
+                ENTRY_ACROSS_GAP,
+                knowable_us=event_us,
+                computed_at_us=pending.signal_us,
+                first_allowed_us=pending.next_minute_us,
+                side=plan.side,
+            )
+            self._refuse_entry(pending, row, ENTRY_ACROSS_GAP)
+            return
+        if reference != reference:  # NaN: this minute is proved empty, so the fill uses the first that prints
+            pending.next_minute_us += MICROS_PER_MINUTE
+            return
+        proposal = pending.proposal
         if beyond_collar(plan, reference):
             self.counters["entry_collar"] += 1
             self._log(
-                "ENTRY_COLLAR",
+                ENTRY_COLLAR,
                 knowable_us=event_us,
                 computed_at_us=pending.signal_us,
                 reference=reference,
                 limit=plan.limit,
                 side=plan.side,
             )
+            self._refuse_entry(pending, row, ENTRY_COLLAR)
             return
+        self._pending = None
         fill = entry_fill_price(reference, plan.side, self.params.costs)
         r = abs(fill - plan.s0)
         rt = self.params.costs.rt
@@ -632,21 +721,22 @@ class Simulator:
                     self._apply(position, item)
         position.last_row = row
         open_ = self._o[row]
+        close_us = self._close_us[row]
         if (
             open_ != open_
         ):  # NaN: a minute with no trades touches nothing, and the position stays open across it
-            self._charge_funding(position, row)
+            self._charge_funding(position, close_us, row)
             return
         side = position.side
-        close_us = self._close_us[row]
         costs = self.params.costs
+        # Everything up to this open is owed whatever follows, even a settlement inside a hole in the rows.
+        self._charge_funding(position, open_us, row)
         if position.pending_exit_us is not None and open_us >= position.pending_exit_us:
             # This exit fills at the open, so a settlement later in this minute falls after it and is not
             # owed.
             price = exit_price(open_, side, costs.slip)
             self._exit_rest(position, close_us, open_, price, position.pending_exit_reason, costs.fee_taker)
             return
-        self._charge_funding(position, row)
         stop = position.stop
         high = self._h[row] if side > 0 else -self._l[row]
         low = self._l[row] if side > 0 else -self._h[row]
@@ -655,10 +745,12 @@ class Simulator:
         position.best = max(position.best, high)
         position.worst = min(position.worst, low)
         if s_open <= s_stop:
+            # This also fills at the open, so the same holds.
             reason = "ENTRY_THROUGH_STOP" if row == position.fill_row else "STOP_GAP"
             price = exit_price(open_, side, costs.stop_slip)
             self._exit_rest(position, close_us, open_, price, reason, costs.fee_taker)
             return
+        self._charge_funding(position, close_us, row)
         if low <= s_stop:
             price = exit_price(stop, side, costs.stop_slip)
             self._exit_rest(position, close_us, stop, price, "STOP", costs.fee_taker)
@@ -681,6 +773,7 @@ class Simulator:
             if position.side * (item.stop - position.stop) < 0:
                 raise TimingContractError("a stop was about to move away from the market")
             position.stop = item.stop
+            position.stop_reason_in_force = item.stop_reason
         move = item.move
         if move is not None:
             for leg in position.legs:
@@ -689,18 +782,36 @@ class Simulator:
                     if move.set_fraction:
                         leg.fraction = move.fraction
 
-    def _charge_funding(self, position: _Position, row: int) -> None:
+    def _charge_funding(self, position: _Position, through_us: int, row: int) -> None:
+        """C10: every settlement in (entry fill, this moment] is owed once, on the quantity open now.
+
+        A settlement that fell in a hole in the rows is charged at the first row after the hole. A settlement
+        with no rate books nothing: C17 logs it as `DATA_GAP` and does not assume one, and the trade carries
+        it as unresolved.
+        """
         schedule = self._funding
         cursor = self._funding_cursor
-        open_us = self._open_us[row]
-        close_us = self._close_us[row]
-        while cursor < len(schedule) and schedule[cursor].settle_us <= open_us:
+        size = len(schedule)
+        if cursor >= size or schedule[cursor].settle_us > through_us:
+            return
+        while cursor < size and schedule[cursor].settle_us <= position.fill_us:
             cursor += 1
-        while cursor < len(schedule) and schedule[cursor].settle_us <= close_us:
+        close_us = self._close_us[row]
+        while cursor < size and schedule[cursor].settle_us <= through_us:
             event = schedule[cursor]
-            # C10: charged when entry fill time < settlement <= exit fill time.
-            if position.fill_us < event.settle_us:
-                mark = self._mark_for_funding(row)
+            mark = self._mark_for_funding(row)
+            if event.rate is None:
+                position.funding_gaps.append(FundingGap(event.settle_us, position.qty, mark))
+                self.counters["funding_rate_missing"] += 1
+                self._log(
+                    "DATA_GAP",
+                    knowable_us=close_us,
+                    source="funding",
+                    settle_us=event.settle_us,
+                    qty=position.qty,
+                    mark=mark,
+                )
+            else:
                 position.funding.append(FundingCharge(event.settle_us, event.rate, position.qty, mark))
                 self._log(
                     "FUNDING",
@@ -783,6 +894,14 @@ class Simulator:
         plan = position.plan
         recorded = tuple(position.exits)
         legs, gap_start = self._apply_gap_rule(position, recorded)
+        # C2's headline treats the position as stopped at the gap, so nothing after that is owed.
+        taken_at_gap = legs is not recorded and gap_start is not None
+        funding = tuple(
+            item for item in position.funding if not taken_at_gap or item.settle_us <= (gap_start or 0)
+        )
+        funding_gaps = tuple(
+            item for item in position.funding_gaps if not taken_at_gap or item.settle_us <= (gap_start or 0)
+        )
         final_reason = legs[-1].reason
         status = "open" if legs[-1].open_at_end else "closed"
         return TradeRecord(
@@ -810,7 +929,7 @@ class Simulator:
             level=position.proposal.level,
             entry_fee_rate=self.params.costs.fee_taker,
             legs=legs,
-            funding=tuple(position.funding),
+            funding=funding,
             stop_path=tuple(position.stop_path),
             target_path=tuple(position.target_path),
             exit_reason=final_reason,
@@ -826,6 +945,7 @@ class Simulator:
             line=self._line,
             is_default=self._is_default,
             in_portfolio=self._in_portfolio,
+            funding_gaps=funding_gaps,
         )
 
     def _apply_gap_rule(
@@ -875,11 +995,15 @@ class Simulator:
             stop_in_force=stop,
             signal_us=position.signal_us,
         )
-        as_recorded = self._net_of(position, recorded)
-        touched = self._net_of(position, alternative)
+        as_recorded = self._net_of(position, recorded, tuple(position.funding))
+        touched = self._net_of(
+            position, alternative, tuple(item for item in position.funding if item.settle_us <= gap_start)
+        )
         return (alternative if touched < as_recorded else recorded), gap_start
 
-    def _net_of(self, position: _Position, legs: tuple[ExitLeg, ...]) -> int:
+    def _net_of(
+        self, position: _Position, legs: tuple[ExitLeg, ...], funding: tuple[FundingCharge, ...]
+    ) -> int:
         _, booked = book_trade(
             side=position.side,
             entry_us=self._close_us[position.fill_row],
@@ -888,16 +1012,19 @@ class Simulator:
             q0=position.q0,
             entry_fee_rate=self.params.costs.fee_taker,
             legs=legs,
-            funding=tuple(position.funding),
+            funding=funding,
         )
         return booked.net
 
 
 def _stop_kind(position: _Position) -> str:
-    """Which kind of stop was in force at the end, for the exit reasons in section 5 of the outputs."""
-    if not position.stop_path:
+    """Which kind of stop was in force at the end, for the exit reasons in section 5 of the outputs.
+
+    The one acting then, and not the newest planned, which may not yet have reached its first minute.
+    """
+    reason = position.stop_reason_in_force
+    if reason is None:
         return "initial"
-    final = position.stop_path[-1]
-    if final["reason"] == BREAK_EVEN:
+    if reason == BREAK_EVEN:
         return "break_even"
     return "trailed"

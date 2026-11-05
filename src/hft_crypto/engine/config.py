@@ -26,7 +26,7 @@ FUNDING_MODES = frozenset({"absent", "required"})
 VALUE_STATES = frozenset({"placeholder", "declared"})
 LINE_SETS = frozenset({"all", "default_only"})
 STRATEGY_IDS = ("S01", "S02", "S03", "S04", "S05", "S06", "S07", "S08", "S09", "S10")
-_TOP_KEYS = frozenset({"schema_version", "run", "timing", "costs", "risk", "strategies", "ticks"})
+_TOP_KEYS = frozenset({"schema_version", "run", "timing", "costs", "risk", "strategies", "ticks", "placebo"})
 _RUN_KEYS = frozenset(
     {
         "data_kind",
@@ -45,6 +45,9 @@ _TIMING_KEYS = frozenset({"latency_ms"})
 _COST_KEYS = frozenset({"rt_bps", "slip_bps", "stop_slip_bps", "stop_slip_state", "target_fee_bps", "basis"})
 _RISK_KEYS = frozenset({"state", "basis", "capital", "leverage_cap", "gross_cap", "per_trade_pct"})
 _STRATEGY_KEYS = frozenset({"default_line", "default_state", "portfolio_line", "portfolio_state", "grid"})
+_PLACEBO_KEYS = frozenset({"draws"})
+# C15 declares this in advance, so a market run may not state another count. A generated run may, for tests.
+DECLARED_PLACEBO_DRAWS = 200
 
 
 def _table(raw: dict[str, Any], key: str, where: str) -> dict[str, Any]:
@@ -224,6 +227,7 @@ class EngineConfig:
     opened_blocks: tuple[str, ...]
     read_days: tuple[dt.date, ...]
     line_set: str
+    placebo_draws: int = DECLARED_PLACEBO_DRAWS
     config_hash: str = field(default="")
 
     def tick(self, symbol: str) -> float:
@@ -356,8 +360,26 @@ def parse_engine_config(raw: dict[str, Any]) -> EngineConfig:
         for strategy in STRATEGY_IDS
     }
 
+    placebo = _table(raw, "placebo", "engine config")
+    _keys(placebo, _PLACEBO_KEYS, "placebo")
+    placebo_draws = placebo["draws"]
+    if isinstance(placebo_draws, bool) or not isinstance(placebo_draws, int) or placebo_draws < 1:
+        raise ConfigError(f"placebo: draws must be a whole number above zero, not {placebo_draws!r}")
+    data_kind = _text(run, "data_kind", "run", DATA_KINDS)
+    if data_kind == "MARKET":
+        # D-35: the portfolio figure uses each strategy's C18 default line, so an edit cannot pick another.
+        moved = [name for name, grid in strategies.items() if grid.portfolio_line != grid.default_line]
+        if moved:
+            raise ConfigError(
+                f"D-35: on market data portfolio_line must be the default line, not so for {moved}"
+            )
+    if data_kind == "MARKET" and placebo_draws != DECLARED_PLACEBO_DRAWS:
+        raise ConfigError(
+            f"placebo: C15 declares {DECLARED_PLACEBO_DRAWS} draws, and a change is a new document version"
+        )
+
     return EngineConfig(
-        data_kind=_text(run, "data_kind", "run", DATA_KINDS),
+        data_kind=data_kind,
         venue=_text(run, "venue", "run"),
         symbols=tuple(symbols),
         tier=_text(run, "tier", "run", TIERS),
@@ -372,6 +394,7 @@ def parse_engine_config(raw: dict[str, Any]) -> EngineConfig:
         opened_blocks=tuple(opened),
         read_days=tuple(read_days),
         line_set=_text(run, "lines", "run", LINE_SETS),
+        placebo_draws=placebo_draws,
         config_hash=stable_hash(raw),
     )
 

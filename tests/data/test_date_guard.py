@@ -758,7 +758,9 @@ def test_a_refusal_by_the_host_stops_the_job_with_a_fixed_code(
     fetcher.failures[target.url] = FetchError("403 and any words the host chose")
     document = _run(one_quarter, _check_root(tmp_path / "check"), fetcher)
     assert document["stopped"] == "fetch_refused"
-    assert document["quarters"][0]["passes"] is False
+    # RA-02: a stopped run decides nothing, so no quarter can be read as failing for a reason that is not
+    # coverage. It is rerun in a new root.
+    assert document["quarters"] == []
     # It stopped there, and did not go round it.
     march = monthly_candle_file(one_quarter, "binance", BTC, dt.date(2024, 3, 1))
     assert march.url not in fetcher.requests
@@ -1129,3 +1131,67 @@ def test_the_check_sets_nothing_so_ideal_stays_off_until_someone_with_the_eviden
     _run_candle(config, _check_root(tmp_path / "check"), _publish_sample(config))
     assert config.source("binance").candle_check == "not_shown"
     assert config.source("binance").ideal_allowed is False
+
+
+# ---- RA-02 ---------------------------------------------------------------------------------------------
+
+
+from hft_crypto.data.parsers import ValidationError  # noqa: E402
+
+
+def _coverage_document(stopped: str, quarters: list[dict[str, object]]) -> dict[str, object]:
+    return {
+        "check": "x",
+        "code_version": "x",
+        "run_at": "x",
+        "file_list_sha256": "x",
+        "stopped": stopped,
+        "quarters": quarters,
+    }
+
+
+def _candle_document(stopped: str, days: list[dict[str, object]]) -> dict[str, object]:
+    return {
+        "check": "x",
+        "code_version": "x",
+        "run_at": "x",
+        "days_sha256": "x",
+        "stopped": stopped,
+        "days": days,
+        "symbols": [],
+    }
+
+
+_QUARTER = {
+    "quarter": "2024-Q1",
+    "symbol": "BTCUSDT",
+    "files": 3,
+    "files_checksum_ok": 3,
+    "rows": 1,
+    "empty_minutes_unproved": 0,
+    "empty_minutes_proved": 0,
+    "row_checks_pass": True,
+    "passes": True,
+}
+_DAY: dict[str, object] = {"day": "2021-03-15", "symbol": "BTCUSDT", "result": "PASS", "code": "pass"}
+
+
+@pytest.mark.parametrize("word", ["fetch refused", "403 Forbidden by the host", "", "None", "stopped"])
+def test_ra02_stopped_holds_only_its_two_words(word: str) -> None:
+    from hft_crypto.data.coverage import check_candle_output, check_output
+
+    check_output(_coverage_document("none", [_QUARTER]))
+    check_output(_coverage_document("fetch_refused", []))
+    with pytest.raises(ValidationError, match="off the list"):
+        check_output(_coverage_document(word, []))
+    with pytest.raises(ValidationError, match="off the list"):
+        check_candle_output(_candle_document(word, []))
+
+
+def test_ra02_a_stopped_run_holds_no_result_to_read() -> None:
+    from hft_crypto.data.coverage import check_candle_output, check_output
+
+    with pytest.raises(ValidationError, match="decides nothing"):
+        check_output(_coverage_document("fetch_refused", [_QUARTER]))
+    with pytest.raises(ValidationError, match="decides nothing"):
+        check_candle_output(_candle_document("fetch_refused", [_DAY]))

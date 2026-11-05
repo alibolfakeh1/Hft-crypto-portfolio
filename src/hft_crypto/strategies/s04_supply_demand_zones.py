@@ -30,6 +30,7 @@ from hft_crypto.strategies.base import (
     sided,
     sided_clv,
 )
+from hft_crypto.strategies.sources import LevelSource
 from hft_crypto.strategies.zones import Zone, ZoneBook
 
 _SCALE_T1 = 0.5
@@ -53,6 +54,9 @@ class _Memo:
 
 class S04SupplyDemandZones(Strategy):
     id = "S04"
+    # 7.10.
+    v0s_m = 2.5
+    v0s_hold_bars: ClassVar[dict[int, int]] = {60: 48, 240: 24}
     h_max_hours: ClassVar[dict[int, float]] = {60: 96.0, 240: 168.0}
     requirements = (
         "ATR(14) on the decision timeframe, defined at the base",
@@ -60,11 +64,11 @@ class S04SupplyDemandZones(Strategy):
         "A zone born earlier, returned to for the first time",
     )
 
-    def __init__(self, params: dict[str, Any]) -> None:
+    def __init__(self, params: dict[str, Any], source: LevelSource | None = None) -> None:
         super().__init__(params)
         self.q_min = float(params["q_min"])
         self.touch_limit = int(params["touch_limit"])
-        self.book = ZoneBook(self.timeframe_minutes)
+        self.book = ZoneBook(self.timeframe_minutes, source)
         self._new_stack: list[Zone] = []
 
     def on_close(self, market: MarketView) -> list[Proposal]:
@@ -83,17 +87,19 @@ class S04SupplyDemandZones(Strategy):
         if len(market.bars) < 2:
             self.note(NO_PATTERN)
             return []
-        best: Proposal | None = None
+        # C5: the pick among zones on one bar is final, so a setup that then fails tries no other zone.
+        best: Zone | None = None
         best_q = -1.0
         for zone in self.book.entry:
-            quality = self.book.quality(zone, bar)
-            if not zone.active or quality <= best_q or not self._qualifies(zone, market, quality):
+            if not zone.active:
                 continue
-            proposal = self._setup(market, bar, zone)
-            if proposal is not None:
-                best, best_q = proposal, quality
+            quality = self.book.quality(zone, bar)
+            if quality > best_q and self._qualifies(zone, market, quality):
+                best, best_q = zone, quality
         if best is not None:
-            return [best]
+            proposal = self._setup(market, bar, best)
+            if proposal is not None:
+                return [proposal]
         self.note(NO_PATTERN)
         return []
 
@@ -107,7 +113,9 @@ class S04SupplyDemandZones(Strategy):
         dist = side * zone.dist
         _, _, low, close = sided(bar, side)
         return (
-            zone.touches_before(bar.close_us) <= self.touch_limit
+            # 7.9: a zone born at a close never affects that bar.
+            zone.birth_index < bar.index
+            and zone.touches_before(bar.close_us) <= self.touch_limit
             and quality >= self.q_min
             and side * market.bars[-2].c > prox
             and low <= prox

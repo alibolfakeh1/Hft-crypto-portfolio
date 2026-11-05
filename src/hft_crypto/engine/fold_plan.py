@@ -47,6 +47,28 @@ PLAN_ORDER = (
         "LOCKED BLOCK, read on 10 listed days (D-27)",
     ),
 )
+# Fold plan section 4, and D-41: the days already read. Their bars stay for continuity, and a range touching
+# one is refused unless the configuration lists it, so a setup reaching it is left out under FP-07.
+READ_DAYS = (
+    dt.date(2024, 6, 1),
+    dt.date(2025, 12, 1),
+    dt.date(2026, 1, 1),
+    dt.date(2026, 2, 1),
+    dt.date(2026, 3, 1),
+    dt.date(2026, 4, 1),
+    dt.date(2026, 5, 1),
+    dt.date(2026, 6, 1),
+    dt.date(2026, 7, 1),
+    dt.date(2026, 8, 1),
+    dt.date(2026, 9, 1),
+    *(dt.date(2026, 10, 5) + dt.timedelta(days=offset) for offset in range(30)),
+    dt.date(2026, 10, 1),
+    dt.date(2026, 11, 1),
+)
+# D-38. Every report on test or locked dates carries this sentence.
+D38_SENTENCE = "About 137 MB of D-18 could not be dated. Whether it touched these dates is UNVERIFIED (D-38)"
+# Fold plan section 5. A run on market data outside the candidate family, counted beside the registry's lines.
+COUNTED_OUTSIDE_REGISTRY = {"D-32": 2}
 # Generated dates sit before either asset existed, so they can only ever mean generated data.
 GENERATED_BLOCK = Block("generated", dt.date(1990, 1, 1), dt.date(2019, 12, 31), "")
 
@@ -70,8 +92,16 @@ def opened_blocks(names: tuple[str, ...], data_kind: str) -> tuple[Block, ...]:
     return PLAN_ORDER[: len(names)]
 
 
-def check_range(date_range: DateRange, names: tuple[str, ...], data_kind: str) -> tuple[Block, ...]:
-    """Refuse a range reaching outside what is open. Returns the blocks it touches."""
+def check_range(
+    date_range: DateRange,
+    names: tuple[str, ...],
+    data_kind: str,
+    read_days: tuple[dt.date, ...] = (),
+) -> tuple[Block, ...]:
+    """Refuse a range reaching outside what is open, or touching a day already read that the configuration
+    does not list (EN-05). Returns the blocks it touches. What is open is checked first, so a range outside
+    it is refused for that, whatever days it touches.
+    """
     blocks = opened_blocks(names, data_kind)
     first, last = blocks[0].first, blocks[-1].last
     if date_range.start < first or date_range.end > last:
@@ -79,10 +109,22 @@ def check_range(date_range: DateRange, names: tuple[str, ...], data_kind: str) -
             f"the range {date_range.start} to {date_range.end} reaches outside the opened dates, "
             f"{first} to {last}, so this run is refused"
         )
+    unlisted = sorted(
+        day for day in READ_DAYS if date_range.start <= day <= date_range.end and day not in read_days
+    )
+    if unlisted:
+        raise ConfigError(
+            f"the range touches days already read under section 4 of the fold plan, {unlisted}, and the "
+            "configuration's read_days does not list them, so this run is refused"
+        )
     return tuple(
         block for block in blocks if block.first <= date_range.end and block.last >= date_range.start
     )
 
 
 def span_labels(blocks: tuple[Block, ...]) -> tuple[str, ...]:
-    return tuple(block.label for block in blocks if block.label)
+    """Each block's label. A test or locked block also carries D-38's sentence, beside the D-27 label."""
+    labels = tuple(block.label for block in blocks if block.label)
+    if any(block.name != FIRST_TRAINING_SPAN.name and block.label for block in blocks):
+        labels = (*labels, D38_SENTENCE)
+    return labels

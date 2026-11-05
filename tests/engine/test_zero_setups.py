@@ -114,9 +114,12 @@ def test_the_days_really_are_separate(with_trades: tuple[MinuteTape, TradeTape |
     tape, _ = with_trades
     assert tape.size == 12 * 1440
     bars = tape.frame(60)
-    assert len(bars) == 12 * 24
+    traded = [bar for bar in bars if bar.has_price]
+    assert len(traded) == 12 * 24
+    # Each hour between the days is on the grid as a gap, under C2, and carries nothing.
+    assert all(bar.gap and not bar.complete for bar in bars if not bar.has_price)
     # Nothing carries across a month: no prior day, and ATR starts again each day.
-    first_of_each_day = [bar for bar in bars if bar.open_us % DAY == 0]
+    first_of_each_day = [bar for bar in traded if bar.open_us % DAY == 0]
     assert all(bar.day is None and bar.atr is None and bar.atrd is None for bar in first_of_each_day)
     assert all(bar.vr is None and bar.srv is None for bar in bars)
 

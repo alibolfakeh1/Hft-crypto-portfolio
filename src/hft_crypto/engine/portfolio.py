@@ -5,6 +5,14 @@ through every entry in the order it was decided, and asks what the portfolio hel
 that would take gross exposure past the cap is scaled to what is left, and an entry with nothing left is
 refused at this level. It stays on the stream's own record, and carries no weight in the portfolio's.
 
+**What was held, and not the headline.** A trade's headline legs can treat it as stopped at a gap, and which
+way is the headline is settled only when the trade ends. So this reads the path as it was recorded, which is
+what was held, and a later entry's size rests on nothing after its own decision (EN-01).
+
+**A refused entry holds its room until its fill minute.** At its decision nobody can know that the open will
+be past the collar, or that the minute will be missing. So it reserves its notional like any entry decided
+then, and the room comes back to any decision at or after the open of the minute that refused it (EN-03).
+
 Entries decided at one moment are taken in strategy and symbol order. That order is arbitrary. It is written
 down here so that it stays visible, because the first in line gets the room.
 """
@@ -14,7 +22,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from hft_crypto.engine.simulator import TradeRecord
+from hft_crypto.engine.simulator import RefusedEntry, TradeRecord
 
 TradeKey = tuple[str, str, str, int]
 
@@ -36,14 +44,14 @@ class CapDecision:
 
 def _open_qty(trade: TradeRecord, at_us: int) -> float:
     left = trade.q0
-    for leg in trade.legs:
+    for leg in trade.as_recorded_legs:
         if leg.event_us <= at_us and not leg.open_at_end:
             left -= leg.qty
     return max(left, 0.0)
 
 
 def _finished_by(trade: TradeRecord, at_us: int) -> bool:
-    return all(leg.event_us <= at_us and not leg.open_at_end for leg in trade.legs)
+    return all(leg.event_us <= at_us and not leg.open_at_end for leg in trade.as_recorded_legs)
 
 
 def apply_gross_cap(
@@ -52,26 +60,35 @@ def apply_gross_cap(
     capital: float,
     gross_cap: float,
     mark: Callable[[str, int], float | None],
+    refused: Sequence[RefusedEntry] = (),
 ) -> dict[TradeKey, CapDecision]:
     """A size factor for every trade counted in the portfolio, using only what was held at its decision."""
     limit = gross_cap * capital
-    ordered = sorted(trades, key=lambda item: (item.decided_as_of_us, item.strategy, item.symbol))
+    ordered: list[TradeRecord | RefusedEntry] = sorted(
+        (*trades, *refused), key=lambda item: (item.decided_as_of_us, item.strategy, item.symbol)
+    )
     decisions: dict[TradeKey, CapDecision] = {}
     held: list[tuple[TradeRecord, float]] = []
-    for trade in ordered:
-        moment = trade.decided_as_of_us
+    reserved: list[tuple[RefusedEntry, float]] = []
+    for entry in ordered:
+        moment = entry.decided_as_of_us
         held = [(item, scale) for item, scale in held if not _finished_by(item, moment)]
-        gross = 0.0
+        reserved = [(item, scale) for item, scale in reserved if item.refused_from_us > moment]
+        gross = sum(scale * item.q0 * item.decision_price for item, scale in reserved)
         for item, scale in held:
             if item.fill_us > moment:
                 gross += scale * item.q0 * item.decision_price
                 continue
             price = mark(item.symbol, moment)
             gross += scale * _open_qty(item, moment) * (item.fill if price is None else price)
-        notional = trade.q0 * trade.decision_price
+        notional = entry.q0 * entry.decision_price
         room = limit - gross
         scale = 1.0 if notional <= room else max(room, 0.0) / notional
-        decisions[trade_key(trade)] = CapDecision(scale, gross, notional)
+        if isinstance(entry, RefusedEntry):
+            if scale > 0.0:
+                reserved.append((entry, scale))
+            continue
+        decisions[trade_key(entry)] = CapDecision(scale, gross, notional)
         if scale > 0.0:
-            held.append((trade, scale))
+            held.append((entry, scale))
     return decisions

@@ -17,6 +17,7 @@ effect from its own knowable time, as `late_gap` on the bar being closed when it
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import cast
 
@@ -234,6 +235,10 @@ class MinuteTape:
             delay_us=delay_us,
         )
 
+    def __getstate__(self) -> dict[str, object]:
+        """A worker process builds the bars it needs, which costs less than carrying them across."""
+        return {**self.__dict__, "_frames": {}}
+
     def digest(self) -> str:
         """A hash of exactly what this run read, whichever files it came from."""
         hasher = hashlib.sha256()
@@ -300,6 +305,18 @@ class MinuteTape:
             for start, end in zip(starts.tolist(), ends.tolist(), strict=True)
         ]
 
+    def _on_grid(self, width_us: int) -> Iterator[tuple[int, int, int]]:
+        """The same, with an empty span for each bucket on the grid that has no rows. C2: bars sit on a fixed
+        grid, and a bar with no rows is a missing bar, so it must be seen as one.
+        """
+        previous: int | None = None
+        for bucket_close, first, end in self._spans(width_us):
+            if previous is not None:
+                for missing in range(previous + width_us, bucket_close, width_us):
+                    yield missing, first, first
+            yield bucket_close, first, end
+            previous = bucket_close
+
     def frame(self, minutes: int) -> list[Bar]:
         """Every bar of a timeframe that has closed in this tape, each with its as-of values. Cached."""
         cached = self._frames.get(minutes)
@@ -326,7 +343,7 @@ class MinuteTape:
         waiting: list[int] = []
         current_day: int | None = None
         current_day_open: float | None = None
-        for bucket_close, first, end in self._spans(width):
+        for bucket_close, first, end in self._on_grid(width):
             if bucket_close > last_close:
                 break  # the last bucket has not closed in this tape
             as_of = bucket_close + self.delay_us
@@ -406,7 +423,9 @@ class MinuteTape:
                 )
             )
             previous_close = c
-            previous_close_us = bucket_close
+            if end > first:
+                # A true range needs the close before it, and a bucket with no rows has none.
+                previous_close_us = bucket_close
         return bars
 
 
@@ -414,9 +433,8 @@ class _PeriodBook:
     """Completed days and weeks, finished in time order as they become knowable.
 
     A day whose last minutes are still unproven waits, and later days wait behind it. A day with a known gap,
-    or
-    with minutes missing, is not computed, and ATRD starts again after it. Nothing is carried across a hole:
-    the set in force for a bar is the day ending exactly at the start of its own UTC day, or nothing.
+    or with minutes missing, is not computed, and ATRD starts again after it. Nothing is carried across a
+    hole: the set in force for a bar is the day ending exactly at the start of its own UTC day, or nothing.
     """
 
     def __init__(self, tape: MinuteTape) -> None:

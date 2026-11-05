@@ -12,6 +12,10 @@ import numpy as np
 import polars as pl
 
 from hft_crypto.bars.core import UTC_TIME, build_bars_1m
+from hft_crypto.data.atomic import atomic_write_parquet
+from hft_crypto.data.catalog import Catalog
+from hft_crypto.data.derive import BARS_1M, TRADES
+from hft_crypto.data.zones import SYNTHETIC_MARKER, DataRoot
 from hft_crypto.engine.config import CostConfig, EngineConfig, load_engine_config
 from hft_crypto.engine.market import MarketView
 from hft_crypto.engine.simulator import SimParams, Simulator, StreamResult
@@ -36,6 +40,18 @@ def utc(year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> int:
 
 def engine_config() -> EngineConfig:
     return load_engine_config(GENERATED_CONFIG)
+
+
+def default_only_config(base: Path, *, draws: int | None = None) -> Path:
+    """The shipped file, with only the default lines, so a test stays quick. A test may state its draws."""
+    text = GENERATED_CONFIG.read_text(encoding="utf-8").replace('lines = "all"', 'lines = "default_only"')
+    name = "default_only.toml"
+    if draws is not None:
+        text = text.replace("draws = 200", f"draws = {draws}")
+        name = f"default_only_{draws}.toml"
+    path = base / name
+    path.write_text(text, encoding="utf-8")
+    return path
 
 
 def costs(rt_bps: float = 12.0, slip_bps: float = 1.0, stop_slip_bps: float = 5.0) -> CostConfig:
@@ -77,7 +93,7 @@ def generated_trades(
     *,
     seed: int,
     start_us: int,
-    days: int,
+    days: int = 70,
     per_minute: float = 1.2,
     start_price: float = 1000.0,
     daily_vol: float = 0.03,
@@ -155,6 +171,54 @@ def perturb_after(trades: pl.DataFrame, cut_us: int, seed: int) -> pl.DataFrame:
     return pl.concat([kept.select(noise.columns), noise])
 
 
+def candles_from(trades: pl.DataFrame, *, first_open_us: int, minutes: int) -> pl.DataFrame:
+    """Candles over `[open, open + 60 s)`, so a print exactly on a boundary falls in the later one.
+
+    A minute with no trades carries the last close forward, as a venue may, and reports a count of zero.
+    """
+    stamps = trades["ts"].dt.timestamp("us").to_numpy()
+    prices = trades["price"].to_numpy()
+    qty = trades["qty"].to_numpy()
+    slots = (stamps - first_open_us) // MINUTE
+    keep = (slots >= 0) & (slots < minutes)
+    slots, prices, qty = slots[keep], prices[keep], qty[keep]
+    order = np.lexsort((np.arange(slots.size), slots))
+    slots, prices, qty = slots[order], prices[order], qty[order]
+    starts = np.searchsorted(slots, np.arange(minutes), side="left")
+    ends = np.searchsorted(slots, np.arange(minutes), side="right")
+    rows: dict[str, list[Any]] = {
+        key: [] for key in ("open", "high", "low", "close", "volume", "quote_volume", "trade_count")
+    }
+    last = float(prices[0])
+    for begin, end in zip(starts.tolist(), ends.tolist(), strict=True):
+        if end > begin:
+            chunk = prices[begin:end]
+            amount = qty[begin:end]
+            rows["open"].append(float(chunk[0]))
+            rows["high"].append(float(chunk.max()))
+            rows["low"].append(float(chunk.min()))
+            rows["close"].append(float(chunk[-1]))
+            rows["volume"].append(float(amount.sum()))
+            rows["quote_volume"].append(float((chunk * amount).sum()))
+            rows["trade_count"].append(int(end - begin))
+            last = float(chunk[-1])
+        else:
+            for key in ("open", "high", "low", "close"):
+                rows[key].append(last)
+            rows["volume"].append(0.0)
+            rows["quote_volume"].append(0.0)
+            rows["trade_count"].append(0)
+    opens = first_open_us + np.arange(minutes, dtype=np.int64) * MINUTE
+    return pl.DataFrame(
+        {
+            "open_time": pl.Series(opens, dtype=pl.Int64).cast(UTC_TIME),
+            **{key: pl.Series(rows[key], dtype=pl.Float64) for key in rows if key != "trade_count"},
+            "trade_count": pl.Series(rows["trade_count"], dtype=pl.Int64),
+            "taker_buy_volume": pl.Series([value / 2.0 for value in rows["volume"]], dtype=pl.Float64),
+        }
+    )
+
+
 def minute_bars(trades: pl.DataFrame, *, first_close_us: int, last_close_us: int) -> pl.DataFrame:
     return build_bars_1m(
         trades,
@@ -204,6 +268,46 @@ def run_stream(
     }
     strategy = build_strategy(strategy_id, merged)
     return Simulator(strategy, tape, sim or sim_params(), trades=trades, probe=probe).run()
+
+
+def write_generated_root(
+    path: Path,
+    *,
+    first: dt.date = dt.date(2000, 1, 3),
+    days: int = 70,
+    seed: int = 41,
+    venue: str = "synthetic",
+    symbols: tuple[str, ...] = ("SYNTHBTC", "SYNTHETH"),
+) -> DataRoot:
+    """A root holding generated bars and trades, written where the reader looks for them."""
+    root = DataRoot(path)
+    root.guard.check(SYNTHETIC_MARKER).write_text("Generated test data. Not market data.\n", encoding="utf-8")
+    catalog = Catalog(root.catalog_path)
+    catalog.set_meta("data_kind", "SYNTHETIC")
+    catalog.close()
+    start = utc(first.year, first.month, first.day)
+    for index, symbol in enumerate(symbols):
+        trades = generated_trades(
+            seed=seed + index, start_us=start, days=days, start_price=1000.0 if index == 0 else 100.0
+        )
+        bars = minute_bars(
+            trades, first_close_us=start + MINUTE, last_close_us=start + days * DAY
+        ).with_columns(pl.lit(venue).alias("venue"), pl.lit(symbol).alias("symbol"))
+        for offset in range(days):
+            day = first + dt.timedelta(days=offset)
+            low = pl.lit(start + offset * DAY, dtype=pl.Int64).cast(UTC_TIME)
+            high = pl.lit(start + (offset + 1) * DAY, dtype=pl.Int64).cast(UTC_TIME)
+            atomic_write_parquet(
+                root.curated_part(BARS_1M, venue, symbol, day),
+                bars.filter((pl.col("open_time") >= low) & (pl.col("open_time") < high)),
+                guard=root.guard,
+            )
+            atomic_write_parquet(
+                root.curated_part(TRADES, venue, symbol, day),
+                trades.filter((pl.col("ts") >= low) & (pl.col("ts") < high)),
+                guard=root.guard,
+            )
+    return root
 
 
 # ---- a table of bars from a document's worked example

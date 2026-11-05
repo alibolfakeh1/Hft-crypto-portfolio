@@ -11,7 +11,7 @@ to choose anything.
 from __future__ import annotations
 
 import datetime as dt
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -28,7 +28,9 @@ from hft_crypto.data.guard import PathGuard
 from hft_crypto.data.reader import MarketReader, RunClock
 from hft_crypto.data.zones import DataRoot, DataRootError, resolve_data_root
 from hft_crypto.engine.config import DateRange, EngineConfig, load_engine_config
-from hft_crypto.engine.fold_plan import check_range, span_labels
+from hft_crypto.engine.fold_plan import COUNTED_OUTSIDE_REGISTRY, check_range, span_labels
+from hft_crypto.engine.funding import FundingRow, funding_schedule, missing_settlements
+from hft_crypto.engine.placebo import ControlLog, DrawStat, Plan, run_placebos
 from hft_crypto.engine.registry import TrialRegistry, trial_row
 from hft_crypto.engine.simulator import (
     MODE,
@@ -37,8 +39,10 @@ from hft_crypto.engine.simulator import (
     SimParams,
     Simulator,
     StreamResult,
+    SymbolData,
 )
 from hft_crypto.engine.tape import MinuteTape, TradeTape
+from hft_crypto.reports.placebo import not_requested_rows, placebo_rows
 from hft_crypto.reports.portfolio import (
     OutputRows,
     build_axis,
@@ -47,22 +51,17 @@ from hft_crypto.reports.portfolio import (
     row_label,
     stream_status,
 )
-from hft_crypto.strategies import available_strategies, build_strategy
+from hft_crypto.reports.v0s import v0s_rows, v0s_trade_rows
+from hft_crypto.strategies import available_strategies, build_strategy, strategy_class
+from hft_crypto.strategies.v0s import VARIANT_V0S, V0SControl
 from hft_crypto.synthetic import FIRST_DAY, SYNTHETIC_VENUE, synthetic_config
-from hft_crypto.timeutil import day_start_us, iso, utcnow
+from hft_crypto.timeutil import day_start_us, iso, iso_us, utcnow
 from hft_crypto.versioning import code_version, stable_hash
 
 _FloatArray = npt.NDArray[np.float64]
 # A stored row can take its knowable time from a later row. The as-of view handles that, so this bound only
 # has to let such a row through the reader's check. It reads nothing further, because the cut-off holds.
 _READ_SLACK_DAYS = 400
-
-
-@dataclass(frozen=True)
-class SymbolData:
-    tape: MinuteTape
-    trades: TradeTape | None
-    funding: tuple[FundingEvent, ...]
 
 
 @dataclass(frozen=True)
@@ -73,6 +72,7 @@ class RunOutcome:
     streams: tuple[StreamResult, ...]
     rows: OutputRows
     header: dict[str, Any]
+    placebo: tuple[dict[str, Any], ...] = ()
 
 
 def _refuse_inside_repository(path: Path) -> None:
@@ -176,15 +176,24 @@ def read_symbol(
             raise ConfigError(f"funding is required, and none was read for {symbol}")
         _inside_range(rows, date_range, "settle_time", "a funding row")
         ordered = rows.sort("settle_time")
-        funding = tuple(
-            FundingEvent(int(when), float(rate))
-            for when, rate in zip(
-                ordered["settle_time"].dt.timestamp("us").to_list(),
-                ordered["funding_rate"].to_list(),
-                strict=True,
-            )
+        funding = funding_schedule(
+            [
+                FundingRow(int(when), float(rate), int(hours))
+                for when, rate, hours in zip(
+                    ordered["settle_time"].dt.timestamp("us").to_list(),
+                    ordered["funding_rate"].to_list(),
+                    ordered["funding_interval_hours"].to_list(),
+                    strict=True,
+                )
+            ],
+            first_open_us=date_range.first_open_us,
+            end_us=date_range.end_us,
         )
     return SymbolData(tape, trades, funding)
+
+
+def _first_last(moments: tuple[int, ...]) -> list[str]:
+    return [iso_us(moments[0]), iso_us(moments[-1])] if moments else []
 
 
 def build_manifest(
@@ -203,7 +212,9 @@ def build_manifest(
             "flagged_gap_rows": int(tape.gap.sum()),
             "trade_rows": None if item.trades is None else int(item.trades.ts_us.size),
             "trade_rows_sha256": None if item.trades is None else item.trades.digest(),
-            "funding_rows": len(item.funding),
+            "funding_rows": sum(1 for event in item.funding if event.rate is not None),
+            "funding_settlements_with_no_rate": len(missing_settlements(item.funding)),
+            "funding_settlements_with_no_rate_first_last": _first_last(missing_settlements(item.funding)),
         }
     return {
         "venue": engine.venue,
@@ -212,6 +223,33 @@ def build_manifest(
         "date_range": date_range.as_output(),
         "symbols": symbols,
     }
+
+
+def _sim_params(
+    engine: EngineConfig,
+    *,
+    allowance_us: int,
+    minimum_allowance_us: int,
+    date_range: DateRange,
+) -> Callable[[str, str], SimParams]:
+    """The same parameters for a real stream and for its placebo, since C15 keeps configuration and mode."""
+    read_days_us = tuple((day_start_us(day), day_start_us(day) + 86_400_000_000) for day in engine.read_days)
+
+    def params_for(strategy_id: str, symbol: str) -> SimParams:
+        return SimParams(
+            costs=engine.costs,
+            latency_us=engine.latency_us,
+            allowance_us=allowance_us,
+            fill_span_allowance_us=minimum_allowance_us,
+            risk_budget=engine.risk.risk_budget(strategy_id, symbol),
+            capital=engine.risk.capital,
+            leverage_cap=engine.risk.leverage_cap,
+            tick=engine.tick(symbol),
+            span_end_us=date_range.end_us,
+            read_days_us=read_days_us,
+        )
+
+    return params_for
 
 
 def simulate_streams(
@@ -225,10 +263,13 @@ def simulate_streams(
     registry: TrialRegistry | None = None,
     manifest_hash: str = "",
     logged_at: str = "",
+    version: str = "",
 ) -> list[StreamResult]:
     """Each grid line of each strategy on each symbol, in a fixed order, each registered before it starts."""
     streams: list[StreamResult] = []
-    read_days_us = tuple((day_start_us(day), day_start_us(day) + 86_400_000_000) for day in engine.read_days)
+    params_for = _sim_params(
+        engine, allowance_us=allowance_us, minimum_allowance_us=minimum_allowance_us, date_range=date_range
+    )
     for strategy_id in strategies:
         for line in engine.lines(strategy_id):
             for symbol in engine.symbols:
@@ -250,26 +291,16 @@ def simulate_streams(
                         costs=engine.costs.declared_values(),
                         risk_state=engine.risk.state,
                         data_kind=engine.data_kind,
-                        code_version=code_version(),
+                        code_version=version,
                         config_hash=engine.config_hash,
                         manifest_hash=manifest_hash,
+                        lines_counted=strategy.lines_on(engine.tier),
                     )
                     registry.started(row, logged_at=logged_at)
                 result = Simulator(
                     strategy,
                     item.tape,
-                    SimParams(
-                        costs=engine.costs,
-                        latency_us=engine.latency_us,
-                        allowance_us=allowance_us,
-                        fill_span_allowance_us=minimum_allowance_us,
-                        risk_budget=engine.risk.risk_budget(strategy_id, symbol),
-                        capital=engine.risk.capital,
-                        leverage_cap=engine.risk.leverage_cap,
-                        tick=engine.tick(symbol),
-                        span_end_us=date_range.end_us,
-                        read_days_us=read_days_us,
-                    ),
+                    params_for(strategy_id, symbol),
                     trades=item.trades,
                     funding=item.funding,
                     line=line.line_id,
@@ -308,21 +339,150 @@ def _modes(engine: EngineConfig) -> dict[str, str]:
     }
 
 
-def _funding_note(engine: EngineConfig) -> str:
+def _funding_note(engine: EngineConfig, missing: dict[str, int]) -> str:
     if engine.funding == "absent":
         return "Funding is absent from this run: no funding was charged, so net figures leave it out"
-    return "Funding is charged at actual settlement times, under C10"
+    if any(missing.values()):
+        return (
+            "Funding is charged at actual settlement times, under C10. Some settlements have no rate, and "
+            "none is assumed under C17. A position open across one logs DATA_GAP and carries it as "
+            "unresolved, and net figures leave it out"
+        )
+    return (
+        "Funding is charged at actual settlement times, under C10. Every settlement in the range has a rate"
+    )
 
 
-def _not_built() -> dict[str, str]:
+def simulate_v0s(
+    engine: EngineConfig,
+    data: dict[str, SymbolData],
+    *,
+    allowance_us: int,
+    minimum_allowance_us: int,
+    strategies: Sequence[str],
+    date_range: DateRange,
+    registry: TrialRegistry | None = None,
+    manifest_hash: str = "",
+    logged_at: str = "",
+    version: str = "",
+) -> list[StreamResult]:
+    """C13: the `V0S` control on every line `V0` ran, each logged in the registry as a control."""
+    params_for = _sim_params(
+        engine, allowance_us=allowance_us, minimum_allowance_us=minimum_allowance_us, date_range=date_range
+    )
+    streams: list[StreamResult] = []
+    for strategy_id in strategies:
+        for line in engine.lines(strategy_id):
+            for symbol in engine.symbols:
+                item = data[symbol]
+                row = None
+                if registry is not None:
+                    row = trial_row(
+                        strategy=strategy_id,
+                        line=line.line_id,
+                        is_default=line.is_default,
+                        in_portfolio=False,
+                        symbol=symbol,
+                        params=line.params,
+                        mode=MODE,
+                        variant=VARIANT_V0S,
+                        tier=engine.tier,
+                        date_range=date_range.as_output(),
+                        costs=engine.costs.declared_values(),
+                        risk_state=engine.risk.state,
+                        data_kind=engine.data_kind,
+                        code_version=version,
+                        config_hash=engine.config_hash,
+                        manifest_hash=manifest_hash,
+                        lines_counted=0,
+                        control=True,
+                    )
+                    registry.started(row, logged_at=logged_at)
+                result = Simulator(
+                    V0SControl(build_strategy(strategy_id, line.params)),
+                    item.tape,
+                    params_for(strategy_id, symbol),
+                    trades=item.trades,
+                    funding=item.funding,
+                    line=line.line_id,
+                    is_default=line.is_default,
+                    in_portfolio=False,
+                ).run()
+                streams.append(result)
+                if registry is not None and row is not None:
+                    registry.finished(
+                        row,
+                        logged_at=logged_at,
+                        result={"setups": result.setups, "trades": len(result.trades)},
+                    )
+    return streams
+
+
+def _control_log(
+    engine: EngineConfig,
+    registry: TrialRegistry,
+    *,
+    date_range: DateRange,
+    manifest_hash: str,
+    logged_at: str,
+    version: str,
+) -> ControlLog:
+    """C15: placebo runs go in the trial registry as controls, each before it starts."""
+
+    def row(plan: Plan, draw: int) -> dict[str, Any]:
+        return trial_row(
+            strategy=plan.strategy,
+            line=plan.line,
+            is_default=True,
+            in_portfolio=False,
+            symbol=plan.symbol,
+            params=plan.params,
+            mode=MODE,
+            variant=VARIANT,
+            tier=engine.tier,
+            date_range=date_range.as_output(),
+            costs=engine.costs.declared_values(),
+            risk_state=engine.risk.state,
+            data_kind=engine.data_kind,
+            code_version=version,
+            config_hash=engine.config_hash,
+            manifest_hash=manifest_hash,
+            lines_counted=0,
+            draw=draw,
+        )
+
+    def started(plan: Plan, draw: int) -> None:
+        registry.started(row(plan, draw), logged_at=logged_at)
+
+    def finished(plan: Plan, stat: DrawStat) -> None:
+        registry.finished(
+            row(plan, stat.draw),
+            logged_at=logged_at,
+            result={"setups": stat.setups, "trades": stat.overall.trades},
+        )
+
+    return ControlLog(started, finished)
+
+
+def _not_built(*, placebo: bool) -> dict[str, str]:
     return {
-        "V0S": "Not built. The brief is V0, and the fold plan's owner view asks for it beside V0",
         "selection": "C18 selection for S01 and S06 is not built. No line is picked by outcome anywhere",
         "IDEAL_comparison": "Not reported, see modes",
         "counterfactuals": "SKIPPED_OPEN and ENTRY_COLLAR are logged. C14's counterfactuals are not built",
         "NO_RETEST_counterfactual": "S02 logs NO_RETEST. Its counterfactual at acceptance is not built",
         "G5_target_stress": "The two target stress cases in C7 are not built",
-        "placebo": "C15 placebos are not built in this command",
+        **(
+            {}
+            if placebo
+            else {
+                "placebo": "This command did not ask for C15 placebos. Ask with --placebo. See placebo.json"
+            }
+        ),
+        "placebo_named_extras": "Not built: S07's AVERAGE-PRICE and S10's unconditional breakout",
+        "closed_trade_equity": "docs/04 section 1's closed-trade equity series is not built",
+        "monthly_and_rolling_tables": "docs/04's monthly and rolling tables are not built",
+        "confidence_intervals": "Headline figures carry a sample size and no confidence interval",
+        "s01_confluence_log": "Not built, because S01 does not say how close two levels must be to coincide",
         "netted_portfolio": "Section 9 also asks for positions netted by symbol. Only their sum is built",
         "deflated_sharpe": "Not computed. It needs the registry's pooled trial count",
         "share_of_risk": "Not computed. Layer 5 has no method for it yet",
@@ -340,6 +500,10 @@ def write_outputs(
     manifest: dict[str, Any],
     trials: list[dict[str, Any]],
     streams: Sequence[StreamResult],
+    placebo: list[dict[str, Any]],
+    placebo_ran: bool,
+    v0s: list[dict[str, Any]],
+    v0s_trades: list[dict[str, Any]],
 ) -> None:
     def write(name: str, rows: list[dict[str, Any]]) -> None:
         atomic_write_json(out_dir / name, {"header": header, "rows": rows}, guard=guard)
@@ -351,12 +515,15 @@ def write_outputs(
     write("equity.json", outcome_rows.equity)
     write("events.json", outcome_rows.events)
     write("trials.json", trials)
+    write("placebo.json", placebo)
+    write("v0s.json", v0s)
+    write("v0s_trades.json", v0s_trades)
     atomic_write_json(
         out_dir / "run.json",
         {
             "header": header,
             "manifest": manifest,
-            "not_built": _not_built(),
+            "not_built": _not_built(placebo=placebo_ran),
             "strategies": sorted({stream.strategy for stream in streams}),
             "streams": [
                 {
@@ -385,13 +552,16 @@ def run_engine(
     out_dir: str | Path | None = None,
     pipeline_config_dir: str | None = None,
     logged_at: dt.datetime | None = None,
+    placebo: bool = False,
+    placebo_workers: int = 1,
+    progress: Callable[[str], None] | None = None,
 ) -> RunOutcome:
     """The whole run. The same files and the same configuration give byte-identical output files."""
     engine = load_engine_config(config_path)
     root = resolve_data_root(data_root, create=False)
     pipeline = load_pipeline_config(pipeline_config_dir)
     source_config = resolve_source(root, pipeline, engine)
-    blocks = check_range(date_range, engine.opened_blocks, engine.data_kind)
+    blocks = check_range(date_range, engine.opened_blocks, engine.data_kind, engine.read_days)
     registry = TrialRegistry(root)
     moment = iso(logged_at if logged_at is not None else utcnow())
     # C12: market runs need the declared costs in the registry, and the same values here. Generated runs do
@@ -429,6 +599,19 @@ def run_engine(
         registry=registry,
         manifest_hash=manifest_hash,
         logged_at=moment,
+        version=version,
+    )
+    controls = simulate_v0s(
+        engine,
+        data,
+        allowance_us=allowance_us,
+        minimum_allowance_us=minimum,
+        strategies=available_strategies(),
+        date_range=date_range,
+        registry=registry,
+        manifest_hash=manifest_hash,
+        logged_at=moment,
+        version=version,
     )
 
     first_us = min(int(item.tape.close_us[0]) for item in data.values())
@@ -440,17 +623,49 @@ def run_engine(
         return data[symbol].tape.mark_price(at_us)
 
     labels = span_labels(blocks)
+    funding_missing = {symbol: len(missing_settlements(item.funding)) for symbol, item in data.items()}
     rows = build_rows(streams, config=engine, labels=labels, axis=axis, marks=marks, mark_at=mark_at)
+    if placebo:
+        placebo_results = run_placebos(
+            engine,
+            data,
+            streams,
+            date_range=date_range,
+            sim_for=_sim_params(
+                engine, allowance_us=allowance_us, minimum_allowance_us=minimum, date_range=date_range
+            ),
+            workers=placebo_workers,
+            log=_control_log(
+                engine,
+                registry,
+                date_range=date_range,
+                manifest_hash=manifest_hash,
+                logged_at=moment,
+                version=version,
+            ),
+            progress=progress,
+        )
+        placebo_output = placebo_rows(placebo_results, config=engine, labels=labels)
+    else:
+        placebo_output = not_requested_rows(config=engine, labels=labels, strategies=available_strategies())
+    v0s_output = v0s_rows(streams, controls, config=engine, labels=labels, axis=axis, marks=marks)
+    v0s_trade_output = v0s_trade_rows(controls, config=engine, labels=labels)
     header = output_header(
         config=engine,
         labels=labels,
         date_range=date_range.as_output(),
         code_version=version,
         manifest_hash=manifest_hash,
-        funding_note=_funding_note(engine),
+        funding_note=_funding_note(engine, funding_missing),
         modes=_modes(engine),
         registry_distinct_trials=registry.distinct_trials(),
+        counted_outside_registry=COUNTED_OUTSIDE_REGISTRY,
+        registry_distinct_runs=registry.distinct_runs(),
+        registry_placebo_readings=registry.placebo_readings(),
         bar_allowance_ms=minimum / 1000.0,
+        placebo_ran=placebo,
+        funding_missing=funding_missing,
+        equity_timeframe_minutes=source_config.report.equity_timeframe_minutes,
     )
     run_id = f"engine-{stable_hash([engine.config_hash, manifest_hash, version])[:16]}"
     target = Path(out_dir) if out_dir is not None else root.run_dir(run_id)
@@ -472,11 +687,33 @@ def run_engine(
             "status": stream_status(stream),
             "setups": stream.setups,
             "trades": len(stream.trades),
-            "counts_as_trial": engine.data_kind == "MARKET",
+            "lines_counted": strategy_class(stream.strategy).lines_on(engine.tier),
+            "counts_as_trial": engine.data_kind == "MARKET"
+            and strategy_class(stream.strategy).lines_on(engine.tier) > 0,
             "control": False,
             "used_for_selection": False,
         }
         for stream in streams
+    ] + [
+        {
+            "label": row_label(engine, labels),
+            "strategy": stream.strategy,
+            "line": stream.line,
+            "is_default": stream.is_default,
+            "in_portfolio": False,
+            "asset": stream.symbol,
+            "mode": MODE,
+            "variant": VARIANT_V0S,
+            "params": stream.params,
+            "status": stream_status(stream),
+            "setups": stream.setups,
+            "trades": len(stream.trades),
+            "lines_counted": 0,
+            "counts_as_trial": False,
+            "control": True,
+            "used_for_selection": False,
+        }
+        for stream in controls
     ]
     write_outputs(
         rows,
@@ -486,6 +723,10 @@ def run_engine(
         manifest=manifest,
         trials=trials,
         streams=streams,
+        placebo=placebo_output,
+        placebo_ran=placebo,
+        v0s=v0s_output,
+        v0s_trades=v0s_trade_output,
     )
     return RunOutcome(
         run_id=run_id,
@@ -494,6 +735,7 @@ def run_engine(
         streams=tuple(streams),
         rows=rows,
         header=header,
+        placebo=tuple(placebo_output),
     )
 
 

@@ -8,12 +8,16 @@ to coincide, and the `CYCLE` control run, because C-10 holds back every `CYCLE` 
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass, field, replace
+from functools import partial
 from typing import Any, ClassVar
 
 from hft_crypto.engine.market import MarketView
 from hft_crypto.engine.tape import Bar, PeriodBar, weekday
 from hft_crypto.strategies.base import (
+    ATRD_RESTART_CLOSES,
+    ATRD_RESTART_SETUPS_LOST,
     BAR_GAP,
     BREAK_EVEN,
     INVALIDATION,
@@ -22,6 +26,7 @@ from hft_crypto.strategies.base import (
     REST,
     SIDES,
     TIME_STOP,
+    UNDEFINED_ATRD,
     Management,
     PositionView,
     Proposal,
@@ -33,7 +38,8 @@ from hft_crypto.strategies.base import (
     sided,
     sided_clv,
 )
-from hft_crypto.strategies.levels import Level, nearest_at_or_above, period_levels
+from hft_crypto.strategies.levels import Level, PeriodSets, floor_pivots, nearest_at_or_above
+from hft_crypto.strategies.sources import LevelSource
 
 _DAILY_FULL = ("S2", "S1", "P", "R1", "R2")
 _DAILY_CORE = ("S1", "P", "R1")
@@ -77,6 +83,9 @@ def _target_plan(t1: float, t2: float, close_us: int) -> tuple[TargetPlan, Targe
 
 class S01FloorPivotRejection(Strategy):
     id = "S01"
+    # 7.10.
+    v0s_m = 2.0
+    v0s_hold_bars: ClassVar[dict[int, int]] = {15: 16, 30: 16}
     live_comparable = False
     h_max_hours: ClassVar[dict[int, float]] = {15: 12.0, 30: 24.0}
     requirements = (
@@ -86,7 +95,7 @@ class S01FloorPivotRejection(Strategy):
         "The UTC day before the current one, complete",
     )
 
-    def __init__(self, params: dict[str, Any]) -> None:
+    def __init__(self, params: dict[str, Any], source: LevelSource | None = None) -> None:
         super().__init__(params)
         self.touch_limit = int(params["touch_limit"])
         level_set = params["level_set"]
@@ -94,27 +103,34 @@ class S01FloorPivotRejection(Strategy):
             raise ValueError(f"S01 has no level set named {level_set!r}")
         self.weekly = level_set == "full"
         self.daily_names = _DAILY_FULL if self.weekly else _DAILY_CORE
+        self.sets = PeriodSets(source or LevelSource(), floor_pivots, weekly=self.weekly)
         self._states: dict[str, _LevelState] = {}
 
-    def _levels_for(self, day: PeriodBar | None, week: PeriodBar | None) -> list[Level]:
-        levels = period_levels(day, "D", self.daily_names)
+    def _levels_for(self, day: PeriodBar | None, week: PeriodBar | None, bar: Bar) -> list[Level]:
+        levels = self.sets.levels("D", day, self.daily_names, bar)
         if self.weekly:
-            levels += period_levels(week, "W", _WEEKLY)
+            levels += self.sets.levels("W", week, _WEEKLY, bar)
         return levels
 
     def on_close(self, market: MarketView) -> list[Proposal]:
         bar = market.bar
-        levels = self._levels_for(bar.day, bar.week)
+        self.sets.observe(bar)
+        levels = self._levels_for(bar.day, bar.week, bar)
         self._states = {level.id: self._states.get(level.id, _LevelState(level.price)) for level in levels}
-        self._count_touches(levels, bar)
+        self._count_touches(levels, bar, market.bars)
         if bar.gap:
             self.note(BAR_GAP)
             return []
+        restart = self.watch_atrd(bar)
         missing = self.missing(bar, "atr", "vr", "atrd")
         if missing:
             self.note(missing)
+            if restart and missing == UNDEFINED_ATRD:
+                self.note(ATRD_RESTART_CLOSES)
+                if self._lost_to_restart(market, bar, levels):
+                    self.note(ATRD_RESTART_SETUPS_LOST)
             return []
-        if bar.day is None:
+        if bar.day is None or not levels:
             self.note(NO_LEVELS)
             return []
         if bar.day_open is None:
@@ -130,13 +146,24 @@ class S01FloorPivotRejection(Strategy):
         self.note(NO_PATTERN)
         return []
 
-    def _count_touches(self, levels: list[Level], bar: Bar) -> None:
+    def _lost_to_restart(self, market: MarketView, bar: Bar, levels: list[Level]) -> bool:
+        """Whether this close would have given a setup with ATRD defined, so that day-move filter passing."""
+        if bar.day is None or not levels or bar.day_open is None or bar.vr is None or bar.vr > 1.75:
+            return False
+        open_day = replace(bar, atrd=math.inf)
+        return any(self.would_set_up(partial(self._setup, market, open_day, levels, side)) for side in SIDES)
+
+    def _count_touches(self, levels: list[Level], bar: Bar, bars: list[Bar]) -> None:
+        """Section 3: a touch of support is a bar where the level has that role and `L <= l + b`, so a level
+        first seen above the price has no touch until price has held above it and come back.
+        """
         atr = bar.atr
         for level in levels:
             state = self._states[level.id]
             for side in SIDES:
                 _, _, low, _ = sided(bar, side)
-                now = atr is not None and low <= side * level.price + 0.10 * atr
+                price = side * level.price
+                now = atr is not None and low <= price + 0.10 * atr and self._has_role(bars, price, side)
                 if now and not state.touching[side]:
                     state.index[side] += 1
                 state.touching[side] = now
@@ -270,7 +297,7 @@ class S01FloorPivotRejection(Strategy):
         memo.roll_end_us = day.end_us
         side = position.side
         _, _, _, close = sided(bar, side)
-        levels = self._levels_for(day, bar.week_at_close)
+        levels = self._levels_for(day, bar.week_at_close, bar)
         first, second = nearest_at_or_above([side * item.price for item in levels], close + 0.5 * atr)
         if first is None:
             return

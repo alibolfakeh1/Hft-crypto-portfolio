@@ -39,6 +39,7 @@ from hft_crypto.strategies.base import (
     sided,
     sided_clv,
 )
+from hft_crypto.strategies.sources import LevelSource
 
 _VALUE_SHARE = 0.70
 _BIN_SHARE = 0.0002
@@ -137,6 +138,11 @@ class _Memo:
 
 class S08VolumeProfileValueArea(Strategy):
     id = "S08"
+    # 7.10.
+    v0s_m = 2.0
+    v0s_hold_bars: ClassVar[dict[int, int]] = {60: 8, 30: 16}
+    needs_trades = True
+    branches = (REJECTION, ACCEPTANCE)
     h_max_hours: ClassVar[dict[int, float]] = {60: 24.0, 30: 24.0}
     requirements = (
         "Trades, tier T1. On candles this strategy gives no result",
@@ -146,8 +152,9 @@ class S08VolumeProfileValueArea(Strategy):
         "The completed UTC days the profile covers, all with no gap",
     )
 
-    def __init__(self, params: dict[str, Any]) -> None:
+    def __init__(self, params: dict[str, Any], source: LevelSource | None = None) -> None:
         super().__init__(params)
+        self._source = source or LevelSource()
         self.profile_days = int(params["profile_days"])
         self.counts = _COUNTS[self.timeframe_minutes]
         self._areas: dict[int, ValueArea | None] = {}
@@ -168,8 +175,19 @@ class S08VolumeProfileValueArea(Strategy):
         area = value_area(
             market.trades_between(end_us - self.profile_days * MICROS_PER_DAY, end_us), market.tick
         )
+        if area is not None:
+            area = self._placed(area, market.bar)
         self._areas[end_us] = area
         return area
+
+    def _placed(self, area: ValueArea, bar: Bar) -> ValueArea | None:
+        """Section 10: a placebo moves the whole band, so it keeps its width and its `POC`'s place in it."""
+        middle = (area.vah + area.val) / 2.0
+        placed = self._source.vector("VALUE_AREA", {"middle": middle}, bar)
+        if placed is None:
+            return None
+        move = placed["middle"] - middle
+        return ValueArea(area.poc + move, area.vah + move, area.val + move)
 
     def _developing(self, market: MarketView, bar: Bar) -> ValueArea | None:
         """Today's trades up to this close, usable from six hours into the day."""
@@ -186,6 +204,9 @@ class S08VolumeProfileValueArea(Strategy):
         for period in (bar.day, bar.day_at_close):
             if period is not None:
                 self._complete.add(period.end_us)
+        if bar.day_at_close is not None:
+            # At the close that first makes it knowable, whether or not a position needs it yet.
+            self._area_ending(market, bar.day_at_close.end_us)
         if bar.day is None:
             self._reset(None)
             self.note(NO_LEVELS)

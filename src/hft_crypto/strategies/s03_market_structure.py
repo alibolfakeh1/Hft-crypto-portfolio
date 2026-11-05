@@ -2,8 +2,7 @@
 
 Readings the document leaves open, each reported:
 - At a recompute after entry, if no candidate clears the threshold, `T1` stays as it was. The fallback in 7.3
-is
-  written for the setup, and its terms do not exist at a later close.
+  is written for the setup, and its terms do not exist at a later close.
 """
 
 from __future__ import annotations
@@ -47,10 +46,16 @@ CHOCH = "CHOCH"
 @dataclass
 class _Memo:
     bos_since_entry: bool = False
+    stall_checked: bool = False
 
 
 class S03MarketStructure(Strategy):
     id = "S03"
+    # 7.10.
+    v0s_m = 3.0
+    v0s_hold_bars: ClassVar[dict[int, int]] = {60: 120, 240: 30}
+    # 7.8. A C15 placebo long may be open while `state` is DOWN, so it exits on either kind of break.
+    exits_on: ClassVar[tuple[str, ...]] = (CHOCH,)
     h_max_hours: ClassVar[dict[int, float]] = {60: 240.0, 240: 240.0}
     requirements = (
         "ATR(14) on the decision timeframe, and on its higher timeframe for the amplitude test",
@@ -75,13 +80,18 @@ class S03MarketStructure(Strategy):
     def higher_minutes(self) -> tuple[int, ...]:
         return (_HIGHER[self.timeframe_minutes],)
 
-    def on_close(self, market: MarketView) -> list[Proposal]:
+    def _advance(self, market: MarketView) -> None:
+        """The registers, at each close. They never read a position, so every variant sees the same ones."""
         bar = market.bar
         self._update_higher(market)
         self.new_swings = self.sigma.update(market.bars)
         self.events = self._run_state_machine(bar)
         while self._choch_at and self._choch_at[0] <= bar.index - _CHOP_WINDOW:
             self._choch_at.popleft()
+
+    def on_close(self, market: MarketView) -> list[Proposal]:
+        bar = market.bar
+        self._advance(market)
         if bar.gap:
             self.note(BAR_GAP)
             return []
@@ -144,30 +154,27 @@ class S03MarketStructure(Strategy):
         if self.bos_count > self.max_bos:
             self.note("BOS_COUNT_OVER_LIMIT")
             return None
-        base, base_previous = self.sigma.latest_two(against(side), before_us=bar.close_us)
-        if base is None or base_previous is None or side * base.price <= side * base_previous.price:
+        # Section 3: if the latest swing was confirmed at this close, no higher low exists here, and no
+        # earlier swing stands in for it.
+        base, base_previous = self.sigma.latest_two(against(side))
+        if (
+            base is None
+            or base_previous is None
+            or base.valid_from >= bar.close_us
+            or side * base.price <= side * base_previous.price
+        ):
             self.note("NO_HIGHER_LOW")
             return None
-        _, high, low, close = sided(bar, side)
+        failed = self.non_signal_failure(bar, side, base, atr, vr)
+        if failed is not None:
+            self.note(failed)
+            return None
+        _, _, _, close = sided(bar, side)
         price = side * base.price
-        if high - low > 3.0 * atr:
-            self.note("CLIMAX_BAR")
+        s0 = self._initial_stop(market, close, price, atr, vr)
+        if s0 is None:
             return None
-        if close - price > 3.5 * atr:
-            self.note("TOO_EXTENDED")
-            return None
-        if len(self._choch_at) > 2:
-            self.note("CHOP")
-            return None
-        if vr > 2.0:
-            self.note("VR_BLOCK")
-            return None
-        struct = price - 0.30 * clip(vr, 0.8, 1.5) * atr
-        s0 = min(struct, close - market.r_min(1.0))
         distance = close - s0
-        if distance > 4.0 * atr:
-            self.note("STOP_TOO_WIDE")
-            return None
         broken_price = side * broken.price
         leg = broken_price - price
         t1 = self._lowest_candidate(side, broken_price, leg, close, close + 1.25 * distance)
@@ -182,6 +189,30 @@ class S03MarketStructure(Strategy):
             expiry_bars=3,
             memo=_Memo(),
         )
+
+    def non_signal_failure(self, bar: Bar, side: int, base: Swing, atr: float, vr: float) -> str | None:
+        """Conditions c, d, e and f of section 5, which also say which bars a C15 placebo may enter on."""
+        _, high, low, close = sided(bar, side)
+        if high - low > 3.0 * atr:
+            return "CLIMAX_BAR"
+        if close - side * base.price > 3.5 * atr:
+            return "TOO_EXTENDED"
+        if len(self._choch_at) > 2:
+            return "CHOP"
+        if vr > 2.0:
+            return "VR_BLOCK"
+        return None
+
+    def _initial_stop(
+        self, market: MarketView, close: float, price: float, atr: float, vr: float
+    ) -> float | None:
+        """7.1, in side space, or None when it is too wide to trade."""
+        struct = price - 0.30 * clip(vr, 0.8, 1.5) * atr
+        s0 = min(struct, close - market.r_min(1.0))
+        if close - s0 > 4.0 * atr:
+            self.note("STOP_TOO_WIDE")
+            return None
+        return s0
 
     def _lowest_candidate(
         self, side: int, broken_price: float, leg: float, close: float, threshold: float
@@ -204,8 +235,8 @@ class S03MarketStructure(Strategy):
         memo: _Memo = position.memo
         minutes = self.timeframe_minutes
         for kind, event_side, _ in self.events:
-            if kind == CHOCH and event_side == -side:
-                return Management(exit_reason=INVALIDATION, exit_note="CHOCH_AGAINST")
+            if kind in self.exits_on and event_side == -side:
+                return Management(exit_reason=INVALIDATION, exit_note=f"{kind}_AGAINST")
         bos_now = [swing for kind, event_side, swing in self.events if kind == BOS and event_side == side]
         if bos_now:
             memo.bos_since_entry = True
@@ -213,8 +244,12 @@ class S03MarketStructure(Strategy):
         n = position.n
         fill = position.fill_side
         r = position.r
-        if n >= _STALL_BARS[minutes] and not memo.bos_since_entry and close < fill + 1.0 * r:
-            return Management(exit_reason=TIME_STOP, exit_note="STALL")
+        # 7.7: one check, at that close, or at the next close that has a price. A trade that passes is not
+        # checked again.
+        if n >= _STALL_BARS[minutes] and not memo.stall_checked and bar.has_price:
+            memo.stall_checked = True
+            if not memo.bos_since_entry and close < fill + 1.0 * r:
+                return Management(exit_reason=TIME_STOP, exit_note="STALL")
         if n >= _ABSOLUTE_BARS[minutes]:
             return Management(exit_reason=TIME_STOP, exit_note="ABSOLUTE_LIMIT")
         decision = Management()

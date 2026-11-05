@@ -22,7 +22,7 @@ from hft_crypto.config import LAST_OPENED_DECISION, ConfigError, PipelineConfig
 from hft_crypto.data.atomic import atomic_write_bytes, canonical_json_bytes, read_parquet
 from hft_crypto.data.catalog import Catalog
 from hft_crypto.data.context import JobContext
-from hft_crypto.data.derive import USABLE_DAY_STATUSES, bars_dataset
+from hft_crypto.data.derive import bars_dataset, day_is_usable
 from hft_crypto.data.health import build_health
 from hft_crypto.data.ingest import QUARANTINE_LOG
 from hft_crypto.data.poll import read_poll_log
@@ -75,12 +75,15 @@ def _read_all(
     return pl.concat(frames).sort("close_time"), [root.guard.relative(part) for part in parts]
 
 
-def _day_status(catalog: Catalog, root: DataRoot, dataset: str, venue: str, symbol: str) -> dict[str, str]:
-    """The check status of each stored day, as the catalog holds it."""
-    statuses: dict[str, str] = {}
+def _day_status(
+    catalog: Catalog, root: DataRoot, dataset: str, venue: str, symbol: str
+) -> dict[str, tuple[str, dict[str, Any] | None]]:
+    """The check status and detail of each stored day, as the catalog holds them."""
+    statuses: dict[str, tuple[str, dict[str, Any] | None]] = {}
     for part in root.curated_parts(dataset, venue, symbol):
         record = catalog.get_file(root.guard.relative(part))
-        statuses[part.stem.removeprefix("part-")] = "unknown" if record is None else record.check_status
+        day = part.stem.removeprefix("part-")
+        statuses[day] = ("unknown", None) if record is None else (record.check_status, record.check_detail)
     return statuses
 
 
@@ -113,9 +116,11 @@ def build_benchmark(
     last usable close, across holes. Volatility and Sharpe use only one-day returns between adjacent usable
     days. Drawdown uses the marks that exist. The output states the days in the span, used and excluded.
 
-    A day is used if it passed its checks, or if nothing outside its files could check it. A provisional,
-    warned or failed day is not, so a bad price cannot reach these figures. A day is final only once the next
-    day's file could exist, so what a report says as of a moment does not depend on anything delivered later.
+    A day is used if it passed its checks, or if nothing outside its files could check it. A provisional or
+    failed day is not, so a bad price cannot reach these figures. On candles a flagged minute does not exclude
+    a day, only a hole at the row giving its open or close does, under `day_is_usable`. A day is final only
+    once the next day's file could exist, so what a report says as of a moment does not depend on anything
+    delivered later.
     """
     root.refuse_unopened("a report")
     venue = config.report.benchmark_venue
@@ -131,7 +136,7 @@ def build_benchmark(
     if daily_all.is_empty() or equity_all.is_empty():
         return None, []
     statuses = _day_status(catalog, root, daily_dataset, venue, symbol)
-    usable_days = [day for day, status in statuses.items() if status in USABLE_DAY_STATUSES]
+    usable_days = [day for day, (status, detail) in statuses.items() if day_is_usable(status, detail)]
     span_start = config.report.span_start
     span_end = min(_span_end(now_us), opened)
     if span_end < span_start:
@@ -170,6 +175,12 @@ def build_benchmark(
     problem = _drawdown_problem(used, in_span, minutes, closes[-1])
     stats = computed.to_dict() if problem is None else {**computed.to_dict(), "max_drawdown": None}
     stats["max_drawdown_note"] = problem
+    # RA-01: each day used states how many minutes it flagged, and this is their sum.
+    stats["minutes_flagged_in_days_used"] = sum(
+        int((statuses[day.isoformat()][1] or {}).get("flagged_minutes", 0))
+        for day in days
+        if day.isoformat() in statuses
+    )
     equity = normalise_to_100(equity_prices)
     drawdown = underwater(equity)
     points = tuple(

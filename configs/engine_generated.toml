@@ -55,6 +55,10 @@ S08 = { SYNTHBTC = 0.25, SYNTHETH = 0.25 }
 S09 = { SYNTHBTC = 0.25, SYNTHETH = 0.25 }
 S10 = { SYNTHBTC = 0.25, SYNTHETH = 0.25 }
 
+[placebo]
+# C15: declared in advance, with each draw's seed fixed by a hash of its identity.
+draws = 200
+
 [ticks]
 # The generator prices to two decimals. A real tick is read from the chosen source, under C16.
 SYNTHBTC = 0.01

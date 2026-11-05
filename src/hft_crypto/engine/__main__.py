@@ -38,7 +38,23 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="log the configuration's costs in the trial registry under C12, and run nothing",
     )
+    parser.add_argument(
+        "--placebo",
+        action="store_true",
+        help="also run C15's declared draws on each default line, and write them to placebo.json",
+    )
+    parser.add_argument(
+        "--placebo-workers",
+        type=int,
+        default=1,
+        help="how many processes run the draws. It changes the time taken and no result",
+    )
     return parser
+
+
+def _progress(message: str) -> None:
+    sys.stderr.write(f"{message}\n")
+    sys.stderr.flush()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -56,6 +72,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             date_range=DateRange(parse_date(args.start), parse_date(args.end)),
             out_dir=args.out_dir,
             pipeline_config_dir=args.pipeline_config_dir,
+            placebo=args.placebo,
+            placebo_workers=args.placebo_workers,
+            progress=_progress,
         )
     except (ConfigError, DataRootError, PathGuardError, TimingContractError, ValueError) as exc:
         sys.stderr.write(f"error: {exc}\n")
@@ -78,6 +97,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "trades": len(stream.trades),
             }
             for stream in outcome.streams
+        ],
+        "placebo": [
+            {
+                "strategy": row["strategy"],
+                "asset": row["asset"],
+                "status": row["status"],
+                "reason": row["reason"],
+                "draws": row["draws"],
+                "gross_rank": row["gross_rank"],
+                "net_rank": row["net_rank"],
+                "rank_of": row["rank_of"],
+            }
+            for row in outcome.placebo
         ],
     }
     sys.stdout.write(canonical_json_bytes(summary).decode("utf-8"))

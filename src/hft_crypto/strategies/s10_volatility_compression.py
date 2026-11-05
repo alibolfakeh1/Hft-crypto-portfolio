@@ -52,10 +52,15 @@ class _Memo:
     largest_tr: float = 0.0
     filled_t1: bool = False
     srv: list[float | None] = field(default_factory=list)
+    thesis_checked: bool = False
+    stall_checked: bool = False
 
 
 class S10VolatilityCompression(Strategy):
     id = "S10"
+    # 7.10.
+    v0s_m = 4.0
+    v0s_hold_bars: ClassVar[dict[int, int]] = {240: 36, 60: 72}
     h_max_hours: ClassVar[dict[int, float]] = {240: 240.0, 60: 120.0}
     requirements = (
         "ATR(14) on the decision timeframe",
@@ -90,6 +95,23 @@ class S10VolatilityCompression(Strategy):
             return False
         return self._widths.share_at_or_below(width) <= self.pr_max
 
+    def _armed_box(self, bars: list[Bar]) -> tuple[float, float, float, float] | None:
+        """The box and `ATR_(k-1)` when section 3's armed condition holds. C15 enters on these bars too."""
+        k = len(bars) - 1
+        if k < max(self.box_bars, 6) + 1:
+            return None
+        prior_atr = bars[k - 1].atr
+        box = bars[k - self.box_bars : k]
+        if prior_atr is None or any(item.gap for item in box):
+            return None
+        high = max(item.h for item in box)
+        low = min(item.l for item in box)
+        height = high - low
+        recent = self._compressed[k - 6 : k]
+        if sum(1 for flag in recent if flag) < 3 or height > 4.0 * prior_atr:
+            return None
+        return high, low, height, prior_atr
+
     def on_close(self, market: MarketView) -> list[Proposal]:
         bars = market.bars
         bar = bars[-1]
@@ -107,22 +129,14 @@ class S10VolatilityCompression(Strategy):
         if bar.srv is None:
             self.note(UNDEFINED_SRV)
             return []
-        if k < max(self.box_bars, 6) + 1 or k < self._spent_until:
+        if k < self._spent_until:
             self.note(NO_PATTERN)
             return []
-        previous = bars[k - 1]
-        prior_atr = previous.atr
-        box = bars[k - self.box_bars : k]
-        if prior_atr is None or any(item.gap for item in box):
+        armed = self._armed_box(bars)
+        if armed is None:
             self.note(NO_PATTERN)
             return []
-        high = max(item.h for item in box)
-        low = min(item.l for item in box)
-        height = high - low
-        recent = self._compressed[k - 6 : k]
-        if sum(1 for flag in recent if flag) < 3 or height > 4.0 * prior_atr:
-            self.note(NO_PATTERN)
-            return []
+        high, low, height, prior_atr = armed
         weekend = weekday(bar.close_us - 1) >= SATURDAY
         if bar.tr is None or bar.tr < 1.0 * prior_atr or bar.srv < (1.25 if weekend else 1.0):
             self.note(NO_PATTERN)
@@ -189,15 +203,16 @@ class S10VolatilityCompression(Strategy):
         ratio = None if frozen is None else frozen / memo.atr_e
         if close < memo.box_mid:
             return Management(exit_reason=INVALIDATION, exit_note="BACK_IN_THE_BOX")
-        if (
-            n == _THESIS_BAR[minutes]
-            and ratio is not None
-            and ratio < 1.10
-            and memo.largest_tr < 1.25 * memo.atr_e
-        ):
-            return Management(exit_reason=INVALIDATION, exit_note="THESIS_CHECK")
-        if n >= _STALL_BAR[minutes] and close < fill + 1.0 * r:
-            return Management(exit_reason=TIME_STOP, exit_note="STALL")
+        # 7.7: each is one check, at that close, or at the next close that has a price. A trade that passes
+        # one is not checked again by it.
+        if n >= _THESIS_BAR[minutes] and not memo.thesis_checked and bar.has_price:
+            memo.thesis_checked = True
+            if ratio is not None and ratio < 1.10 and memo.largest_tr < 1.25 * memo.atr_e:
+                return Management(exit_reason=INVALIDATION, exit_note="THESIS_CHECK")
+        if n >= _STALL_BAR[minutes] and not memo.stall_checked and bar.has_price:
+            memo.stall_checked = True
+            if close < fill + 1.0 * r:
+                return Management(exit_reason=TIME_STOP, exit_note="STALL")
         if n >= _ABSOLUTE[minutes]:
             return Management(exit_reason=TIME_STOP, exit_note="ABSOLUTE_LIMIT")
         decision = Management()

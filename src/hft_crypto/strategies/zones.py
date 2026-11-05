@@ -20,6 +20,7 @@ from typing import Any
 
 from hft_crypto.engine.tape import Bar
 from hft_crypto.strategies.base import sided, sided_clv
+from hft_crypto.strategies.sources import LevelSource
 
 _MAX_BASE = 5
 _DEPARTURE_LENGTHS = (1, 2, 3)
@@ -66,7 +67,8 @@ class Zone:
 class ZoneBook:
     """Entry zones with the arrival condition, and stack zones without it, as two separate lists."""
 
-    def __init__(self, minutes: int) -> None:
+    def __init__(self, minutes: int, source: LevelSource | None = None) -> None:
+        self._source = source or LevelSource()
         self.max_age = _MAX_AGE_DAYS * 1440 // minutes
         self.entry: list[Zone] = []
         self.stack: list[Zone] = []
@@ -179,15 +181,25 @@ class ZoneBook:
             and sided(bars[start - 3], side)[0] - sided(bars[start - 1], side)[3] >= 1.0 * atr_base
         )
         bar = bars[k]
-        for is_entry, wanted in ((False, True), (True, arrival)):
-            if not wanted or (is_entry, side, base_end) in self._seen:
-                continue
-            self._seen.add((is_entry, side, base_end))
+        new = [
+            is_entry
+            for is_entry, wanted in ((False, True), (True, arrival))
+            if wanted and (is_entry, side, base_end) not in self._seen
+        ]
+        if not new:
+            return True
+        self._seen.update((is_entry, side, base_end) for is_entry in new)
+        # One band, whichever lists it joins. A placebo moves it and keeps its real width.
+        placed = self._source.vector(f"ZONE:{side}", {"prox": side * prox}, bar)
+        if placed is None:
+            return True
+        move = placed["prox"] - side * prox
+        for is_entry in new:
             zone = Zone(
                 id=f"{'E' if is_entry else 'K'}:{side}:{bars[base_end].close_us}",
                 side=side,
-                prox=side * prox,
-                dist=side * dist,
+                prox=side * prox + move,
+                dist=side * dist + move,
                 atr_base=atr_base,
                 departure=strength,
                 tightness=tightness,

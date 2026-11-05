@@ -18,9 +18,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
+from hft_crypto.engine.indicators import CLV_DIGITS
 from hft_crypto.engine.market import MarketView
 from hft_crypto.engine.tape import Bar
 
@@ -34,6 +36,11 @@ UNDEFINED_ATR = "ATR_UNDEFINED"
 UNDEFINED_VR = "VR_UNDEFINED"
 UNDEFINED_SRV = "SRV_UNDEFINED"
 UNDEFINED_ATRD = "ATRD_UNDEFINED"
+# Section 18.2 of the recheck: a flagged minute restarts ATRD's 14-day seed, which costs setups, and that is
+# printed. A close is counted once ATRD had a value before, so the warm-up at the start is not in it.
+ATRD_RESTART_CLOSES = "ATRD_RESTART_CLOSES"
+ATRD_RESTART_SETUPS_LOST = "ATRD_RESTART_SETUPS_LOST"
+ATRD_RESTART_RANGES_LOST = "ATRD_RESTART_RANGES_LOST"
 NO_LEVELS = "PRIOR_PERIOD_LEVELS_UNDEFINED"
 NO_PATTERN = "NO_PATTERN"
 NOT_ON_T0 = "NEEDS_T1_TRADES"
@@ -156,14 +163,28 @@ class Strategy(ABC):
     # What this strategy needs before a setup can exist. Printed with every result.
     requirements: tuple[str, ...] = ()
     live_comparable: bool = True
+    # S07 and S08 read trades, so on candles they run nothing and count as no line.
+    needs_trades: ClassVar[bool] = False
+    # What one run gives lines for. S08's two branches are read separately, so it counts as two (section 4).
+    branches: ClassVar[tuple[str, ...]] = ()
     # C18, by decision timeframe in minutes.
     h_max_hours: ClassVar[dict[int, float]] = {}
+    # C13 and section 7.10: the V0S control's fixed target in R, and its hold in bars by timeframe.
+    v0s_m: ClassVar[float] = 0.0
+    v0s_hold_bars: ClassVar[dict[int, int]] = {}
 
     def __init__(self, params: dict[str, Any]) -> None:
         self.params = params
         self.timeframe_minutes = int(params["timeframe_minutes"])
         self.reasons: Counter[str] = Counter()
         self.log_buffer: list[dict[str, Any]] = []
+
+    @classmethod
+    def lines_on(cls, tier: str) -> int:
+        """How many lines one run of this strategy counts for in the trial registry, on this tier."""
+        if cls.needs_trades and tier == "T0":
+            return 0
+        return max(1, len(cls.branches))
 
     @property
     def higher_minutes(self) -> tuple[int, ...]:
@@ -179,6 +200,21 @@ class Strategy(ABC):
 
     def log(self, kind: str, **fields: Any) -> None:
         self.log_buffer.append({"type": kind, **fields})
+
+    def watch_atrd(self, bar: Bar) -> bool:
+        """True when ATRD is undefined at a close after it had a value, so a restart is costing this close."""
+        if bar.atrd is not None:
+            self._atrd_seen = True
+            return False
+        return getattr(self, "_atrd_seen", False)
+
+    def would_set_up(self, attempt: Callable[[], Proposal | None]) -> bool:
+        """A dry run, for counting only. What it notes is put back, and nothing it finds is traded."""
+        kept = Counter(self.reasons)
+        try:
+            return attempt() is not None
+        finally:
+            self.reasons = kept
 
     def missing(self, bar: Bar, *names: str) -> str | None:
         """The first required input undefined at this close, which then fails the setup under C3."""
@@ -208,6 +244,11 @@ class Strategy(ABC):
             return True
         return False
 
+    def v0s_time_up(self, market: MarketView, position: PositionView) -> bool:
+        """C13: the V0S hold has run out at this close. S09 holds to its hard flat in its place."""
+        del market
+        return position.n >= self.v0s_hold_bars[self.timeframe_minutes]
+
     def on_fill(self, position: PositionView) -> list[TargetMove]:
         """Targets set from the real fill, which rule the fill bar. Only S10 uses this, and it says so."""
         del position
@@ -234,7 +275,7 @@ def sided(bar: Bar, side: int) -> tuple[float, float, float, float]:
 
 
 def sided_clv(bar: Bar, side: int) -> float:
-    return bar.clv if side == LONG else 1.0 - bar.clv
+    return bar.clv if side == LONG else round(1.0 - bar.clv, CLV_DIGITS)
 
 
 def ratio_buffer(k: float, vr: float | None) -> float | None:

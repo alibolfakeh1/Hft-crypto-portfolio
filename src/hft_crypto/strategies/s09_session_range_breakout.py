@@ -28,6 +28,8 @@ from typing import Any, ClassVar
 from hft_crypto.engine.market import MarketView
 from hft_crypto.engine.tape import Bar, weekday
 from hft_crypto.strategies.base import (
+    ATRD_RESTART_CLOSES,
+    ATRD_RESTART_RANGES_LOST,
     BAR_GAP,
     BREAK_EVEN,
     INVALIDATION,
@@ -91,6 +93,7 @@ class _Memo:
     srv: list[float | None] = field(default_factory=list)
     armed: bool = False
     raised_at_peak: bool = False
+    follow_checked: bool = False
 
 
 def fit_profile(
@@ -136,6 +139,9 @@ def calendar_date_at_or_before(moment_us: int) -> int:
 
 class S09SessionRangeBreakout(Strategy):
     id = "S09"
+    # 7.10.
+    v0s_m = 2.0
+    v0s_hold_bars: ClassVar[dict[int, int]] = {}
     h_max_hours: ClassVar[dict[int, float]] = {60: 11.0}
     requirements = (
         "A seasonal profile: every weekday hour in the 90 days before a calendar date of C12, with volume",
@@ -173,26 +179,33 @@ class S09SessionRangeBreakout(Strategy):
             )
         self._samples = {key: value for key, value in self._samples.items() if key >= date - DAY}
 
-    def _start_range(self, bar: Bar) -> None:
+    def _schedule_from(self, bar: Bar) -> _Range | None:
+        """The day's schedule, if the profile says this bar opens its window."""
         profile = self._profile
         if profile is None or (bar.open_us % DAY) // HOUR != profile.window_start_hour:
-            return
+            return None
         start = bar.open_us
         end = start + self.window_hours * HOUR
         hour_at_end = (end % DAY) // HOUR
         peak = end + ((profile.peak_hour - hour_at_end) % 24) * HOUR
-        self._ranges.append(_Range(start, end, peak, end + _FLAT_AFTER_HOURS * HOUR))
+        return _Range(start, end, peak, end + _FLAT_AFTER_HOURS * HOUR)
+
+    def _start_range(self, bar: Bar) -> None:
+        schedule = self._schedule_from(bar)
+        if schedule is not None:
+            self._ranges.append(schedule)
 
     def on_close(self, market: MarketView) -> list[Proposal]:
         bar = market.bar
+        restart = self.watch_atrd(bar)
         self._maybe_refit(bar)
         if not bar.gap:
             self._samples[bar.open_us] = bar.v
         self._start_range(bar)
         finished = self._collect_range(bar)
-        proposal = self._look_for_break(market, bar) if finished is None else None
-        if finished is not None:
-            self._qualify(finished, bar)
+        proposal = self._look_for_break(market, bar)
+        for item in finished:
+            self._qualify(item, bar)
         if proposal is not None:
             return [proposal]
         if self._profile is None:
@@ -203,10 +216,13 @@ class S09SessionRangeBreakout(Strategy):
             return []
         missing = self.missing(bar, "atr", "vr", "srv", "atrd")
         self.note(missing if missing else NO_PATTERN)
+        if restart:
+            self.note(ATRD_RESTART_CLOSES)
         return []
 
-    def _collect_range(self, bar: Bar) -> _Range | None:
-        finished: _Range | None = None
+    def _collect_range(self, bar: Bar) -> list[_Range]:
+        """The ranges whose last bar this is. At most one, unless a placebo's moved windows overlap."""
+        finished: list[_Range] = []
         still: list[_Range] = []
         for item in self._ranges:
             if bar.gap:
@@ -216,7 +232,7 @@ class S09SessionRangeBreakout(Strategy):
                 item.lows.append(bar.l)
             if bar.close_us >= item.end_us:
                 if not item.gap and len(item.highs) == self.window_hours:
-                    finished = item
+                    finished.append(item)
             else:
                 still.append(item)
         self._ranges = still
@@ -224,7 +240,11 @@ class S09SessionRangeBreakout(Strategy):
 
     def _qualify(self, item: _Range, bar: Bar) -> None:
         atrd = bar.atrd
-        if atrd is None or weekday(item.end_us) >= SATURDAY:
+        if weekday(item.end_us) >= SATURDAY:
+            return
+        if atrd is None:
+            if getattr(self, "_atrd_seen", False):
+                self.note(ATRD_RESTART_RANGES_LOST)
             return
         width = max(item.highs) - min(item.lows)
         expected = atrd * math.sqrt(self.window_hours / 24.0)
@@ -247,7 +267,8 @@ class S09SessionRangeBreakout(Strategy):
                     if close > edge + 0.10 * atr and close - open_ >= 0.5 * (bar.h - bar.l):
                         item.broken = True
                         self.log("BREAK", side=side, range_end_us=item.end_us)
-                        result = self._setup(market, bar, item, side, edge)
+                        setup = self._setup(market, bar, item, side, edge)
+                        result = result if result is not None else setup
                         break
             if not item.broken:
                 still.append(item)
@@ -285,6 +306,11 @@ class S09SessionRangeBreakout(Strategy):
             memo=memo,
         )
 
+    def v0s_time_up(self, market: MarketView, position: PositionView) -> bool:
+        """7.10: `H` is replaced by the same hard flat at `T_flat`."""
+        memo: _Memo = position.memo
+        return market.bar.close_us >= memo.flat_us
+
     def manage(self, market: MarketView, position: PositionView) -> Management:
         bar = market.bar
         side = position.side
@@ -296,8 +322,11 @@ class S09SessionRangeBreakout(Strategy):
         r = position.r
         if n <= 3 and close < memo.range_high - 0.25 * memo.range_width:
             return Management(exit_reason=INVALIDATION, exit_note="BACK_IN_THE_RANGE")
-        if n == 4 and close < fill + 0.5 * r:
-            return Management(exit_reason=TIME_STOP, exit_note="NO_FOLLOW_THROUGH")
+        # 7.7: one check, at n = 4 or once at the next close that has one, as S03's stall.
+        if n >= 4 and not memo.follow_checked and bar.has_price:
+            memo.follow_checked = True
+            if close < fill + 0.5 * r:
+                return Management(exit_reason=TIME_STOP, exit_note="NO_FOLLOW_THROUGH")
         if bar.close_us >= memo.flat_us:
             return Management(exit_reason=TIME_STOP, exit_note="HARD_FLAT")
         decision = Management()

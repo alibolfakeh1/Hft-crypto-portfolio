@@ -128,6 +128,17 @@ CANDLE_RUN_CODES = CODES | {CODE_FILE_MISSING, CODE_FILE_UNREADABLE}
 # Fixed codes only. Exception text can carry a row, and plan section 3 counts a log as a read.
 STOP_NONE = "none"
 STOP_FETCH_REFUSED = "fetch_refused"
+# RA-02: the only words `stopped` may hold. A run that stopped decides nothing: it is not the plan's
+# application, its output holds no quarter, day or symbol to be read as a result, and it is rerun in a new
+# root.
+STOP_WORDS = frozenset({STOP_NONE, STOP_FETCH_REFUSED})
+
+
+def _check_stopped(document: dict[str, Any], what: str, results: tuple[str, ...]) -> None:
+    if document["stopped"] not in STOP_WORDS:
+        raise ValidationError(f"{what}: stopped holds a word off the list")
+    if document["stopped"] != STOP_NONE and any(document[key] for key in results):
+        raise ValidationError(f"{what}: a stopped run decides nothing, so it holds no result")
 
 
 def init_check_root(path: str | Path, *, data_root: str | None = None) -> Path:
@@ -153,6 +164,7 @@ def check_output(document: dict[str, Any]) -> None:
     for key, kind in TOP_LEVEL_TYPES.items():
         if type(document[key]) is not kind:
             raise ValidationError(f"coverage output: {key} has the wrong type")
+    _check_stopped(document, "coverage output", ("quarters",))
     for row in document["quarters"]:
         if set(row) != set(QUARTER_TYPES):
             raise ValidationError("coverage output: a quarter has the wrong keys")
@@ -277,6 +289,7 @@ def check_candle_output(document: dict[str, Any]) -> None:
     for key, kind in CANDLE_TOP_LEVEL_TYPES.items():
         if type(document[key]) is not kind:
             raise ValidationError(f"candle check output: {key} has the wrong type")
+    _check_stopped(document, "candle check output", ("days", "symbols"))
     for row in document["days"]:
         if set(row) != set(CANDLE_DAY_TYPES):
             raise ValidationError("candle check output: a day has the wrong keys")
@@ -378,6 +391,7 @@ def run_coverage_check(
                 "passes": quarter.passes(),
             }
             for (name, symbol), quarter in sorted(quarters.items())
+            if stopped == STOP_NONE
         ],
     }
     check_output(document)
@@ -512,6 +526,7 @@ def run_candle_check(
             {"day": day.isoformat(), "symbol": symbol, "result": verdict.result, "code": verdict.code}
             for symbol, rows in sorted(results.items())
             for day, verdict in rows
+            if stopped == STOP_NONE
         ],
         "symbols": [
             {
@@ -522,6 +537,7 @@ def run_candle_check(
                 "shown": condition_2_shown([(day, verdict.result) for day, verdict in rows]),
             }
             for symbol, rows in sorted(results.items())
+            if stopped == STOP_NONE
         ],
     }
     check_candle_output(document)

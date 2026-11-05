@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
-from hft_crypto.engine.tape import PeriodBar
+from hft_crypto.engine.tape import Bar, PeriodBar
+from hft_crypto.strategies.sources import LevelSource
 
 
 @dataclass(frozen=True)
@@ -28,12 +30,48 @@ def floor_pivots(period: PeriodBar) -> dict[str, float]:
     }
 
 
-def period_levels(period: PeriodBar | None, kind: str, names: tuple[str, ...]) -> list[Level]:
-    """Levels with ids that name their period, so a new day's P is a different level from yesterday's."""
-    if period is None:
-        return []
-    values = floor_pivots(period)
-    return [Level(f"{kind}:{period.end_us}:{name}", values[name]) for name in names]
+class PeriodSets:
+    """Each completed period's values, fixed at the first close that can read that period.
+
+    That close is the set's knowable time, so a placebo set is drawn there and not at whichever later close
+    first needs it. A set whose source gives nothing stays empty for good, and the strategy reads it as no
+    levels.
+    """
+
+    def __init__(
+        self,
+        source: LevelSource,
+        compute: Callable[[PeriodBar], dict[str, float]],
+        *,
+        weekly: bool,
+    ) -> None:
+        self._source = source
+        self._compute = compute
+        self._weekly = weekly
+        self._sets: dict[tuple[str, int], dict[str, float] | None] = {}
+
+    def observe(self, bar: Bar) -> None:
+        """At the top of every close, so a set is born here whether or not anything reads it."""
+        self.at("D", bar.day_at_close, bar)
+        self.at("D", bar.day, bar)
+        if self._weekly:
+            self.at("W", bar.week_at_close, bar)
+            self.at("W", bar.week, bar)
+
+    def at(self, kind: str, period: PeriodBar | None, bar: Bar) -> dict[str, float] | None:
+        if period is None:
+            return None
+        key = (kind, period.end_us)
+        if key not in self._sets:
+            self._sets[key] = self._source.vector(kind, self._compute(period), bar)
+        return self._sets[key]
+
+    def levels(self, kind: str, period: PeriodBar | None, names: tuple[str, ...], bar: Bar) -> list[Level]:
+        """Levels with ids that name their period, so a new day's P is a different level from yesterday's."""
+        values = self.at(kind, period, bar)
+        if values is None or period is None:
+            return []
+        return [Level(f"{kind}:{period.end_us}:{name}", values[name]) for name in names]
 
 
 def nearest_at_or_above(prices: list[float], floor: float) -> tuple[float | None, float | None]:

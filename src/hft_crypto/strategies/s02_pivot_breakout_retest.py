@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
+from hft_crypto.engine.indicators import MICROS_PER_DAY
 from hft_crypto.engine.market import MarketView
 from hft_crypto.engine.tape import Bar, PeriodBar
 from hft_crypto.strategies.base import (
@@ -35,7 +36,8 @@ from hft_crypto.strategies.base import (
     sided,
     sided_clv,
 )
-from hft_crypto.strategies.levels import Level, floor_pivots, nearest_at_or_above, period_levels
+from hft_crypto.strategies.levels import Level, PeriodSets, floor_pivots, nearest_at_or_above
+from hft_crypto.strategies.sources import LevelSource
 
 _TRADABLE = ("S2", "S1", "P", "R1", "R2")
 _WEEKLY = ("S1", "P", "R1")
@@ -53,6 +55,7 @@ class _Sequence:
     count: int = 0
     srv: list[float | None] = field(default_factory=list)
     accepted_at: int | None = None
+    retested: bool = False
 
 
 @dataclass
@@ -63,10 +66,19 @@ class _Memo:
     srv: list[float | None] = field(default_factory=list)
     roll_end_us: int = 0
     t1_price: float | None = None
+    day: int = 0
+
+
+def _utc_day(bar: Bar) -> int:
+    """C2: a UTC day is (00:00, 24:00], so the bar closing at 24:00 belongs to the day it ends."""
+    return (bar.close_us - 1) // MICROS_PER_DAY
 
 
 class S02PivotBreakoutRetest(Strategy):
     id = "S02"
+    # 7.10.
+    v0s_m = 2.5
+    v0s_hold_bars: ClassVar[dict[int, int]] = {60: 48}
     h_max_hours: ClassVar[dict[int, float]] = {60: 72.0}
     requirements = (
         "ATR(14) on the decision timeframe",
@@ -75,32 +87,39 @@ class S02PivotBreakoutRetest(Strategy):
         "The UTC day before the current one, complete",
     )
 
-    def __init__(self, params: dict[str, Any]) -> None:
+    def __init__(self, params: dict[str, Any], source: LevelSource | None = None) -> None:
         super().__init__(params)
         self.acc = int(params["acc"])
         self.weekly = bool(params["weekly_levels"])
+        # The whole set, with the target-only R3 and S3, so a placebo replaces the targets too.
+        self.sets = PeriodSets(source or LevelSource(), floor_pivots, weekly=self.weekly)
         self._sequences: dict[tuple[str, int], _Sequence] = {}
-        self._traded: set[str] = set()
+        # Section 5: at most one trade per level per UTC day, so a weekly level is free again the next day.
+        self._traded: set[tuple[str, int]] = set()
         self._set_key: tuple[int, int] | None = None
 
-    def _tradable(self, day: PeriodBar | None, week: PeriodBar | None) -> list[Level]:
-        levels = period_levels(day, "D", _TRADABLE)
+    def _tradable(self, day: PeriodBar | None, week: PeriodBar | None, bar: Bar) -> list[Level]:
+        levels = self.sets.levels("D", day, _TRADABLE, bar)
         if self.weekly:
-            levels += period_levels(week, "W", _WEEKLY)
+            levels += self.sets.levels("W", week, _WEEKLY, bar)
         return levels
 
-    def _target_prices(self, day: PeriodBar | None, week: PeriodBar | None, side: int) -> list[float]:
+    def _target_prices(
+        self, day: PeriodBar | None, week: PeriodBar | None, side: int, bar: Bar
+    ) -> list[float]:
         """The tradable set plus the target-only R3 and S3."""
-        prices = [side * level.price for level in self._tradable(day, week)]
-        for period in (day, week) if self.weekly else (day,):
-            if period is not None:
-                values = floor_pivots(period)
+        prices = [side * level.price for level in self._tradable(day, week, bar)]
+        periods = (("D", day), ("W", week)) if self.weekly else (("D", day),)
+        for kind, period in periods:
+            values = self.sets.at(kind, period, bar)
+            if values is not None:
                 prices.append(side * values["R3" if side > 0 else "S3"])
         return prices
 
     def on_close(self, market: MarketView) -> list[Proposal]:
         bar = market.bar
-        levels = self._tradable(bar.day, bar.week)
+        self.sets.observe(bar)
+        levels = self._tradable(bar.day, bar.week, bar)
         key = (
             0 if bar.day is None else bar.day.end_us,
             0 if bar.week is None or not self.weekly else bar.week.end_us,
@@ -109,12 +128,13 @@ class S02PivotBreakoutRetest(Strategy):
             self._set_key = key
             live = {level.id for level in levels}
             self._sequences = {seq: item for seq, item in self._sequences.items() if seq[0] in live}
-            self._traded &= live
+            self._traded = {item for item in self._traded if item[0] in live}
         candidates = self._advance_sequences(market, levels)
         if bar.gap:
             self.note(BAR_GAP)
             return []
-        missing = self.missing(bar, "atr", "vr", "srv")
+        # SRV belongs to acceptance, which checks it. A retest bar's own SRV is in no condition of section 3.
+        missing = self.missing(bar, "atr", "vr")
         if missing:
             self.note(missing)
             return []
@@ -124,8 +144,9 @@ class S02PivotBreakoutRetest(Strategy):
         if bar.vr is not None and bar.vr > 2.0:
             self.note("VR_BLOCK")
             return []
-        ordered = sorted(candidates, key=lambda item: abs(bar.c - item[0].price))
-        for level, side in ordered:
+        if candidates:
+            # Section 3: if two levels retest on one bar, use the one nearest the close, and no other.
+            level, side = min(candidates, key=lambda item: abs(bar.c - item[0].price))
             proposal = self._setup(market, bar, level, side)
             if proposal is not None:
                 return [proposal]
@@ -175,10 +196,13 @@ class S02PivotBreakoutRetest(Strategy):
                         and close > price + band
                         and sided_clv(bar, side) >= 0.50
                     )
-                    if is_retest and level.id not in self._traded:
-                        found.append((level, side))
+                    if is_retest:
+                        sequence.retested = True
+                        if (level.id, _utc_day(bar)) not in self._traded:
+                            found.append((level, side))
                     if age >= _RETEST_WINDOW:
-                        self.log("NO_RETEST", level=level.id, side=side)
+                        if not sequence.retested:
+                            self.log("NO_RETEST", level=level.id, side=side)
                         del self._sequences[key]
                     continue
                 if previous.atr is None:
@@ -204,13 +228,13 @@ class S02PivotBreakoutRetest(Strategy):
             self.note("STOP_TOO_WIDE")
             return None
         first, second = nearest_at_or_above(
-            self._target_prices(bar.day, bar.week, side), close + 1.5 * distance
+            self._target_prices(bar.day, bar.week, side, bar), close + 1.5 * distance
         )
         if first is None:
             self.note("NO_T1_ROOM")
             return None
         t2 = second if second is not None else first + (first - price)
-        memo = _Memo(level.id, price, roll_end_us=0 if bar.day is None else bar.day.end_us)
+        memo = _Memo(level.id, price, roll_end_us=0 if bar.day is None else bar.day.end_us, day=_utc_day(bar))
         return Proposal(
             side=side,
             s0=side * s0,
@@ -221,7 +245,10 @@ class S02PivotBreakoutRetest(Strategy):
         )
 
     def notify_sent(self, proposal: Proposal) -> None:
-        self._traded.add(proposal.memo.level_id)
+        memo: _Memo = proposal.memo
+        self._traded.add((memo.level_id, memo.day))
+        # This sequence has done its work, and a later trade on the level needs a new break.
+        self._sequences.pop((memo.level_id, proposal.side), None)
 
     def manage(self, market: MarketView, position: PositionView) -> Management:
         bar = market.bar
@@ -271,12 +298,14 @@ class S02PivotBreakoutRetest(Strategy):
         day = bar.day
         if day is None:
             return
-        rungs = {level.id: side * level.price for level in self._tradable(day, bar.week)}
-        values = floor_pivots(day)
-        rungs[f"D:{day.end_us}:R3S3"] = side * values["R3" if side > 0 else "S3"]
+        rungs = {level.id: side * level.price for level in self._tradable(day, bar.week, bar)}
+        values = self.sets.at("D", day, bar)
+        if values is not None:
+            rungs[f"D:{day.end_us}:R3S3"] = side * values["R3" if side > 0 else "S3"]
         if self.weekly and bar.week is not None:
-            weekly = floor_pivots(bar.week)
-            rungs[f"W:{bar.week.end_us}:R3S3"] = side * weekly["R3" if side > 0 else "S3"]
+            weekly = self.sets.at("W", bar.week, bar)
+            if weekly is not None:
+                rungs[f"W:{bar.week.end_us}:R3S3"] = side * weekly["R3" if side > 0 else "S3"]
         counts: dict[str, int] = {}
         for rung, price in rungs.items():
             if price <= memo.level:
@@ -296,7 +325,7 @@ class S02PivotBreakoutRetest(Strategy):
         memo.roll_end_us = day.end_us
         side = position.side
         _, _, _, close = sided(bar, side)
-        prices = self._target_prices(day, bar.week_at_close, side)
+        prices = self._target_prices(day, bar.week_at_close, side, bar)
         if t1_filled:
             first, _ = nearest_at_or_above(prices, close + 0.5 * atr)
             if first is not None:

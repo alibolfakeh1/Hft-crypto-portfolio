@@ -654,3 +654,32 @@ def test_only_the_data_layer_can_read_stored_data_directly() -> None:
         if direct_reads(path) and path.relative_to(root).as_posix() not in ALLOWED_TO_READ_STORED_DATA
     }
     assert offenders == {}
+
+
+# ---- section 17.5 of the recheck: two reads a test must hold -----------------------------------------------
+
+
+def test_funding_reads_to_the_cut_and_not_to_the_decision(tmp_path: Path) -> None:
+    """The engine's clock sets its decision far past its cut, so only the cut keeps a later settlement out.
+    Here the cut is at hour 2 and the decision at hour 5, and the settlements at hours 3 and 4 must not come
+    back.
+    """
+    setup = _binance()
+    ctx = make_context(tmp_path / "r", now=dt.datetime(2026, 3, 2, tzinfo=dt.UTC), config=setup)
+    times = [START + hour * HOUR for hour in (1, 2, 3, 4)]
+    _store(ctx, "funding", "binance", _funding_frame(times))
+    rows = MarketReader(ctx.root, setup).funding("binance", "S", RunClock(START + 2 * HOUR, START + 5 * HOUR))
+    assert rows["settle_time"].dt.timestamp("us").to_list() == times[:2]
+
+
+def test_as_of_bars_a_minute_after_t_still_ends_at_t(tmp_path: Path) -> None:
+    """A read a minute or more after `t` is where reading to the read and not to `t` would show."""
+    setup = _binance()
+    ctx = make_context(tmp_path / "r", now=dt.datetime(2026, 3, 2, tzinfo=dt.UTC), config=setup)
+    _store(ctx, official_dataset(1), "binance", _official_bars("binance"))
+    moment = START + 60 * MINUTE
+    rows = MarketReader(ctx.root, setup).as_of_bars(1, "binance", "S", moment, moment + 60_000_000)
+    assert rows.height == 60
+    assert rows["close_time"].dt.timestamp("us").max() == moment
+    later = MarketReader(ctx.root, setup).as_of_bars(1, "binance", "S", moment, moment + 600_000_000)
+    assert later.height == 60

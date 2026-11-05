@@ -25,9 +25,17 @@ def true_range(high: float, low: float, previous_close: float) -> float:
     return max(high - low, abs(high - previous_close), abs(low - previous_close))
 
 
+CLV_DIGITS = 9
+
+
 def clv(high: float, low: float, close: float) -> float:
-    """Close location value, or 0.5 on a bar with no range."""
-    return (close - low) / (high - low) if high != low else 0.5
+    """Close location value, or 0.5 on a bar with no range.
+
+    Rounded, so a value of exactly 0.5 in decimal is 0.5 on both sides of the mirror. Binary subtraction alone
+    can leave it just below, and every threshold on this value would then treat a long and a short
+    differently.
+    """
+    return round((close - low) / (high - low), CLV_DIGITS) if high != low else 0.5
 
 
 class WilderAtr:

@@ -22,7 +22,7 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
-from hft_crypto.engine.accounting import ExitLeg, from_cents, to_cents
+from hft_crypto.engine.accounting import ExitLeg, from_cents, to_cents, unrealised_cents
 from hft_crypto.engine.config import EngineConfig
 from hft_crypto.engine.portfolio import CapDecision, TradeKey, apply_gross_cap, trade_key
 from hft_crypto.engine.simulator import MODE, VARIANT, StreamResult, TradeRecord
@@ -160,6 +160,8 @@ class _Tally:
     count: int
     closed: int
     bps: list[float]
+    funding_gaps: int
+    funding_gap_notional: float
 
 
 def _r_values(trade: TradeRecord, net: int, gross: int) -> tuple[float | None, float | None]:
@@ -178,12 +180,15 @@ def _tally(trades: Sequence[TradeRecord], scale_of: _Scale) -> _Tally:
     gross_r: list[float] = []
     net_b = gross_b = 0.0
     bps: list[float] = []
-    excluded = counted = closed = 0
+    excluded = counted = closed = gaps = 0
+    gap_notional = 0.0
     for trade in trades:
         scale = scale_of(trade)
         if scale <= 0.0:
             continue
         counted += 1
+        gaps += len(trade.funding_gaps)
+        gap_notional += sum(item.notional for item in trade.funding_gaps) * scale
         _, booked = trade.book(scale)
         gross += booked.gross
         slippage += booked.slippage
@@ -222,6 +227,8 @@ def _tally(trades: Sequence[TradeRecord], scale_of: _Scale) -> _Tally:
         counted,
         closed,
         bps,
+        gaps,
+        gap_notional,
     )
 
 
@@ -243,6 +250,9 @@ def _trade_stats(tally: _Tally) -> dict[str, Any]:
         "slippage": from_cents(tally.slippage),
         "fees": from_cents(tally.fees),
         "funding": from_cents(tally.funding),
+        # C10 and C17: a settlement with no rate is not assumed. The net figures above leave it out.
+        "funding_unresolved_settlements": tally.funding_gaps,
+        "funding_unresolved_notional": _round(tally.funding_gap_notional, 2),
         "gross_r_total": _round(sum(tally.gross_r)),
         "net_r_total": _round(sum(tally.net_r)),
         "avg_gross_r": _round(_mean(tally.gross_r)),
@@ -269,7 +279,8 @@ def _cost_lines(tally: _Tally, rt_bps: float) -> dict[str, Any]:
     funding not.
     """
     costs = tally.slippage + tally.fees
-    multiple = tally.gross / costs if costs > 0 else None
+    # Net at a multiple m is gross - m * costs - funding, so it reaches zero here, and funding does not scale.
+    multiple = (tally.gross - tally.funding) / costs if costs > 0 else None
     return {
         "net_pnl_cost_2x": from_cents(tally.gross - 2 * costs - tally.funding),
         "net_pnl_cost_3x": from_cents(tally.gross - 3 * costs - tally.funding),
@@ -307,11 +318,11 @@ def _current_position(trades: Sequence[TradeRecord]) -> dict[str, Any]:
     net = 0
     open_r = 0.0
     for trade in held:
-        _, booked = trade.book()
-        net += booked.net
         last = trade.legs[-1]
-        if trade.r > 0:
-            open_r += trade.side * (last.price - trade.fill) / trade.r
+        # Only what is still open. What already left is booked, and a part-closed trade may hold far less.
+        net += unrealised_cents(trade.side, last.qty, trade.fill, last.price)
+        if trade.r > 0 and trade.q0 > 0:
+            open_r += trade.side * (last.price - trade.fill) / trade.r * (last.qty / trade.q0)
     longs = sum(1 for trade in held if trade.side > 0)
     state = "long" if longs == len(held) else "short" if longs == 0 else "mixed"
     return {"state": state, "open_r": _round(open_r, 4), "unrealised_pnl": from_cents(net)}
@@ -364,7 +375,9 @@ def _full_section(
         "short": section(_sided(trades, -1)),
         # S08 section 5: its two branches are reported separately.
         "branches": {tag: section([trade for trade in trades if trade.tag == tag]) for tag in tags},
-        "exit_reasons": dict(sorted(Counter(_exit_label(trade) for trade in trades).items())),
+        "exit_reasons": dict(
+            sorted(Counter(_exit_label(trade) for trade in trades if scale_of(trade) > 0.0).items())
+        ),
     }
 
 
@@ -474,7 +487,10 @@ def build_rows(
     label_of = {stream.strategy: _stream_labels(config, labels, stream.live_comparable) for stream in streams}
     all_trades = [trade for stream in streams for trade in stream.trades]
     counted = [trade for trade in all_trades if trade.in_portfolio]
-    cap = apply_gross_cap(counted, capital=capital, gross_cap=config.risk.gross_cap, mark=mark_at)
+    refused = [item for stream in streams if stream.in_portfolio for item in stream.refused_entries]
+    cap = apply_gross_cap(
+        counted, capital=capital, gross_cap=config.risk.gross_cap, mark=mark_at, refused=refused
+    )
     scale_of = _scaler(cap)
     shared: dict[str, Any] = {"axis": axis, "marks": marks, "capital_cents": capital_cents, "rt_bps": rt_bps}
 
@@ -496,6 +512,12 @@ def build_rows(
             "closes": stream.closes,
             "setups": stream.setups,
             "no_setup_reasons": stream.reasons,
+            # Section 18.2: what a restart of ATRD's seed cost, counted after ATRD first had a value.
+            "atrd_restart": {
+                "closes": stream.reasons.get("ATRD_RESTART_CLOSES", 0),
+                "setups_lost": stream.reasons.get("ATRD_RESTART_SETUPS_LOST", 0),
+                "ranges_lost": stream.reasons.get("ATRD_RESTART_RANGES_LOST", 0),
+            },
             "requirements": list(stream.requirements),
             **_full_section(stream.trades, **shared),
             "current_position": _current_position(stream.trades),
@@ -686,6 +708,10 @@ def _trade_row(trade: TradeRecord, label: str, cap: dict[TradeKey, CapDecision])
             "fees": from_cents(booked.fees),
             "funding": from_cents(booked.funding),
         },
+        "funding_unresolved": [
+            {"settle": iso_us(item.settle_us), "qty": item.qty, "mark": item.mark, "notional": item.notional}
+            for item in trade.funding_gaps
+        ],
         "gross_r": _round(gross_r),
         "net_r": _round(net_r),
         "gross_result_b": _round(from_cents(booked.gross) / trade.risk_budget),
@@ -788,7 +814,13 @@ def output_header(
     funding_note: str,
     modes: dict[str, str],
     registry_distinct_trials: int,
+    counted_outside_registry: dict[str, int],
+    registry_distinct_runs: int,
+    registry_placebo_readings: int,
     bar_allowance_ms: float,
+    placebo_ran: bool,
+    funding_missing: dict[str, int],
+    equity_timeframe_minutes: int,
 ) -> dict[str, Any]:
     """Printed at the top of every file."""
     return {
@@ -823,9 +855,33 @@ def output_header(
         },
         "bar_allowance_ms": bar_allowance_ms,
         "bar_allowance_note": "The source's declared allowance. UNVERIFIED until measured",
-        "funding": {"status": config.funding, "note": funding_note},
+        "funding": {
+            "status": config.funding,
+            "note": funding_note,
+            "settlements_with_no_rate": funding_missing,
+        },
+        "equity_timeframe_minutes": equity_timeframe_minutes,
+        "equity_note": "Marks and max drawdown read this grid, so a move inside one step does not show",
         "risk": config.risk.as_output(),
         "registry_distinct_trials": registry_distinct_trials,
+        # EN-07: lines that can give a result, by `lines_on`, and the runs the plan counts outside the
+        # registry.
+        "trial_count": {
+            "registry_lines": registry_distinct_trials,
+            "counted_outside_registry": counted_outside_registry,
+            "total": registry_distinct_trials + sum(counted_outside_registry.values()),
+            "note": (
+                "Lines that can give a result: S08 counts two on trades, and S07 and S08 none on candles. "
+                "D-32 counts 2 symbol runs, under section 5 of the fold plan. Generated runs count none"
+            ),
+        },
+        "registry_distinct_runs": registry_distinct_runs,
+        "registry_placebo_readings": registry_placebo_readings,
+        "placebo": {
+            "ran": placebo_ran,
+            "draws_declared": config.placebo_draws,
+            "note": "C15, on each default line, in calendar quarters, in the same mode as the real run",
+        },
         "code_version": code_version,
         "config_hash": config.config_hash,
         "data_manifest_hash": manifest_hash,
