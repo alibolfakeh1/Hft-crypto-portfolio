@@ -1,14 +1,16 @@
 """The network guard. Python runs this file at the start of any child whose PYTHONPATH names this folder.
 
-tests/conftest.py loads the same file for the test process, before collection, and points every child's PYTHONPATH here.
+tests/conftest.py loads the same file for the test process, before collection, and points every child's
+PYTHONPATH here.
 
-An audit hook fires inside the C functions, so no patch, fixture scope or base class gets past it. It raises from
-BaseException, because code under test catches Exception, and a broad catch must not turn this alarm into an ordinary
-failure a test then expects. The suite makes no socket call at all, so it needs no allow-list for addresses.
+An audit hook fires inside the C functions, so no patch, fixture scope or base class gets past it. It raises
+from BaseException, because code under test catches Exception, and a broad catch must not turn this alarm into
+an ordinary failure a test then expects. The suite makes no socket call at all, so it needs no allow-list for
+addresses.
 
 What this does not cover: Rust inside polars opens its own sockets, below the hook, so a source scan in
-tests/data/test_safety.py refuses a URL passed to a polars reader. A raw socket in a non-Python child is refused only
-by that child not being on the list of programs below.
+tests/data/test_safety.py refuses a URL passed to a polars reader. A raw socket in a non-Python child is refused
+only by that child not being on the list of programs below.
 """
 
 from __future__ import annotations
