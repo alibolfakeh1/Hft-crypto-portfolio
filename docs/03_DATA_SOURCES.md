@@ -12,6 +12,10 @@ Decision `D-17` makes possible commercial use the deciding scenario.
 > of 2026-11-04. The next source is open (`D-24`). The facts about other sources stand. One addition: Tardis's terms say
 > that agreeing to them also means agreeing to the Buyer Terms of Paddle, its reseller for paid subscriptions. Those
 > Buyer Terms were not read: `UNVERIFIED`.
+>
+> **Update, 2026-11-05, later.** The owner chose Binance Vision for research and non-commercial use for now (`D-29`), which
+> replaces `D-17`. Data derived from it is credited to Binance Vision, shared under CC BY-NC-SA 4.0, and this project is not
+> associated with or endorsed by Binance.
 
 ## Recommendation
 
