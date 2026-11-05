@@ -9,8 +9,8 @@ an ordinary failure a test then expects. The suite makes no socket call at all, 
 addresses.
 
 What this does not cover: Rust inside polars opens its own sockets, below the hook, so a source scan in
-tests/data/test_safety.py refuses a URL passed to a polars reader. A raw socket in a non-Python child is refused
-only by that child not being on the list of programs below.
+tests/data/test_safety.py refuses a URL passed to a polars reader. A raw socket in a non-Python child is
+refused only by that child not being on the list of programs below.
 """
 
 from __future__ import annotations
