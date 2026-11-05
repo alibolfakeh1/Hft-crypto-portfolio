@@ -700,6 +700,38 @@ Run from my own generator against the production check, over 15 generated days, 
 
 **A fault of mine, for the record.** A first pass of the data mutants ran on copies with no `.git`, which made one unrelated test fail on an unchanged control. I saw it in the control's result and reran those mutants on full copies, so no figure here rests on that test. **A leftover from this round:** I tried to clear temporary mutant copies from my own scratch folder, a safety check refused, and I did not work around it. Those copies stay there, outside the repository.
 
+### 17.6 The coverage check's run plan, `6a7dfc9`
+
+**Condition 3 of 17.4 is met in substance by Option B as written, and Option A holds as far as it goes. Either may run once the items below are done.** Licence and the runner's region are for the owner, and I make no ruling on them.
+
+**Option B, the local run.**
+
+- **It meets the leak condition** only because each root is removed in the same step, and a trap removes it on a stop, a crash or an interrupt. The closed-date files sit on a working machine for the length of one list, and nothing reads them but the check.
+- **Three conditions.**
+  1. A person runs it, or an agent whose brief excludes the root. It runs in a fresh temporary folder no agent session uses.
+  2. A trap does not survive a hard kill or a power loss. So after the run, a search for any folder holding `ROOT_KIND` under the temporary folder must find none, and the log entry says so. A root found later is removed under the same rule and logged. It is not a read, because nothing read it.
+  3. Rule `check-root-after-run` is reviewed by `python-reviewer`. From the leak side it is sound: it selects only a root it made, refuses a link, and needs the marker.
+- **The two output files and the clone hold no market data,** and they may stay until the log entry is written.
+
+**Option A, the Actions job.** As far as it holds, it is sound. It has a single push trigger on its own branch, `run_attempt == 1`, a base check refusing a later commit, `concurrency`, no cache, artifact, Pages, publish or secret, and read-only contents. The public log holds only what section 7 lists. One point to add: a run started any other way, such as a re-run by hand that bypasses the attempt guard, is not the plan's application, and its output is ignored and logged.
+
+**The data-steward's questions.**
+
+| Question | Ruling | Leak question |
+|---|---|---|
+| Both lists or neither | **Agreed.** Plan section 2's fallback moves first-span quarters into test only if too few test quarters pass. Half a result could start that, so neither list may decide alone. **The first complete pair is the application,** and no second complete run may follow, or a later pair could be chosen over an earlier one | Yes, and this answers it |
+| Rerun after `fetch_refused` | **Agreed:** one rerun on a written note, in a new root, by the same option, and a second refusal goes to the owner. A rerun cannot select on counts, because a stopped document holds none (RA-02). **No rerun after a complete run, for any reason** | None, given RA-02 |
+| A fixed reason word on `fetch_refused` | **Allowed:** `http_403`, `http_451`, `http_429`, `timeout`, `connection` and `size_limit`, held to that list by the same schema test. It says nothing about the market | None |
+| 12 hex characters of `code_version` | **Enough,** with the full hash in the log line and the decision log, as proposed | None |
+| A 429 stops at once | **Agreed** | None. It is courtesy to the host, and the stop decides nothing |
+
+**Two more, from reading section 8.**
+
+- **A 404 on a listed file counts as a coverage fact today.** Its quarter fails, and a failed test quarter is never read. But `data-steward`'s listing showed every month from 2020-01 to 2026-09 present. So a 404 at run time is an outage and not a gap in the archive. A fluke would drop a test quarter for good, because the application happens once. **A 404 on a file the listing showed should stop the run,** for example as `not_found` under the reason words, rather than fail a quarter.
+- **A checksum mismatch** also fails its quarter. A transfer error is transient, so treat it the same way: a stop, then the rerun rule. A mismatch that repeats on the rerun is then a coverage fact.
+
+**Base commit.** `1c2dc23` is fine for the coverage code: I re-audited RA-02 there (section 17 and the engine report). The 429 change makes a new base. I review the run commit's diff against that base before it runs, which is the plan's own condition 3.
+
 ## 18. The texts committed since `31d05d3`
 
 Read at `cf1880f`: the fold plan's amendment and its sections 8, 9 and 10, `D-32` to `D-41`, the charter, the index and S documents from their anchors, and `CHANGES_2026-11-04.md`. I did not open the demonstration's output, and I cannot.
