@@ -66,7 +66,7 @@ h    = prox - dist                                             # require 0.1*ATR
 **Arrival, demand (DBR).** `O_(base_start-3) - C_(base_start-1) >= 1.0 * ATR_base`. Price came down into the base.
 
 **Search order at each close `e`.** Try departure length 1, then 2, then 3, each tested against the longest valid base ending just before it, and take the first that satisfies the
-conditions. If a zone with the same `base_end` already exists,
+departure conditions and the limit on `h`. Arrival is tested after that, on that base, and decides only whether an entry zone is born too, so a longer departure is not tried to find one. If a zone with the same `base_end` already exists,
 do nothing. Supply zones (RBD) are the exact mirror, with `prox = min over base of min(O_i, C_i)` and
 `dist = max(H ...)`.
 

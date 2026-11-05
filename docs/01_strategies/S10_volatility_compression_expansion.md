@@ -153,6 +153,8 @@ It means: sell into a bar that runs two full `ATR` beyond the highest high so fa
 | 4h | `n = 6` | `n = 18` | `n = 60` | 36 |
 | 1h | `n = 12` | `n = 36` | `n = 120` | 72 |
 
+The thesis check and the stall exit are each one check, at the close of that bar. A trade that passes one is not checked again by it, and it runs on its stops, the box invalidation and the absolute limit. If that bar has no close, the check falls at the next close that has one.
+
 ### 7.8 Invalidation
 
 - **Thesis check.** At the bar in the table, if `VRe_b < 1.10` and the largest `TR` since entry is below `1.25 * ATR_e`, volatility has not expanded. Exit at the next open, whatever the P&L.

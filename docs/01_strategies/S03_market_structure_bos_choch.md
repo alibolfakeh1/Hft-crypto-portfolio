@@ -67,7 +67,7 @@ if SL exists and C_k < SL.price - b_k:
 Initial `state` is `NONE`, and the first break of either kind is treated as a CHoCH, with no trade.
 
 **Higher low.** `SL_last` and `SL_prev` are the two latest swing lows in `Sigma` as of `t_k`, whether broken or not. A higher
-low means `SL_last.price > SL_prev.price`, with `SL_last` confirmed before the BOS bar.
+low means `SL_last.price > SL_prev.price`, with `SL_last` confirmed before the BOS bar. If the latest swing low as of `t_k` was confirmed at `t_k` itself, no higher low exists at that close, and no earlier swing stands in for it.
 
 **Leg.** `Leg = SH.price - SL_last.price`, where `SH` is the swing high just broken.
 
@@ -175,6 +175,8 @@ any, comes from the few long runs.
 |---|---|---|---|
 | 1h | `n = 30` | `n = 240` | 120 |
 | 4h | `n = 12` | `n = 60` | 30 |
+
+The stall exit is one check, at the close of that bar. A trade that passes it is not checked again, and it runs on its stop, its invalidation and the absolute limit. If that bar has no close, the check falls at the next close that has one.
 
 ### 7.8 Invalidation
 

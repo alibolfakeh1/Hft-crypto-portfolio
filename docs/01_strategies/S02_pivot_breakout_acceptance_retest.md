@@ -101,7 +101,7 @@ A sequence ends when its level's set rolls, since a bar is evaluated against the
 | `expiry` | 4 bars after `t_k` |
 
 If no retest comes within 12 bars, log `NO_RETEST` with the counterfactual of buying at acceptance. At most
-one trade per level per UTC day.
+one trade per level per UTC day. The day is that of `t_k`, so a weekly level can trade once on each day.
 
 ## 6. Entry trigger for `V0`
 

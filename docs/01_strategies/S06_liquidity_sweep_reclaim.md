@@ -49,7 +49,7 @@ note it because it is the only outcome claim I saw, and it is unfavourable.
 | `PWL` | Low of the last completed UTC week, on the same terms |
 | Swing low | In `Sigma(5, 3, 1.0)` on 1h bars with 1h `ATR`, unswept, age at most 7 days from the close of its extreme bar, and knowable at least 8 `T_d` bars before the sweep |
 
-A pool is consumed by its first sweep or by any close beyond it, logged as `consumed_at`, and gives at most one trade. Pools are a register
+A pool is consumed by its first sweep or by any close beyond it, logged as `consumed_at`, and gives at most one trade. This runs from the pool's confirmation, so a swing pool consumed during its 8-bar wait gives no trade. Pools are a register
 under [C4](00_INDEX.md#c4-swing-pivots-and-registers), read as of the sweep. A swing pool is therefore visible while `valid_from <= t < valid_to`,
 even if a later, lower swing replaces it after the trade. Equal lows and nearby round numbers (multiples of 1,000 for BTC and 100 for ETH,
 within `0.25 * ATR` on 1h) are logged as tags and are not filters.

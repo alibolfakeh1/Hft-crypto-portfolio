@@ -58,7 +58,7 @@ as `confluence`, but it is not a filter, because Osler found firms' own strength
 mirror condition gives resistance.
 
 **Touch index.** The count of separate touches of `l` since it became active. A touch of support is a bar
-with `L <= l + b`, and consecutive touching bars count as one. Mirror for resistance.
+where `l` has the support role and `L <= l + b`, and consecutive touching bars count as one. So a level first seen above the price has no touch of support until price has held above it for the role's 4 closes and come back. Mirror for resistance.
 
 **Rejection bar, long, at support `l`.** All of the following on bar `k`:
 

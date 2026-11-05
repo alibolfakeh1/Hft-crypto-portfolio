@@ -260,7 +260,7 @@ liquidity pools and anchors.
 ### C5. Setup object and gate window
 
 A setup is created at the close of the trigger bar `k`, from closed bars only. It holds `side`,
-`level_or_zone`, `invalidation` (the initial stop `S0`), `targets`, `created_at = t_k` and `expiry`.
+`level_or_zone`, `invalidation` (the initial stop `S0`), `targets`, `created_at = t_k` and `expiry`. Where a document picks one object among several on one bar, by nearest, highest or `Q`, the pick is final: if its setup then fails, no other object trades on that bar.
 
 - `V0` sends its entry at `t_k`.
 - Flow variants may send `ENTER` from `t_k` until `expiry`. They use the same `S0`. The gate must return

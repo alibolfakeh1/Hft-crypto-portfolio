@@ -63,10 +63,10 @@ X      = highest high from k_b through the trigger, updated at each close
 
 **Travel.** `X - top >= 1.0 * ATR`, needed before a retest can count.
 
-**Retest window.** `RW` bars after `k_b` (default 48). The first bar after travel with `L <= top` opens the retest. A trigger
+**Retest window.** `RW` bars after `k_b` (default 48). The first bar after the one that completes travel, with `L <= top`, opens the retest, because one bar does not show whether its high or its low came first. A trigger
 may occur on that bar or on the next 2 bars. After those 3 bars, no trade comes from that flip.
 
-**Flip death.** Any close below `bottom - 0.25 * ATR`, any close below `mid` during the retest, or the end of the window.
+**Flip death.** Any close below `bottom - 0.25 * ATR`, any close below `mid` during the retest, including the bar that opens it, or the end of the window.
 This is logged as `dead_at`, and during a re-seed its `ATR` is the last defined value, under
 [C3](00_INDEX.md#c3-indicators). Flips are a register under [C4](00_INDEX.md#c4-swing-pivots-and-registers), read as of a time, and a
 dead flip stays in it.
