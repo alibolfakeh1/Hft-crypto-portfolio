@@ -118,13 +118,16 @@ strategy document may add to them and must state any exception explicitly.
 
 | Mode | Decision | Entry and close-based exit fill, and when an update acts | Used by |
 |---|---|---|---|
-| `IDEAL` | At the bar close, **labelled zero latency and zero allowance**. Of the volume fields it reads only the `settled_*` columns (`settled_volume`, `settled_buy_volume`, `settled_sell_volume`, `settled_quote_volume`), through the read API of data center finding DC-04, because they hold only what had printed by the close. It reads no plain volume column and no `fill_count` | The next `T_d` open. An update acts from the next `T_d` bar | All strategies, as a research measure. Never compared with live results. A source whose prices can carry an after-close print gets no `IDEAL` results, only `IDEAL-1M` and `CYCLE`, and anything in this folder that reports or compares `IDEAL` does not apply on that source |
-| `IDEAL-1M` | At the bar close. `A >= fill_span_allowance_ms`, compared in one unit, is asserted at the start of a run | The first 1m bar with `open_time >= t + max(latency, A)`, where `t` is the close and `A` is the allowance. The exit engine walks 1m bars | All strategies, reported beside `IDEAL` everywhere. It is the selection mode for S01 and S06 |
+| `IDEAL` | At the bar close, **labelled zero latency and zero allowance**. Of the volume fields it reads only the `settled_*` columns (`settled_volume`, `settled_buy_volume`, `settled_sell_volume`, `settled_quote_volume`), through the read API of data center finding DC-04, because they hold only what had printed by the close. It reads no plain volume column and no `fill_count`. A row counts in a bar's settled columns only when it was stamped at least the allowance before that bar's close, by the stamp alone. Standing (`gap`, `empty_proof`, `complete`) is read as of the read, and `knowable_time` is not in the view | The next `T_d` open. An update acts from the next `T_d` bar | All strategies, as a research measure, with S07 and S08 as their section 4 says. Never compared with live results. A source whose prices can carry an after-close print gets no `IDEAL` results, only `IDEAL-1M` and `CYCLE`, and anything in this folder that reports or compares `IDEAL` does not apply on that source. The report says `IDEAL` is not available there, and never omits it silently |
+| `IDEAL-1M` | At the bar close. `A >= fill_span_allowance_ms`, compared in one unit, is asserted at the start of a run. Standing is read as of `t + max(latency, A)` | The first 1m bar with `open_time >= t + max(latency, A)`, where `t` is the close and `A` is the allowance. The exit engine walks 1m bars | All strategies, reported beside `IDEAL` everywhere. It is the selection mode for S01 and S06 |
 | `CYCLE` | At a run, [C17](#c17-hourly-live-cycle). `A >= fill_span_allowance_ms`, compared in one unit, is asserted at the start of a run | Steps 5 and 6 of C17 | Live-eligible strategies. The only mode compared with live results |
 
-**On official 1-minute candles (`D-31`).** The 1m bars in `IDEAL-1M` are those candles, and its fill rule and 1m walk are unchanged. The assertion reads
+**On official 1-minute candles (`D-31`).** The 1m bars in `IDEAL-1M` are those candles, and its fill rule and 1m walk are unchanged. The assertion on `IDEAL-1M` and `CYCLE` reads
 `A >= candle_allowance`, because `fill_span_allowance_ms` describes trade rows. `IDEAL` runs on these bars only if condition 2 of ruling 7 in the data center
-leak recheck holds. The candle boundary and knowable time are left to `leak-auditor`'s ruling and the C2 sentence that follows it.
+leak recheck holds: a candle holds no print from after its close, shown and not assumed. Once it holds, these bars' plain columns are already settled, so the `settled_*` columns equal them and
+`fill_count` is readable. That condition is the gate, and not the trade rows' `allowance_state`. If it is not shown, `IDEAL` is not reported and nothing else stops. Under `IDEAL`, `O_(k+1)` can be a
+print stamped exactly at `t_k`, the decision's own instant. The decision did not read it, so no information leaks, but it is not a clean next print. `IDEAL-1M` is unaffected. A fill at a candle open
+is timed at that open for the funding boundary in [C10](#c10-accounting). The candle boundary and knowable time are in [C2](#c2-bars-and-calendar).
 
 One fill model holds for a whole sample within a mode. There is no switch to finer data where coverage
 happens to exist. `latency` and `A` are declared in [C17](#c17-hourly-live-cycle). C6 and C7 are written in
@@ -142,24 +145,28 @@ as venue-independent without that retest.
 
 - A bar covers `(open_time, close_time]` and is knowable at `close_time`. A bar built from rows with one stamp over an
   interval is knowable at its close plus the source's declared span. The span is `fill_span_allowance_ms`, `UNVERIFIED` until
-  measured on the approved source. Wherever this folder says a bar, or a value built from one, is knowable at a close, that
-  later time holds on such a source, and `IDEAL` reads such a bar only as the [mode table](#5-common-conventions) allows.
+  measured on the approved source. A bar from official candles covers `[open, close)`. It is knowable at its close plus the source's declared candle allowance. Its close is
+  `open_time + 60 s` on the grid, never the file's close field, and the allowance is `candle_allowance`, `UNVERIFIED` until measured. Wherever this folder says a bar, or a value built from one,
+  is knowable at a close, that later time holds for these two kinds of bar. `IDEAL` reads prices at the close, and the rest of such a bar only as the [mode table](#5-common-conventions) allows.
   Bar `k` has `O_k, H_k, L_k, C_k, V_k` and close time `t_k`.
 - Bars sit on a fixed UTC grid. A 1h bar closes on the hour, a 4h bar at 00, 04, ..., 20 UTC.
 - A UTC day is `(00:00, 24:00]`. A UTC week runs from Monday 00:00 to the next Monday 00:00.
 - `T_d` is the strategy's decision timeframe. `n` counts bars since entry, and the fill bar is `n = 1`.
 - **Bar source.** Canonical bars are built from trades under decision `D-12`. In every mode and for both tiers, 1m bars
-  come from trades and `T_d` bars are aggregated from those 1m bars, so `IDEAL` and `CYCLE` read the same bars, apart from the volume fields in the mode table. In research
+  come from trades and `T_d` bars are aggregated from those 1m bars, so `IDEAL` and `CYCLE` read the same bars, apart from the volume fields, `fill_count` and as-of standing in the mode table. In research
   the trades come from the archive. On the live path they come from the hourly poll of the same venue, and the same code
   builds the bars. This trade feed is the one candle source of a tier `T0` strategy. Official venue bars are only a
-  reconciliation check at gate G1.
+  reconciliation check at gate G1. **The candle stage (`D-31`) is the exception.** There the 1m bars in every mode are the venue's official last-trade candles, and `T_d` bars are aggregated from them. Bars from
+  trades later are a new document version with counted trials, and nothing is joined across the change.
 - **A minute with no trades.** It is a bar with zero volume and no price only when the response that delivered the data
   proves continuity across that minute, by a trade id or sequence number with no skip, or by overlapping pages. Such a bar
   can touch nothing and adds nothing to a `T_d` bar's high, low or volume. `P_dec` or a `T_d` close uses the last trade before
   it, and a fill uses the first 1m bar that has a price. **Otherwise the minute is a gap**, so a hole cannot pass as zero-volume
   minutes and hide a stop touched inside it. The [completeness check](#c17-hourly-live-cycle) speaks only to the end of the data
   and is not this proof. A source with no sequence therefore treats every empty minute as a gap, which costs little on a liquid
-  perpetual. The same test applies to the archive at gate G1.
+  perpetual. The same test applies to the archive at gate G1. On official candles the proof comes from the row itself. A missing row is a gap. A row with zero trades is proof of an empty minute, a third kind.
+  Its prices are set to null if the venue carries the last close forward, which is `UNVERIFIED`. A proof or a flag counts from its own knowable time. An empty minute unproven at `t` makes the `T_d` bar closing at `t`
+  not complete as of `t`, so no setup is created at that close, and a later proof creates nothing retroactively.
 - **Levels and the bar that built them.** A bar is evaluated against the level set in force at its open. A new
   UTC day or week set first acts on the bar that opens at the roll, so the bar that closes at the roll is never
   tested against a level built from itself. Rules that update an open trade at the close of that roll bar are
@@ -473,7 +480,7 @@ a separate schedule that I could not open.
 **Declared cost constants, under `D-29` and C12.** The same `fee_taker`, `slip` and `RT` are the declared base case. Their basis is band A of the
 [cost proposal](COST_AND_INSTRUMENT_2026-11-05.md), and the fee has not been read from this venue's schedule, so it stays `UNVERIFIED`. `stop_slip = 5 bp` per stop exit, on both
 symbols. Its basis is my judgement, `UNVERIFIED`: no source I read gives a figure, and a stop is a market order that fires into the move against it, so I set it at five times the
-`slip` of a market order at a bar open. It was not measured on any market data, and a value measured on a span may not apply to that span. It is not part of `RT`, so it changes the price
+`slip` of a market order at a bar open. It was not measured on any market data, and a value measured on a span may not apply to that span. It was set after the `D-27` demonstration by `strategy-architect`, which had read that demonstration's diagnostics, so it was not set by a role that did not see the output, though those diagnostics charged a flat 1 bp on every fill, hold no measurement of a stop fill, and supply no part of this value. It is not part of `RT`, so it changes the price
 of stop exits only, and no setup, floor or trade list. The 2x and 3x reports multiply it with the fee and `slip`, to 10 bp and 15 bp. At the 48 bp floor, a stop exit costs about
 `0.33R` at 1x, against the `0.25R` of C9's round trip.
 
@@ -514,6 +521,8 @@ time alone. Reports show the share of runs that did, because a server time prove
 
 Funding does not take this check, because it has a record only every few hours. It follows [C10](#c10-accounting) alone. Any other sparse source declares its own rule.
 
+**On official candles,** a row is complete when it exists, so the evidence is that the candle closing at `t_cut` is present and known by `t_poll`, in place of the table above. C-10's trade feed values must be re-based on this too, and until they are, no `CYCLE` run may start on candles.
+
 **What a run sees.** Closed 1-minute bars since the last processed minute, trades, and funding settlement times and rates, all up to `t_cut`, plus the
 committed state from the previous run. It sees no book, so no book feature can gate a live entry or exit.
 
@@ -525,7 +534,7 @@ committed state from the previous run. It sees no book, so no book feature can g
 |---|---|---|
 | Nominal start | Minute 7 of each hour | Avoids the top of the hour. Settled at 7 for leak audit finding DC-07, and the poll's cron and `nominal_minute` in configuration state the same minute. `GATE_SPEC.md` computes its look counts from it. GitHub publishes no delay by minute, so whether top-of-the-hour load still reaches minute 7 is `UNVERIFIED` until `C-MEASURED` |
 | `latency` | 500 ms | Time from commit to the first possible fill or update |
-| `A` | 10 s, `UNVERIFIED` | Time for a closed bar or a trade to become readable. To be measured later from a GitHub runner. Asserted against `fill_span_allowance_ms` as the [mode table](#5-common-conventions) says |
+| `A` | 10 s, `UNVERIFIED` | Time for a closed bar or a trade to become readable. To be measured later from a GitHub runner. Asserted against `fill_span_allowance_ms`, or `candle_allowance` on official candles, as the [mode table](#5-common-conventions) says |
 | `D_run` | 60 s for tier `T0`, 180 s for tier `T1` | Declared run duration, used in backtests in place of a real commit time. Both tiers now fetch the same trades, so the `T0` value has lost its basis. C-10 re-bases it on that same fetch. Before the first run, that is not a counted change |
 | Fetch offset | 0 s for the symbol's trade feed, until C-10 declares it. Other sources are declared in `GATE_SPEC.md` | In backtests, `t_poll[source] = run_start + its offset` |
 | Fill wait | 2 minutes | Longest wait in step 5 |
@@ -603,13 +612,13 @@ run that dies after its commit loses nothing, and the next run derives it.
 | Field | Meaning |
 |---|---|
 | `mode` | `IDEAL`, `IDEAL-1M` or `CYCLE`, with the scenario and seed in a backtest |
-| `knowable_time` | When the input became knowable, usually a bar close. For an event that depends on a fill, the fill's time |
+| `knowable_time` | When the input became knowable, under C2. A bar's can be later than its close, and a polled bar's is its receipt. For an event that depends on a fill, the fill's time |
 | `event_time` | Close time of the 1m bar in which a touch or fill happened, or `t_dec` for a decision |
 | `detection_time` | `run_start` of the run that found it |
 | `t_poll`, skew | For each source: the clock reading in the run clock, the runner's clock minus the source's server time where given, and whether the completeness check passed on server time alone |
 | `t_cut`, `t_dec` | The run's data cut-off and commit time |
 | `effective_from` | Open time of the first 1m bar on which a new stop or target acts |
-| `lateness` | `detection_time - knowable_time` |
+| `lateness` | `detection_time - t_close`, where `t_close` is the close time of the bar that produced the event, or the fill's time for an event that depends on a fill. It is never read from a bar's `knowable_time` |
 
 **Gaps in 1m bars.**
 
@@ -677,7 +686,7 @@ first run, with at least 5 seeds for each random scenario. A change to them is a
 
 6. For gate G8, replay the live period with the **actual** run timestamps and the as-seen inputs in `decisions/`, never rebuilt bars. The trade list must match the ledger exactly, and each mismatch goes in
    the paper versus simulation report.
-7. Report the `IDEAL` minus `CYCLE` difference in `Result_B` per trade as the cost of the cycle, and `IDEAL-1M` beside both. `R` may be shown too.
+7. Report the `IDEAL` minus `CYCLE` difference in `Result_B` per trade as the cost of the cycle, and `IDEAL-1M` beside both. `R` may be shown too. Where a strategy has no `IDEAL` results, this figure is `IDEAL-1M` minus `CYCLE`, labelled, so the cost of the cycle stays visible.
 
 A backtest result quoted beside a live record must be the `CYCLE` one. `IDEAL` and `IDEAL-1M` are research measures and are never compared with
 live results.
@@ -706,8 +715,8 @@ So the engine cannot read test data at all, even after more dropped runs than th
 training span is open, and each reading is logged and counted. Test blocks stay closed until the owner opens them in writing, in calendar order, with candidates frozen first. A row, grid,
 sensitivity or constant chosen after a verdict is `EXPLORATORY` on every block read by the verdict that led to it. The locked block is read once, globally, at the final verdict, for every
 candidate frozen that day, all counted. Nothing reads it before then, including `V0`, `V0S`, placebos, G3, G7 and portfolio reports. Later quarters join only as new dated blocks. A setup whose
-`t_k + H_max` passes the last opened date is left out of that read and counted, and it comes back when the next block opens. An earlier test block joins the training of later blocks only, once
-read, under this purge. Days already read are excluded as section 4 of the plan says.
+`t_k + H_max` reaches the first unopened instant is left out of that read and counted, and it comes back when the next block opens. An earlier test block joins the training of later blocks only, once
+read, under this purge. Days already read are excluded as section 4 of the plan says. A setup left out for either reason is never simulated, and the strategy counts as flat across it.
 
 | Strategy | `T_d` | `H_max` | `A_max` under `CYCLE` |
 |---|---|---|---|

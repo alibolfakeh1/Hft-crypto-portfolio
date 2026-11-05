@@ -100,7 +100,7 @@ An excursion gives at most one trade. Once `ACCEPTED`, it cannot produce a rejec
 
 | Object | Knowable at |
 |---|---|
-| `POC`, `VAH`, `VAL`, `VAW` | 00:00 UTC, at the end of the completed day. `IDEAL` is labelled zero allowance, so it uses them from the bar opening at the roll. In `IDEAL-1M` and `CYCLE`, the allowance `A` applies, so an update from them acts from `effective_from` |
+| `POC`, `VAH`, `VAL`, `VAW` | 00:00 UTC, at the end of the completed day. Under `IDEAL` this strategy reports none, and the report says `IDEAL` is not available, on any source whose rows can carry a print from after the close, which includes any source not yet shown otherwise. `IDEAL` is allowed only where each row is one fill stamped at its own print time (`stamp_kind = "exact"`, a measured allowance, and evidence for both). There the sums read rows with `knowable_time` at or before `t`, and it uses these values from the bar opening at the roll. In `IDEAL-1M` and `CYCLE`, the allowance `A` applies, so an update from them acts from `effective_from` |
 | `dPOC`, `dVAH`, `dVAL` | Each bar close, using trades up to that close, from 06:00 UTC onward |
 | Excursion, acceptance, triggers | The close that completes them |
 | `SRV` | Each close, from the previous 8 weeks only |
@@ -286,7 +286,7 @@ Questions for `feature-integrator`. Trades are available to live runs, so trade-
 | Trap | Concrete failure | Guard |
 |---|---|---|
 | Profile from the running day | Using today's trades in "prior" value | Prior profile changes only at 00:00 UTC, from a completed period |
-| Developing value with later trades | `dVAL` at 11:00 using trades to 12:00 | Trades at or before the bar close only |
+| Developing value with later trades | `dVAL` at 11:00 using trades to 12:00 | Trades at or before the bar close only, and under `IDEAL` as section 4 says |
 | Bin width from the day's range | `w` scaled by a range not yet known in the developing profile | `w` uses the first open only |
 | `POC` tie rule on a developing profile | Using the final range to break a tie | Range so far |
 | Choosing a branch after the fact | Calling a trade a rejection because it returned | The state machine classifies in time order, and each close's state is final |
@@ -325,13 +325,13 @@ Using the example in 7.12, with `C_k = 66,610`, `S0 = 66,092.5`, `T1 = 67,200`, 
 **Stops and targets between runs.**
 
 - Touches between runs are resolved from 1m bars at the next run, with `event_time` and `detection_time` recorded. Inside one 1m bar, the stop is first.
-- `dVAL`, `dVAH` and `dPOC` are computed for each processed 1h close, from trades at or before that close and not from trades up to the run. Late runs therefore produce the same values, and they act from `effective_from`.
+- `dVAL`, `dVAH` and `dPOC` are computed for each processed 1h close, from trades at or before that close and not from trades up to the run. Values therefore do not depend on when a run happened, for the trades held, and they act from `effective_from`. A trade received late enters the running totals from the first close processed after it arrived, and earlier values are not rewritten. The difference from an archive rebuild is reported, as [C3](00_INDEX.md#c3-indicators) says.
 - `q` counts `T_d` closes since the `T1` fill, so the decay in 7.3 does not depend on when runs happen.
 - The prior profile changes when a run first processes the 00:00 close. A late or dropped run around 00:00 delays the roll updates only.
 - 1m bars are built from the same trades, so missing trades are a hole in 1m bars, and the gap rules in C17 apply. The run computes no partial profile. A minute with no trades is not missing only when it has the proof of continuity in [C2](00_INDEX.md#c2-bars-and-calendar), and then it adds nothing to the profile.
 - Stops only tighten: the `P_dec` clamp in C17 can reduce a candidate, and the ratchet then keeps the old stop.
 
 **Backtest reproduction.** `CYCLE` under [C17](00_INDEX.md#c17-hourly-live-cycle) at 1h, with `C-LATE` for selection among 1h configurations only, with profiles rebuilt the same way as live and trades cut off at `t_cut`. Report the branches separately, and also show the
-30m `IDEAL` and `IDEAL-1M` results beside the 1h `CYCLE` result, labelled, as a comparison of the classical rule with what can actually run. That comparison is never a selection.
+30m `IDEAL-1M` results, with `IDEAL` only where section 4 allows it, beside the 1h `CYCLE` result, labelled, as a comparison of the classical rule with what can actually run. That comparison is never a selection.
 
 **`PLACEHOLDER`, re-audit condition C-10.** The trade source values for this strategy's `V0` fetch model, meaning page size, rate limit, retention and any fetch offset, are not declared yet. They wait for the source decision and belong in the [C17 constants](00_INDEX.md#c17-hourly-live-cycle). No `CYCLE` run of this strategy may start until they are filled.

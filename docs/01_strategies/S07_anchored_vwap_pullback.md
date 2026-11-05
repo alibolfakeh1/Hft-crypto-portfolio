@@ -83,7 +83,7 @@ this anchor.
 | Object | Knowable at |
 |---|---|
 | Swing anchor | Its confirmation close, `t_c`, which is `Rt` bars after the extreme |
-| `A_t`, `sigma_t` | Only from `t_c`, using trades already complete at `t`. The sum starts earlier but no value exists before `t_c`. `IDEAL` is labelled zero allowance. In `IDEAL-1M` and `CYCLE`, the allowance `A` in [C17](00_INDEX.md#c17-hourly-live-cycle) applies before the value can be read |
+| `A_t`, `sigma_t` | Only from `t_c`, using trades already complete at `t`. The sum starts earlier but no value exists before `t_c`. Under `IDEAL` this strategy reports none, and the report says `IDEAL` is not available, on any source whose rows can carry a print from after the close, which includes any source not yet shown otherwise. `IDEAL` is allowed only where each row is one fill stamped at its own print time (`stamp_kind = "exact"`, a measured allowance, and evidence for both), and there the sums read rows with `knowable_time` at or before `t`. `T0-APPROX` may not stand in. In `IDEAL-1M` and `CYCLE`, the allowance `A` in [C17](00_INDEX.md#c17-hourly-live-cycle) applies before the value can be read |
 | Excursion flag | Each close at or after `t_c` |
 | Trigger, `S0`, targets | `t_k` |
 | Minor anchor in the stack | Its own confirmation close, effective next bar |
@@ -264,7 +264,7 @@ Questions for `feature-integrator`. Trades are available to live runs, so trade-
 |---|---|---|
 | VWAP used before confirmation | A swing low at 08:00 confirmed at 13:00, with its VWAP used at 10:00 | No value exists before `t_c`, even though the sum begins at the extreme |
 | Anchor chosen with hindsight | Picking the leg's true low, or the "most obvious" one | Only the latest confirmed swing in the list, by rule |
-| Trades after the close | Including trades stamped after `t_k` in `A_k` | Trades with time at or before `t_k` only |
+| Trades after the close | Including trades stamped after `t_k` in `A_k` | Trades with time at or before `t_k` only, and under `IDEAL` as section 4 says |
 | Bands from future dispersion | `sigma` over the full leg | Running totals to `t` only |
 | Stack anchor used early | A minor swing low used before its confirmation | From its own confirmation, effective next bar |
 | Same-bar VWAP stop | The close's VWAP applied inside that bar | Effective from the next bar |
@@ -304,7 +304,7 @@ the example in 7.12, with `A = 63,800`, `sigma = 520`, `C_k = 64,010`, `S0 = 63,
 
 - Touches between runs are resolved from 1m bars at the next run, with `event_time` and `detection_time` recorded. Inside one 1m bar, the stop is first.
 - `A`, `sigma` and the stack are computed for each processed `T_d` close, using only trades at or before that close and not all trades up to the
-  run. The result is then the same whether the run was on time or late. New stops and targets act from `effective_from`.
+  run. Values then do not depend on when a run happened, for the trades held. A trade received late enters the running totals from the first close processed after it arrived, and earlier values are not rewritten. The difference from an archive rebuild is reported, as [C3](00_INDEX.md#c3-indicators) says. New stops and targets act from `effective_from`.
 - A band target between runs stays at the last value set, however far the true band has moved. It does not float between runs.
 - Two closes below `A0` are read at the run that processes the second. The exit fills after that run.
 - 1m bars are built from the same trades, so missing trades are a hole in 1m bars, and the gap rules in C17 apply. The run computes no partial VWAP. A minute
