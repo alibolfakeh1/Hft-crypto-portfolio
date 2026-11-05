@@ -5,8 +5,10 @@ order-flow and order-imbalance features help decide whether and when to enter an
 has a dynamic stop and target model. Results are shown as a professional portfolio, and live paper positions
 will be published to a Telegram channel. Everything runs on GitHub itself: Actions, its cache, and Pages.
 
-> **Status: early.** The data pipeline is built and tested on generated data only, and awaits review. All data sources
-> are off until one is approved. No strategy has been coded or tested. There are no results.
+> **Status: early, and under review.** The data pipeline, the simulator and `V0` of the ten strategies exist and have run
+> on generated data only. All data sources are off. No strategy has been tested on market data, so there are no results.
+> Research data is planned to come from Binance Vision, for non-commercial use for now. This project is not associated
+> with or endorsed by Binance.
 
 > **Not investment advice.** Backtests are labelled `SIMULATED` and forward results are labelled `PAPER`. This
 > project sends no real orders.
@@ -17,7 +19,7 @@ will be published to a Telegram channel. Everything runs on GitHub itself: Actio
 
 این پروژه پژوهشی روی استراتژی‌های میان‌فرکانس بیت‌کوین و اتریوم است. استراتژی‌های پیشرفتهٔ کندلی مثل پیوت و عرضه و تقاضا پیشنهاد معامله می‌دهند. بعد فیچرهای جریان سفارش و عدم‌تعادل سفارش کمک می‌کنند تصمیم گرفته شود که آیا و چه زمانی وارد شویم و چه زمانی خارج شویم. حد سود و حد ضرر هر استراتژی داینامیک است و خروجی‌ها به‌صورت پرتفوی نمایش داده می‌شوند. پوزیشن‌های زندهٔ کاغذی هم در کانال تلگرام منتشر خواهند شد.
 
-**وضعیت فعلی:** خط لولهٔ داده ساخته شده و فقط با دادهٔ مصنوعی تست شده است و منتظر بازبینی است. تا انتخاب منبع مجاز، همهٔ منابع داده خاموش‌اند. هیچ استراتژی‌ای کدنویسی یا تست نشده است، پس نتیجه‌ای هم در کار نیست.
+**وضعیت فعلی:** خط لولهٔ داده، موتور شبیه‌سازی و نسخهٔ سادهٔ هر ۱۰ استراتژی ساخته شده‌اند و فقط روی دادهٔ مصنوعی اجرا شده‌اند و در حال بازبینی‌اند. همهٔ منابع داده خاموش‌اند. هیچ استراتژی‌ای روی دادهٔ بازار آزموده نشده است، پس نتیجه‌ای هم در کار نیست. دادهٔ تحقیق قرار است فعلاً برای استفادهٔ غیرتجاری از Binance Vision گرفته شود.
 
 **این پروژه توصیهٔ سرمایه‌گذاری نیست و سفارش واقعی ارسال نمی‌کند.**
 
