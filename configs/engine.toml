@@ -1,0 +1,135 @@
+# Engine configuration for market runs, decision D-29, on the fold plan's first training span.
+# Every key is required and an unknown key is an error.
+#
+# The candle allowance is the source's own key in pipeline.toml, declared in D-33, and it is not copied here.
+# A run refuses until the costs are in the trial registry (C12): --declare-costs logs them, and nothing else runs.
+
+schema_version = 1
+
+[run]
+data_kind = "MARKET"
+venue = "binance"
+symbols = ["BTCUSDT", "ETHUSDT"]
+# D-31, stage one: official candles and funding. S07 and S08 give no result on candles, and nothing stands in.
+tier = "T0"
+minute_source = "official_candles"
+funding = "required"
+credit_line = "Derived from Binance Vision data, CC BY-NC-SA 4.0. Not associated with or endorsed by Binance."
+# Fold plan section 3. A later block is named here only once the owner has opened it in writing.
+opened_blocks = ["first_training_span"]
+# Fold plan section 4. The read days fall in the locked block, so none lies in the first span.
+read_days = []
+lines = "all"
+
+[timing]
+# C17.
+latency_ms = 500.0
+
+[costs]
+# C16 under D-29, declared before any run. All UNVERIFIED against this venue's own schedule.
+rt_bps = 12.0
+slip_bps = 1.0
+stop_slip_bps = 5.0
+stop_slip_state = "declared"
+target_fee_bps = 5.0
+basis = "C16 under D-29: RT 12 bps, slip 1 bp, stop_slip 5 bp per stop exit. Fee UNVERIFIED against the venue"
+
+[risk]
+# D-28 is with the owner. These are the placeholder values it names, and they are printed on every output.
+state = "placeholder"
+basis = "Placeholder from D-28, chosen for the first view. Not measured and not tested. The owner decides"
+capital = 100000.0
+leverage_cap = 2.0
+gross_cap = 3.0
+
+[risk.per_trade_pct]
+S01 = { BTCUSDT = 0.25, ETHUSDT = 0.25 }
+S02 = { BTCUSDT = 0.25, ETHUSDT = 0.25 }
+S03 = { BTCUSDT = 0.25, ETHUSDT = 0.25 }
+S04 = { BTCUSDT = 0.25, ETHUSDT = 0.25 }
+S05 = { BTCUSDT = 0.25, ETHUSDT = 0.25 }
+S06 = { BTCUSDT = 0.25, ETHUSDT = 0.25 }
+S07 = { BTCUSDT = 0.25, ETHUSDT = 0.25 }
+S08 = { BTCUSDT = 0.25, ETHUSDT = 0.25 }
+S09 = { BTCUSDT = 0.25, ETHUSDT = 0.25 }
+S10 = { BTCUSDT = 0.25, ETHUSDT = 0.25 }
+
+[ticks]
+# C16's examples. UNVERIFIED on this venue, and to be read from it before the first run.
+BTCUSDT = 0.1
+ETHUSDT = 0.01
+
+# Grids are section 8 of each document. Default lines are the table in C18: a display order, not a selection.
+# portfolio_line is FP-05's input, and D-35 declares it: the C18 default line for all eight strategies, S01 and S06
+# included. So the portfolio figure selects nothing and adds no line. S07 and S08 wait for bars from trades.
+
+[strategies.S01]
+default_state = "declared"
+default_line = { timeframe_minutes = 15, touch_limit = 1, level_set = "full" }
+portfolio_state = "declared"
+portfolio_line = { timeframe_minutes = 15, touch_limit = 1, level_set = "full" }
+grid = { timeframe_minutes = [15, 30], touch_limit = [1, 2], level_set = ["full", "daily_core"] }
+
+[strategies.S02]
+default_state = "declared"
+default_line = { timeframe_minutes = 60, acc = 3, weekly_levels = false }
+portfolio_state = "declared"
+portfolio_line = { timeframe_minutes = 60, acc = 3, weekly_levels = false }
+grid = { timeframe_minutes = [60], acc = [3, 2], weekly_levels = [false, true] }
+
+[strategies.S03]
+default_state = "declared"
+default_line = { timeframe_minutes = 60, swing = [5, 3], max_bos = 2 }
+portfolio_state = "declared"
+portfolio_line = { timeframe_minutes = 60, swing = [5, 3], max_bos = 2 }
+grid = { timeframe_minutes = [60, 240], swing = [[5, 3], [8, 4]], max_bos = [2, 1] }
+
+[strategies.S04]
+default_state = "declared"
+default_line = { timeframe_minutes = 60, q_min = 60.0, touch_limit = 0 }
+portfolio_state = "declared"
+portfolio_line = { timeframe_minutes = 60, q_min = 60.0, touch_limit = 0 }
+grid = { timeframe_minutes = [60, 240], q_min = [60.0, 45.0], touch_limit = [0, 1] }
+
+[strategies.S05]
+default_state = "declared"
+default_line = { timeframe_minutes = 60, rw = 48 }
+portfolio_state = "declared"
+portfolio_line = { timeframe_minutes = 60, rw = 48 }
+grid = { timeframe_minutes = [60, 240], rw = [48, 24] }
+
+[strategies.S06]
+default_state = "declared"
+default_line = { timeframe_minutes = 15, n_r = 2, swing_pools = true }
+portfolio_state = "declared"
+portfolio_line = { timeframe_minutes = 15, n_r = 2, swing_pools = true }
+grid = { timeframe_minutes = [15, 5], n_r = [2, 0], swing_pools = [true, false] }
+
+[strategies.S07]
+# C18: S07 and S08 wait for bars from trades.
+default_state = "placeholder"
+default_line = { timeframe_minutes = 60, major = [10, 5, 2.0], max_touch = 2 }
+portfolio_state = "placeholder"
+portfolio_line = { timeframe_minutes = 60, major = [10, 5, 2.0], max_touch = 2 }
+grid = { timeframe_minutes = [60], major = [[10, 5, 2.0], [20, 5, 3.0]], max_touch = [2, 1] }
+
+[strategies.S08]
+default_state = "placeholder"
+default_line = { timeframe_minutes = 60, profile_days = 1 }
+portfolio_state = "placeholder"
+portfolio_line = { timeframe_minutes = 60, profile_days = 1 }
+grid = { timeframe_minutes = [60, 30], profile_days = [1, 3] }
+
+[strategies.S09]
+default_state = "declared"
+default_line = { timeframe_minutes = 60, window_hours = 8, srv_min = 1.0 }
+portfolio_state = "declared"
+portfolio_line = { timeframe_minutes = 60, window_hours = 8, srv_min = 1.0 }
+grid = { timeframe_minutes = [60], window_hours = [8, 6], srv_min = [1.0, 1.5] }
+
+[strategies.S10]
+default_state = "declared"
+default_line = { timeframe_minutes = 240, pr_max = 0.10, box_bars = 12 }
+portfolio_state = "declared"
+portfolio_line = { timeframe_minutes = 240, pr_max = 0.10, box_bars = 12 }
+grid = { timeframe_minutes = [240, 60], pr_max = [0.10, 0.20], box_bars = [12, 24] }

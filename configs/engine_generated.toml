@@ -1,0 +1,138 @@
+# Engine configuration for generated runs only. It is refused on any root that does not hold SYNTHETIC data.
+# Every key is required and an unknown key is an error, so nothing here can fall back to a default in code.
+# Generated runs are engineering runs: they are logged in the registry and do not count as trials (C12).
+
+schema_version = 1
+
+[run]
+data_kind = "SYNTHETIC"
+venue = "synthetic"
+symbols = ["SYNTHBTC", "SYNTHETH"]
+# T1 holds trades, so S07 and S08 run as written. T0 holds candles only, and they then give no result.
+tier = "T1"
+minute_source = "bars_1m"
+# Funding is an optional input, and its absence is stated on every output.
+funding = "absent"
+credit_line = "Derived from Binance Vision data, CC BY-NC-SA 4.0. Not associated with or endorsed by Binance."
+# A generated run opens only the generated calendar, which ends before any date of the fold plan.
+opened_blocks = ["generated"]
+# Days already read are excluded under section 4 of the fold plan. None lie in the generated calendar.
+read_days = []
+lines = "all"
+
+[timing]
+# C17. The allowance A comes from pipeline.toml, poll.allowance_a_s, and is UNVERIFIED until measured.
+latency_ms = 500.0
+
+[costs]
+# C16, under D-29. Declared, and the fee is UNVERIFIED against any venue's schedule.
+rt_bps = 12.0
+slip_bps = 1.0
+# C16 declares 5 bp per stop exit, UNVERIFIED. It is labelled a placeholder here because this run is generated.
+stop_slip_bps = 5.0
+stop_slip_state = "placeholder"
+# C7: the base case uses the taker rate, which is rt_bps / 2 - slip_bps.
+target_fee_bps = 5.0
+basis = "C16 under D-29: RT 12 bps, slip 1 bp, stop_slip 5 bp. All UNVERIFIED against a venue. Generated run"
+
+[risk]
+# Decision D-28 is with the owner. These are placeholders and are printed on every output.
+state = "placeholder"
+basis = "Placeholder from D-28, not measured and not tested. The owner decides the real values"
+capital = 100000.0
+leverage_cap = 2.0
+gross_cap = 3.0
+
+[risk.per_trade_pct]
+S01 = { SYNTHBTC = 0.25, SYNTHETH = 0.25 }
+S02 = { SYNTHBTC = 0.25, SYNTHETH = 0.25 }
+S03 = { SYNTHBTC = 0.25, SYNTHETH = 0.25 }
+S04 = { SYNTHBTC = 0.25, SYNTHETH = 0.25 }
+S05 = { SYNTHBTC = 0.25, SYNTHETH = 0.25 }
+S06 = { SYNTHBTC = 0.25, SYNTHETH = 0.25 }
+S07 = { SYNTHBTC = 0.25, SYNTHETH = 0.25 }
+S08 = { SYNTHBTC = 0.25, SYNTHETH = 0.25 }
+S09 = { SYNTHBTC = 0.25, SYNTHETH = 0.25 }
+S10 = { SYNTHBTC = 0.25, SYNTHETH = 0.25 }
+
+[ticks]
+# The generator prices to two decimals. A real tick is read from the chosen source, under C16.
+SYNTHBTC = 0.01
+SYNTHETH = 0.01
+
+# Grids are section 8 of each document, and default lines are the table in C18. A default is a display order, not a
+# selection. portfolio_line is D-35: the C18 default line, so the portfolio figure selects nothing. Rule constants live
+# in the code beside the document section they come from, because a change to one is a new document version.
+
+[strategies.S01]
+default_state = "declared"
+default_line = { timeframe_minutes = 15, touch_limit = 1, level_set = "full" }
+portfolio_state = "declared"
+portfolio_line = { timeframe_minutes = 15, touch_limit = 1, level_set = "full" }
+grid = { timeframe_minutes = [15, 30], touch_limit = [1, 2], level_set = ["full", "daily_core"] }
+
+[strategies.S02]
+default_state = "declared"
+default_line = { timeframe_minutes = 60, acc = 3, weekly_levels = false }
+portfolio_state = "declared"
+portfolio_line = { timeframe_minutes = 60, acc = 3, weekly_levels = false }
+grid = { timeframe_minutes = [60], acc = [3, 2], weekly_levels = [false, true] }
+
+[strategies.S03]
+default_state = "declared"
+default_line = { timeframe_minutes = 60, swing = [5, 3], max_bos = 2 }
+portfolio_state = "declared"
+portfolio_line = { timeframe_minutes = 60, swing = [5, 3], max_bos = 2 }
+grid = { timeframe_minutes = [60, 240], swing = [[5, 3], [8, 4]], max_bos = [2, 1] }
+
+[strategies.S04]
+default_state = "declared"
+default_line = { timeframe_minutes = 60, q_min = 60.0, touch_limit = 0 }
+portfolio_state = "declared"
+portfolio_line = { timeframe_minutes = 60, q_min = 60.0, touch_limit = 0 }
+grid = { timeframe_minutes = [60, 240], q_min = [60.0, 45.0], touch_limit = [0, 1] }
+
+[strategies.S05]
+default_state = "declared"
+default_line = { timeframe_minutes = 60, rw = 48 }
+portfolio_state = "declared"
+portfolio_line = { timeframe_minutes = 60, rw = 48 }
+grid = { timeframe_minutes = [60, 240], rw = [48, 24] }
+
+[strategies.S06]
+default_state = "declared"
+default_line = { timeframe_minutes = 15, n_r = 2, swing_pools = true }
+portfolio_state = "declared"
+portfolio_line = { timeframe_minutes = 15, n_r = 2, swing_pools = true }
+grid = { timeframe_minutes = [15, 5], n_r = [2, 0], swing_pools = [true, false] }
+
+[strategies.S07]
+# C18: S07 and S08 wait for bars from trades. On candles they give no result. This generated run holds trades.
+default_state = "placeholder"
+default_line = { timeframe_minutes = 60, major = [10, 5, 2.0], max_touch = 2 }
+# FP-05: project-manager declares this rule. A placeholder until then, and never chosen by outcome.
+portfolio_state = "placeholder"
+portfolio_line = { timeframe_minutes = 60, major = [10, 5, 2.0], max_touch = 2 }
+grid = { timeframe_minutes = [60], major = [[10, 5, 2.0], [20, 5, 3.0]], max_touch = [2, 1] }
+
+[strategies.S08]
+default_state = "placeholder"
+default_line = { timeframe_minutes = 60, profile_days = 1 }
+# FP-05: project-manager declares this rule. A placeholder until then, and never chosen by outcome.
+portfolio_state = "placeholder"
+portfolio_line = { timeframe_minutes = 60, profile_days = 1 }
+grid = { timeframe_minutes = [60, 30], profile_days = [1, 3] }
+
+[strategies.S09]
+default_state = "declared"
+default_line = { timeframe_minutes = 60, window_hours = 8, srv_min = 1.0 }
+portfolio_state = "declared"
+portfolio_line = { timeframe_minutes = 60, window_hours = 8, srv_min = 1.0 }
+grid = { timeframe_minutes = [60], window_hours = [8, 6], srv_min = [1.0, 1.5] }
+
+[strategies.S10]
+default_state = "declared"
+default_line = { timeframe_minutes = 240, pr_max = 0.10, box_bars = 12 }
+portfolio_state = "declared"
+portfolio_line = { timeframe_minutes = 240, pr_max = 0.10, box_bars = 12 }
+grid = { timeframe_minutes = [240, 60], pr_max = [0.10, 0.20], box_bars = [12, 24] }
