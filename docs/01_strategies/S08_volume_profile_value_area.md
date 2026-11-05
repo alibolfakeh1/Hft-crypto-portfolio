@@ -269,7 +269,7 @@ Each configuration has two branches, reported separately: rejection and acceptan
 | Balanced days following balanced days | Rejection should do best | Result by prior-day range and by whether the current day overlaps value |
 | Trend days and strong migration | Acceptance should do best, rejection should fail | Results by branch and day type measured afterwards |
 | Thin weekends | Profiles are based on less volume, and may be less meaningful | Result by day of week of the profile |
-| Both branches losing together | The classifier adds nothing | Compare each branch with its [placebo](00_INDEX.md#c15-placebo-control): a random band of the same width in `ATR` units, drawn at the profile's knowable time, with a placebo `POC` at the real position inside the band, so that no real level stays in the targets |
+| Both branches losing together | The classifier adds nothing | Compare each branch with its [placebo](00_INDEX.md#c15-placebo-control): a random band of the same width in `ATR` units, drawn at the profile's knowable time, with a placebo `POC` at the real position inside the band, so that no real level stays in the targets. The developing profile stays real, as C15 says, so the value-migration stop and the `T2` raise read real trades. No real level enters a target: the raised `T2` comes from the placebo band, and only the raise's trigger compares a real `dPOC` with the placebo `VAH`. So this control reads the prior-day band only, and `V0` against `V0S` reads those two rules |
 
 ## 11. Flow hooks
 

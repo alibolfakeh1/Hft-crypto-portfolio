@@ -165,6 +165,7 @@ If `T1` is not hit by the close of `n = 24`, exit at the next open. Absolute lim
 ### 7.8 Invalidation
 
 Two consecutive closes below `A0`: exit at the next open. The average participant in the leg is now losing, and the thesis has gone.
+A bar with no trade has no close, so it is neither one of the two nor a break between them, under [C3](00_INDEX.md#c3-indicators).
 
 ### 7.9 Same-bar conflicts
 

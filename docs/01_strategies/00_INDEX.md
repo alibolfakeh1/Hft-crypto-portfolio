@@ -163,7 +163,8 @@ as venue-independent without that retest.
 - **A minute with no trades.** It is a bar with zero volume and no price only when the response that delivered the data
   proves continuity across that minute, by a trade id or sequence number with no skip, or by overlapping pages. Such a bar
   can touch nothing and adds nothing to a `T_d` bar's high, low or volume. `P_dec` or a `T_d` close uses the last trade before
-  it, and a fill uses the first 1m bar that has a price. **Otherwise the minute is a gap**, so a hole cannot pass as zero-volume
+  it, and a fill uses the first 1m bar that has a price. On a `T_d` bar with no trade in it at all, that last trade values the
+  position and nothing more, and no rule reads it as a close, as [C3](#c3-indicators) says. **Otherwise the minute is a gap**, so a hole cannot pass as zero-volume
   minutes and hide a stop touched inside it. The [completeness check](#c17-hourly-live-cycle) speaks only to the end of the data
   and is not this proof. A source with no sequence therefore treats every empty minute as a gap, which costs little on a liquid
   perpetual. The same test applies to the archive at gate G1. On official candles the proof comes from the row itself. A missing row is a gap. A row with zero trades is proof of an empty minute, a third kind.
@@ -216,6 +217,19 @@ of its last input bar.
   amplitude test in [C4](#c4-swing-pivots-and-registers) uses the same value. Before the first seed no such value exists, so a swing
   confirmed then is ignored. Setups still fail. Register events follow this whether or not a position is open, so a register never
   depends on a position. This fills no bar.
+- **A bar with no trade.** A `T_d` bar on the grid with no trade in it, whether its minutes are missing or proved empty, still
+  counts in `n`, so a hole in the data never lengthens a hold or a time stop. It has no close. The last trade before it values the
+  position, and no rule, register event or check reads it as a close. A bar with at least one trade has a close, its last trade,
+  even when it is flagged. The bar that holds the fill always has a trade, so `n = 1` always has a close. A rule at a stated `n` or
+  clock time that falls on a bar with no trade acts by its kind:
+
+| Kind of rule | On a bar with no trade | Where |
+|---|---|---|
+| An exit that reads no close | Fires at that bar's close time, and fills at the first 1m bar with a price | Every time stop on `T1` not hit, and every absolute limit. S09's hard flat. The `V0S` hold |
+| One exit check at a stated `n` that reads a close | Falls once, at the next close that has one, so that an exit rule does not fail open | S03 stall. S10 thesis check and stall. S06 linger. S09's check at `n = 4` |
+| A close-based exit tested at every close, within `n <= N`, or on consecutive closes | Tests only the closes that exist. A bar with no trade neither counts towards a run nor breaks one, and no window is extended, since the fill bar's close is in every window | S01 level lost. S02 acceptance lost. S03 `CHoCH`. S04 absorption. S05 Stage A and Stage B. S06 reclaim lost and aftershock. S07 two closes below `A0`. S08 back across value. S09 back in the range. S10 back in the box |
+| A stop or target update at a stated `n` or clock time | Not computed, under the update rule above, and not tried again. `ATR` is undefined there and for the next 14 complete bars, and by then the early bars it judges have passed. The position keeps its stop, its invalidation and its time stops | S02 participation check. S04 reaction test. S05 inventory clock. S09 volume-arrival check, and its `T2` raise at `h_peak` |
+
 - Filling a missing value to avoid any of this is forbidden.
 
 ### C4. Swing pivots and registers
@@ -422,6 +436,17 @@ A `V0S` target is set from the fill, so the fill bar uses that target, an except
 [C7](#c7-exit-engine). `V0S` follows C7 for a pending exit and for exit slippage. Under the cycle, `H` follows charter
 section 7 rule 7.
 
+`H` is a count of `T_d` bars in every document except S09, where it is the hard flat at `T_flat` of the schedule the position
+entered with. That too is fixed at entry and never moves, and it keeps S09's session limit the same in both variants, so the
+comparison reads only the dynamic model. A count of `H` is a count of `n`, so a bar with no trade counts, and the hold reads no
+close, under [C3](#c3-indicators). Every `H` is within its strategy's `H_max` in [C18](#c18-selection-purge-and-retirement), and
+`V0S` uses that same `H_max`, so it leaves out the same setups as `V0`.
+
+`V0S` is its own stream under [C11](#c11-overlap-policy): one open position per strategy and symbol, and a rule that allows one
+trade per level, flip, pool, day or side counts what this stream sent. A setup can therefore be taken in one stream and
+`SKIPPED_OPEN` in the other, and the comparison prints that count. Taking `V0`'s entries instead would make the control's trades
+depend on the dynamic model it is there to measure, and would let its positions overlap.
+
 ### C14. Event log
 
 Every event is logged with old value, new value, reason, computed-at time and effective-from time:
@@ -459,7 +484,8 @@ therefore says little, and only the difference from the placebo is informative.
 - The distance distribution is built only on earlier blocks, from real levels and the closes at their knowable times. Within the
   first training span, calendar quarters act as blocks, so its first quarter, 2020-Q1 under the fold plan, has no level placebo, and reports say so. The
   first test block, 2024-Q1, may draw on the whole first span.
-- The whole level set is replaced, including levels used as targets, so no real level stays in the placebo's result.
+- The whole level set is replaced, including levels used as targets, so no real level of that set stays in the placebo's result.
+  What stays real is stated below, under **What a draw replaces, and what stays real**.
 
 **Strategies with no level (S03, S10).** Entry bars are drawn uniformly, without replacement, over bars passing the strategy's non-signal filters. Each draw takes as many long and as many short entries, per block
 and symbol, as the line's real setups in that block. An entry that fails its stop or target rules is logged and not replaced, and one that meets an open position is skipped under C11. The side is random, at the block's real long and short share, and independent of returns. That share is same-block information. It
@@ -477,6 +503,14 @@ The configuration and the mode are the same as the real run. Under `CYCLE`, plac
 run times. Comparisons use `Result_B`. Placebo runs are recorded in the trial registry as controls. Within the first training span, every block in this section is a
 calendar quarter. No draw, distance or share reads a date closed under the [read rule](#c18-selection-purge-and-retirement), so a closed block is not an earlier block, and a
 placebo on the locked block is part of its one global read.
+
+**What a draw replaces, and what stays real.** A draw replaces the object the strategy trades against: a period's levels, a pool, a
+zone, a flip, a prior profile, an entry bar, a major anchor list or a window. A value that a rule reads from the bars or trades
+themselves, and not from that object, comes from the same path in the real line and in every draw, so it stays real: S05's later
+swings, S07's minor anchors, S08's developing profile, and every trail, chandelier and price extreme a rule names, such as S04's
+`HHz` and S06's `PSH`. Such a value can set a stop, a target or a trigger. A draw therefore measures what the object adds and says
+nothing about those rules, and the report says so beside the rank. `V0` against `V0S` is the comparison that reads them. Choices
+this section leaves to the code are ruled in [the change record](CHANGES_2026-11-04.md#rulings-on-the-engine-progress-note-2026-11-05).
 
 ### C16. Rounding and arithmetic in examples
 

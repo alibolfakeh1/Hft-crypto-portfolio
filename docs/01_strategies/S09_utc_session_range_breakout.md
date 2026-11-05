@@ -152,7 +152,8 @@ T2 = max(RH + 2.0 * RW, C_k + 2.50 * D)
 
 ### 7.7 Time stop
 
-- At the close of `n = 4`, if `C_b < fill + 0.5 * R`, exit at the next open.
+- At the close of `n = 4`, if `C_b < fill + 0.5 * R`, exit at the next open. This is one check. If that bar has no close, it falls
+  at the next close that has one, under [C3](00_INDEX.md#c3-indicators).
 - **Hard flat.** At the close of the bar ending `T_flat` (23:00 in the example), exit at the next open. With the example's profile, this is about an hour before a 00:00 UTC funding settlement on venues with that schedule. Another profile or venue may not have that margin.
 
 ### 7.8 Invalidation
@@ -165,7 +166,8 @@ For `n <= 3`, if `C_b < RH - 0.25 * RW`, the break has fallen back into the rang
 
 ### 7.10 `V0S` control
 
-`S0` from 7.1, `m = 2.0`, with `H` replaced by the same hard flat at `T_flat`.
+`S0` from 7.1, `m = 2.0`, with `H` replaced by the same hard flat at `T_flat`, from the schedule the position entered with, so it
+is fixed at entry as [C13](00_INDEX.md#c13-v0s-control) requires.
 
 ### 7.11 Why this model suits this strategy
 

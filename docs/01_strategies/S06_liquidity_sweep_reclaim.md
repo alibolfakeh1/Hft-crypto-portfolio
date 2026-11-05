@@ -165,7 +165,10 @@ on this strategy.
 Each of these exits at the next open:
 
 - **Reclaim lost.** For `n <= 4`, `C_b < l - 0.10 * ATR_b`.
-- **Linger.** At the close of `n = 6`, at least 4 of the 6 closes lie within `0.25 * ATR` of `l`.
+- **Linger.** At the close of `n = 6`, at least 4 of the 6 closes lie within `0.25 * ATR` of `l`, with `ATR` that of this close,
+  or the last defined value under [C3](00_INDEX.md#c3-indicators). This is one check. If that bar has no close, the check falls at
+  the next close that has one. A bar with no close adds nothing to the count, so it holds at most 6 closes from `n = 1`, and it
+  still needs 4.
 - **Aftershock.** Before `T1`, a bar with `H_b - L_b >= 3.0 * ATR_b` and `C_b < O_b`.
 
 ### 7.9 Same-bar conflicts
