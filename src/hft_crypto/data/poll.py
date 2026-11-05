@@ -270,8 +270,48 @@ class SymbolResult:
     skew_s: float | None = None
     passed_on_server_time: bool = False
     emitted_hash: str | None = None
+    # What a rebuild can reproduce, so a later rebuild can be checked against this line of the log. A match
+    # proves values only. It never restores a first emission or a receipt time, and nothing in a decision
+    # reads it.
+    rebuild_digest: str | None = None
+    first_close: str | None = None
+    last_close: str | None = None
+    first_trade_id: int | None = None
+    last_trade_id: int | None = None
     bars_left_by_budget: bool = False
     rebuilding: bool = False
+
+
+# Written down once. Scaled integers and not float text, so a library upgrade cannot read as a mismatch.
+REBUILD_DIGEST_PRICE_COLUMNS = ("open", "high", "low", "close")
+REBUILD_DIGEST_VOLUME_COLUMNS = (
+    "volume",
+    "quote_volume",
+    "buy_volume",
+    "sell_volume",
+    "settled_volume",
+    "settled_quote_volume",
+    "settled_buy_volume",
+    "settled_sell_volume",
+)
+_DIGEST_SCALE = 100_000_000
+
+
+def rebuild_digest_lines(bars: pl.DataFrame) -> list[str]:
+    """One line per bar, in close-time order, holding only what a rebuild from the same trades gives."""
+
+    def scaled(name: str) -> list[str]:
+        return ["n" if value is None else str(round(value * _DIGEST_SCALE)) for value in bars[name].to_list()]
+
+    ordered = bars.sort("close_time")
+    bars = ordered
+    closes = [str(value) for value in ordered["close_time"].dt.timestamp("us").to_list()]
+    columns = [
+        closes,
+        *(scaled(name) for name in (*REBUILD_DIGEST_PRICE_COLUMNS, *REBUILD_DIGEST_VOLUME_COLUMNS)),
+    ]
+    columns.append([str(value) for value in ordered["trade_count"].to_list()])
+    return [",".join(items) for items in zip(*columns, strict=True)]
 
 
 def _floor_minute(value_us: int) -> int:
@@ -418,6 +458,8 @@ class _Emission:
     bars: int
     end_us: int
     digest: str | None
+    rebuild_digest: str | None
+    first_close_us: int | None
     left_by_budget: bool
 
 
@@ -440,6 +482,8 @@ def _emit_bars(
     """
     gap_closes = _stored_gap_closes(ctx, poll, symbol)
     digest = hashlib.sha256()
+    values = hashlib.sha256()
+    first_emitted: int | None = None
     emitted = 0
     end_us = after_us
     first_close = after_us + MICROS_PER_MINUTE
@@ -447,7 +491,14 @@ def _emit_bars(
     started = False
     while day_start_us(day) < through_us:
         if started and clock() >= deadline:
-            return _Emission(emitted, end_us, digest.hexdigest() if emitted else None, True)
+            return _Emission(
+                emitted,
+                end_us,
+                digest.hexdigest() if emitted else None,
+                values.hexdigest() if emitted else None,
+                first_emitted,
+                True,
+            )
         started = True
         low = day_start_us(day)
         start = max(first_close, low + MICROS_PER_MINUTE)
@@ -466,6 +517,11 @@ def _emit_bars(
             atomic_write_parquet(part, combined, guard=ctx.root.guard)
             emitted += new.height
             digest.update(new.write_csv().encode("utf-8"))
+            if new.height:
+                values.update("\n".join(rebuild_digest_lines(new)).encode("utf-8"))
+                values.update(b"\n")
+                if first_emitted is None:
+                    first_emitted = min(int(v) for v in new["close_time"].dt.timestamp("us").to_list())
             parents = [ctx.relative(ctx.root.curated_part(TRADES_LIVE, poll.venue, symbol, day))]
             _register_bars(ctx, poll, symbol, day, part, BARS_1M_LIVE, combined.height, parents)
             bars_rel = ctx.relative(part)
@@ -477,7 +533,14 @@ def _emit_bars(
                 _register_bars(ctx, poll, symbol, day, higher_part, dataset, higher.height, [bars_rel])
             end_us = stop
         day += dt.timedelta(days=1)
-    return _Emission(emitted, end_us, digest.hexdigest() if emitted else None, False)
+    return _Emission(
+        emitted,
+        end_us,
+        digest.hexdigest() if emitted else None,
+        values.hexdigest() if emitted else None,
+        first_emitted,
+        False,
+    )
 
 
 def _register_bars(
@@ -593,7 +656,8 @@ def poll_symbol(
                 if row.ts_us > page_received_us + skew_us:
                     raise ValidationError(f"a trade is stamped {iso_us(row.ts_us)}, ahead of the clock")
             fresh = 0
-            for row in page.trades:
+            # In id order, so that a page out of order cannot drop a trade as a repeat.
+            for row in sorted(page.trades, key=lambda item: item.trade_id):
                 if last_id is not None and row.trade_id <= last_id:
                     result.repeated_rows += 1
                     continue
@@ -640,6 +704,9 @@ def poll_symbol(
     if new_trades:
         _write_trades(ctx, poll, pair.symbol, new_trades, allowance_us)
     result.new_trades = len(new_trades)
+    if new_trades:
+        result.first_trade_id = min(trade.trade_id for trade in new_trades)
+        result.last_trade_id = max(trade.trade_id for trade in new_trades)
 
     # Completeness check of C17. Only a record stamped after the cut shows the data runs through it.
     a_us = round(poll.allowance_a_s * MICROS_PER_SECOND)
@@ -670,6 +737,10 @@ def poll_symbol(
         )
         result.new_bars = emission.bars
         result.emitted_hash = emission.digest
+        result.rebuild_digest = emission.rebuild_digest
+        if emission.bars:
+            result.first_close = None if emission.first_close_us is None else iso_us(emission.first_close_us)
+            result.last_close = iso_us(emission.end_us)
         result.bars_left_by_budget = emission.left_by_budget
         emitted_end = emission.end_us
         if emission.left_by_budget:

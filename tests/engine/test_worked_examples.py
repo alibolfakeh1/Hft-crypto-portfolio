@@ -763,17 +763,15 @@ def test_s09_every_stop_in_the_table() -> None:
     expected = [
         67_165.0,
         67_165.0,
-        67_682.9,
+        67_682.8,
         67_690.0,
         67_820.0,
         68_095.0,
         68_135.0,
         68_135.0,
     ]
-    # The table takes BE+ from a fill shown rounded to 67,601.8, which gives 67,682.92. C6 does not round a
-    # fill, so the exact 67,601.76 gives 67,682.88, and C16 floors that to 67,682.8: one tick from the table,
-    # and reported.
-    assert _stops_after(stream, closes[1:9], 67_165.0) == pytest.approx(expected, abs=0.11)
+    # The document's table: the exact fill 67,601.76 gives BE+ 67,682.88, and C16 floors that to 67,682.8.
+    assert _stops_after(stream, closes[1:9], 67_165.0) == pytest.approx(expected, abs=1e-6)
 
 
 def test_s09_the_session_clock_moves_the_far_target_and_the_exits_match() -> None:

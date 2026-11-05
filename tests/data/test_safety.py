@@ -7,10 +7,12 @@ import re
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
 from helpers import REPO_ROOT, base_config
+from hft_crypto.config import APPROVED_ROUTES, route_problem
 from hft_crypto.data.fetch import ALLOWED_HOSTS, ForbiddenHostError, HttpFetcher, check_url
 
 SOURCE = REPO_ROOT / "src"
@@ -24,7 +26,8 @@ def test_there_is_source_to_check() -> None:
 @pytest.mark.parametrize(
     "url",
     [
-        "http://data.binance.vision/x",  # not HTTPS
+        "http://data.binance.vision/data/futures/um/x.zip",  # not HTTPS
+        "https://data.binance.vision/data/spot/x.zip",  # not this project's product
         "https://api.binance.com/api/v3/order",  # order endpoints live on these hosts
         "https://fapi.binance.com/fapi/v1/order",
         "https://api.bybit.com/v5/order/create",
@@ -40,9 +43,9 @@ def test_only_https_to_allowed_hosts(url: str) -> None:
 
 def test_allowed_hosts_exclude_all_exchange_trading_hosts() -> None:
     assert {
+        "data.binance.vision",
         "public.bybit.com",
         "quote-saver.bycsi.com",
-        "api.kraken.com",
     } == ALLOWED_HOSTS
 
 
@@ -54,12 +57,20 @@ def test_every_configured_source_is_on_the_allowlist() -> None:
             if source.prohibited:
                 with pytest.raises(ForbiddenHostError):
                     check_url(url, ALLOWED_HOSTS)
+            elif urlsplit(url).hostname in APPROVED_ROUTES:
+                # A base address is not a file, so it is checked against the route and not fetched as a file.
+                assert route_problem(source.name, url) is None
+                with pytest.raises(ForbiddenHostError):
+                    check_url(url, ALLOWED_HOSTS)
             else:
                 check_url(url, ALLOWED_HOSTS)
 
 
-def test_the_only_kraken_path_is_public() -> None:
-    assert "/0/public/" in base_config().poll.base_url
+def test_the_only_kraken_path_is_public_and_it_is_prohibited() -> None:
+    config = base_config()
+    assert "/0/public/" in config.poll.base_url
+    assert config.source("kraken").prohibited is True
+    assert not config.source_usable("kraken")
 
 
 def test_every_source_ships_disabled() -> None:
@@ -73,10 +84,10 @@ def test_every_source_ships_disabled() -> None:
 
 def test_terms_notes_name_the_decision_and_are_not_stale() -> None:
     config = base_config()
-    assert "D-17" in config.source("binance").terms_note
+    assert "D-29" in config.source("binance").terms_note
     assert "non-commercial" in config.source("binance").terms_note
-    for name in ("bybit", "kraken"):
-        assert "Not approved" in config.source(name).terms_note
+    assert "Not approved" in config.source("bybit").terms_note
+    assert "D-23" in config.source("kraken").terms_note
     for source in config.sources.values():
         assert "UNVERIFIED" not in source.terms_note
 
@@ -85,7 +96,7 @@ def test_with_no_approved_source_the_client_refuses_every_host(tmp_path: Path) -
     config = base_config()
     fetcher = HttpFetcher(config.fetch, allowed_hosts=config.enabled_hosts())
     for url in (
-        "https://data.binance.vision/data/futures/um/x.zip",
+        "https://data.binance.vision/data/futures/um/daily/klines/BTCUSDT/1m/BTCUSDT-1m-2026-03-01.zip",
         "https://public.bybit.com/trading/x.csv.gz",
         "https://quote-saver.bycsi.com/orderbook/linear/x.zip",
         "https://api.kraken.com/0/public/Trades",
@@ -99,6 +110,10 @@ def test_with_no_approved_source_the_client_refuses_every_host(tmp_path: Path) -
 
 def test_enabling_a_source_opens_only_its_own_hosts() -> None:
     config = base_config()
+    declared = replace(config.source("binance"), enabled=True, candle_allowance_ms=1000.0)
+    binance_only = replace(config, sources={**config.sources, "binance": declared})
+    assert binance_only.enabled_sources() == ("binance",)
+    assert binance_only.enabled_hosts() == {"data.binance.vision"}
     bybit_only = replace(
         config, sources={**config.sources, "bybit": replace(config.source("bybit"), enabled=True)}
     )
@@ -151,12 +166,71 @@ def test_nothing_in_the_source_sends_a_request_body_or_another_method() -> None:
             if isinstance(node, ast.Import):
                 assert not {alias.name for alias in node.names} & network_modules, path
             if isinstance(node, ast.ImportFrom):
-                assert node.module not in network_modules, path
+                # N-09: the one exception type a broken response raises, named so it can be caught exactly.
+                names = {alias.name for alias in node.names}
+                allowed = (
+                    node.module == "http.client" and names == {"HTTPException"} and path.name == "fetch.py"
+                )
+                assert allowed or node.module not in network_modules, path
             if isinstance(node, ast.keyword) and node.arg == "method":
                 assert isinstance(node.value, ast.Constant), path
                 assert node.value.value == "GET", path
             if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "Request":
                 assert not any(keyword.arg == "data" for keyword in node.keywords), path
+
+
+_URL_LIKE = re.compile(r"://|\burl\b|\bhttps?\b", re.IGNORECASE)
+
+
+def polars_url_reads(tree: ast.AST) -> list[str]:
+    """Polars readers open their own sockets in Rust, below the audit hook, so a URL must never reach one."""
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        reader = node.func.attr
+        if not reader.startswith(("read_", "scan_")):
+            continue
+        owner = ast.unparse(node.func.value)
+        if owner not in ("pl", "polars"):
+            continue
+        given = [*node.args, *[item.value for item in node.keywords]]
+        if any(_URL_LIKE.search(ast.unparse(item)) for item in given):
+            found.append(reader)
+    return found
+
+
+def test_the_polars_url_scan_finds_what_it_is_looking_for() -> None:
+    bad = ast.parse("pl.read_parquet('https://x/y')\npl.scan_csv(url)\npolars.read_csv(f'http://{x}')\n")
+    assert polars_url_reads(bad) == ["read_parquet", "scan_csv", "read_csv"]
+    good = ast.parse("pl.read_parquet(path)\npl.read_csv(io.BytesIO(data))\nframe.read_x('https://y')\n")
+    assert polars_url_reads(good) == []
+
+
+def test_no_url_is_passed_to_a_polars_reader() -> None:
+    """N-06. This is the one route below the guard in tests/child_guard."""
+    files = [*PY_FILES, *sorted((REPO_ROOT / "tests").rglob("*.py"))]
+    bad = {
+        path.name: polars_url_reads(ast.parse(path.read_text(encoding="utf-8")))
+        for path in files
+        if path.name != "test_safety.py" and polars_url_reads(ast.parse(path.read_text(encoding="utf-8")))
+    }
+    assert bad == {}
+
+
+def test_no_shipped_file_says_a_placeholder_is_frozen() -> None:
+    """Item 7 of the leak recheck. Both sentences were false: D-18 freezes nothing, and the roadmap has it
+    pending."""
+    roots = [REPO_ROOT / "src", REPO_ROOT / "configs", REPO_ROOT / ".github"]
+    false_words = re.compile(r"frozen under decision D-18|stays frozen at", re.IGNORECASE)
+    bad = [
+        path.name
+        for root in roots
+        for path in root.rglob("*")
+        if path.is_file() and false_words.search(path.read_text(encoding="utf-8", errors="replace"))
+    ]
+    assert bad == []
+    assert "not frozen" in (REPO_ROOT / "configs" / "pipeline.toml").read_text(encoding="utf-8")
 
 
 def test_urllib_is_used_only_by_the_fetch_module() -> None:

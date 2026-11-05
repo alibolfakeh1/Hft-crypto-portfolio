@@ -18,7 +18,6 @@ import polars as pl
 
 from hft_crypto.bars.core import UTC_TIME
 from hft_crypto.config import (
-    PROHIBITED_SOURCES,
     PipelineConfig,
     RetentionPolicy,
     load_pipeline_config,
@@ -34,6 +33,10 @@ from hft_crypto.timeutil import day_start_us
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VENUE = "generated"
+POLL_VENUE = "generated-poll"
+# Generated files in these tests are dated in 2026, so the guard is lifted in memory, where no file can reach
+# it.
+FAR_FUTURE = dt.date(2099, 12, 31)
 MINUTE = 60_000_000
 DAY = 86_400_000_000
 
@@ -212,11 +215,11 @@ def base_config() -> PipelineConfig:
 
 
 def with_sources_enabled(config: PipelineConfig) -> PipelineConfig:
-    """Adapters switched on for tests, on generated files only.
+    """Adapters switched on for tests, on generated files only, on addresses that cannot resolve.
 
-    The aggregate-trade adapter's venue is prohibited, and the code refuses it by name and by host. So its
-    adapters run here under a generated venue on an address that cannot resolve. The other sources keep their
-    names, and only ever see a fake fetcher.
+    The aggregate-trade adapters run under a generated venue that builds its bars from trades, which is the
+    path with the most checks to test. The poll's client runs under a generated venue too, because its real
+    source is prohibited by name. The other sources keep their names, and only ever see a fake fetcher.
     """
     generated = replace(
         config.sources["binance"],
@@ -224,19 +227,56 @@ def with_sources_enabled(config: PipelineConfig) -> PipelineConfig:
         enabled=True,
         prohibited=False,
         urls={"archive_base": GENERATED},
+        bar_source="trades",
+        attribution="",
     )
-    sources = {
-        name: replace(source, enabled=True)
-        for name, source in config.sources.items()
-        if name not in PROHIBITED_SOURCES
-    }
+    polled = replace(
+        config.sources["kraken"],
+        name=POLL_VENUE,
+        enabled=True,
+        prohibited=False,
+        urls={"trades_url": f"{GENERATED}/poll"},
+    )
+    bybit = replace(config.sources["bybit"], enabled=True)
     datasets = tuple(
-        replace(spec, id=spec.id.replace("binance.", f"{VENUE}."), venue=VENUE)
+        replace(
+            spec,
+            id=spec.id.replace("binance.", f"{VENUE}."),
+            venue=VENUE,
+            light=True,
+            opt_in=False,
+            # The fixtures publish one candle file a day.
+            granularity="day" if spec.adapter == "binance_klines" else spec.granularity,
+        )
         if spec.venue == "binance"
         else spec
         for spec in config.datasets
     )
-    return replace(config, sources={**sources, VENUE: generated}, datasets=datasets)
+    poll = replace(config.poll, venue=POLL_VENUE, base_url=f"{GENERATED}/poll")
+    return replace(
+        config,
+        sources={"bybit": bybit, VENUE: generated, POLL_VENUE: polled},
+        datasets=datasets,
+        poll=poll,
+        last_opened_date=FAR_FUTURE,
+    )
+
+
+def with_binance_enabled(
+    config: PipelineConfig, *, candle_allowance_ms: float = 1000.0, last_opened_date: dt.date | None = None
+) -> PipelineConfig:
+    """The shipped configuration with its one approved source switched on, in memory. A fake fetcher serves
+    it.
+
+    The allowance is invented, since project-manager has not declared one, and the guard stays as shipped
+    unless a test names another date.
+    """
+    source = replace(config.sources["binance"], enabled=True, candle_allowance_ms=candle_allowance_ms)
+    return replace(
+        config,
+        sources={**config.sources, "binance": source},
+        last_opened_date=last_opened_date or config.last_opened_date,
+    )
 
 
 def base_policy() -> RetentionPolicy:

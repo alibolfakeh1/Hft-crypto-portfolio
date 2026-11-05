@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,7 @@ import polars as pl
 import pytest
 
 from helpers import (
+    FAR_FUTURE,
     GENERATED,
     FakeFetcher,
     agg_trades_csv,
@@ -164,15 +166,18 @@ def test_order_is_newest_first_with_lighter_datasets_first(tmp_path: Path) -> No
 
 def test_today_is_never_expected() -> None:
     spec = small_config(D1).dataset("generated.aggTrades")
-    assert expected_partitions(spec, at(D3)) == [D1, D2]
+    assert expected_partitions(spec, at(D3), ceiling=FAR_FUTURE) == [D1, D2]
 
 
 def test_monthly_partitions_wait_for_the_month_to_end() -> None:
     from dataclasses import replace
 
     spec: DatasetSpec = replace(small_config(D1).dataset("generated.fundingRate"), start=dt.date(2026, 1, 1))
-    assert expected_partitions(spec, at(dt.date(2026, 3, 31))) == [dt.date(2026, 1, 1), dt.date(2026, 2, 1)]
-    assert expected_partitions(spec, at(dt.date(2026, 4, 1)))[-1] == dt.date(2026, 3, 1)
+    assert expected_partitions(spec, at(dt.date(2026, 3, 31)), ceiling=FAR_FUTURE) == [
+        dt.date(2026, 1, 1),
+        dt.date(2026, 2, 1),
+    ]
+    assert expected_partitions(spec, at(dt.date(2026, 4, 1)), ceiling=FAR_FUTURE)[-1] == dt.date(2026, 3, 1)
 
 
 def test_with_no_approved_source_ingest_contacts_nothing_and_says_so(tmp_path: Path) -> None:
@@ -206,6 +211,7 @@ def test_one_enabled_source_does_not_open_the_others(tmp_path: Path) -> None:
         config,
         sources={**config.sources, "bybit": replace(config.source("bybit"), enabled=True)},
         datasets=tuple(replace(spec, start=D1) for spec in config.datasets),
+        last_opened_date=FAR_FUTURE,
     )
     ctx = make_context(tmp_path / "r", now=at(D2), config=bybit_only)
     assert {task.spec.venue for task in plan_tasks(ctx, IngestOptions())} == {"bybit"}
@@ -216,10 +222,10 @@ def test_a_monthly_partition_holding_the_start_date_is_expected() -> None:
     from dataclasses import replace
 
     spec = replace(small_config(D1).dataset("generated.fundingRate"), start=dt.date(2026, 1, 15))
-    assert expected_partitions(spec, at(dt.date(2026, 2, 3))) == [dt.date(2026, 1, 1)]
-    assert expected_partitions(spec, at(dt.date(2026, 2, 3)), start=dt.date(2026, 1, 20)) == [
-        dt.date(2026, 1, 1)
-    ]
+    assert expected_partitions(spec, at(dt.date(2026, 2, 3)), ceiling=FAR_FUTURE) == [dt.date(2026, 1, 1)]
+    assert expected_partitions(
+        spec, at(dt.date(2026, 2, 3)), start=dt.date(2026, 1, 20), ceiling=FAR_FUTURE
+    ) == [dt.date(2026, 1, 1)]
 
 
 def test_book_files_are_opt_in(tmp_path: Path) -> None:
@@ -438,7 +444,7 @@ def test_a_trade_exactly_at_midnight_moves_to_the_bar_of_the_day_before(tmp_path
     """The file of day 2 holds a trade stamped 00:00:00.000. It closes the last bar of day 1."""
     midnight_ms = day_start_us(D2) // 1000
     _, day_two_candles = make_day_files(D2)
-    rows = [(midnight_ms, 101.5, 7.0, False)] + [
+    rows = [(midnight_ms, 100.01, 7.0, False)] + [
         (midnight_ms + minute * 60_000 + 30_000, 100.0, 1.0, True) for minute in range(1440)
     ]
     candle_lines = day_two_candles.splitlines()
@@ -463,7 +469,7 @@ def test_a_trade_exactly_at_midnight_moves_to_the_bar_of_the_day_before(tmp_path
     last = day_one.row(-1, named=True)
     assert last["close_time"].isoformat() == "2026-03-02T00:00:00+00:00"
     assert last["volume"] == 8.0
-    assert last["close"] == 101.5
+    assert last["close"] == 100.01
     assert last["trade_count"] == 2
     day_two = read_parquet(ctx.root.curated_part("bars_1m", "generated", BTC, D2))
     assert day_two.row(0, named=True)["volume"] == 1.0
@@ -783,9 +789,8 @@ def test_a_six_hour_hole_in_a_file_is_recorded_and_flagged(tmp_path: Path, ids_s
     assert gaps
     trades_record = ctx.catalog.get_file(ctx.relative(ctx.root.curated_part("trades", "generated", BTC, D2)))
     assert trades_record is not None
-    assert trades_record.check_status == "warn"
-    assert trades_record.check_detail is not None
-    assert any("silence" in str(item) for item in trades_record.check_detail["warnings"])
+    # DR-13. A silence is a state of the market, so it never sets a status. A skip in the ids is a fault.
+    assert trades_record.check_status == ("warn" if ids_skip else "pass")
     bars = read_parquet(ctx.root.curated_part("bars_1m", "generated", BTC, D2))
     in_hole = bars.slice(360, 360)
     assert in_hole["gap"].all()
@@ -795,9 +800,10 @@ def test_a_six_hour_hole_in_a_file_is_recorded_and_flagged(tmp_path: Path, ids_s
     assert hourly["complete"].to_list() == [True] * before + [False] * (13 - before) + [True] * 11
     record = ctx.catalog.get_file(ctx.relative(ctx.root.curated_part("bars_1m", "generated", BTC, D2)))
     assert record is not None
-    assert record.check_status == "warn"
+    # A silence alone never excludes a day from statistics, and its minutes stay flagged all the same.
+    assert record.check_status == ("warn" if ids_skip else "unreconciled")
     assert bars_state(ctx)["2026-03-02"] == "done"
-    assert ctx.catalog.exclusions()
+    assert bool(ctx.catalog.exclusions()) is ids_skip
 
 
 def test_a_break_in_the_ids_with_no_silence_is_a_warning_and_flags_its_minutes(tmp_path: Path) -> None:
@@ -952,7 +958,7 @@ def test_a_crash_during_a_rebuild_heals_on_the_next_run(
 ) -> None:
     """F-06. A crash after bars_1m said final left bars_1d wrong for ever, while bars_1m was right."""
     midnight_ms = day_start_us(D2) // 1000
-    rows = [(midnight_ms, 101.5, 7.0, True)] + [
+    rows = [(midnight_ms, 100.01, 7.0, True)] + [
         (midnight_ms + minute * 60_000 + 30_000, 100.0, 1.0, True) for minute in range(1440)
     ]
     day_two = agg_trades_csv(rows, first_id=day_first_id(D2))
@@ -997,7 +1003,7 @@ def test_a_crash_during_a_rebuild_heals_on_the_next_run(
     run_ingest(healed, fetcher, options())
     assert bars_state(healed)["2026-03-01"] == "done"
     daily = read_parquet(healed.root.curated_part("bars_1d", "generated", BTC, D1)).row(0, named=True)
-    assert (daily["volume"], daily["close"], daily["gap"]) == (1447.0, 101.5, False)
+    assert (daily["volume"], daily["close"], daily["gap"]) == (1447.0, 100.01, False)
 
     # Identical to a run that never crashed.
     clean = FakeFetcher()
@@ -1088,11 +1094,19 @@ def test_raw_goes_as_soon_as_curated_data_passes(tmp_path: Path) -> None:
         publish_generated_day(fetcher, BTC, day)
     ctx = context(tmp_path / "r", at(D3))
     summary = run_ingest(ctx, fetcher, options(delete_raw=True))
-    assert summary.raw_deleted_files == 4
-    assert summary.raw_kept_after_curated == 0
-    assert [p for p in ctx.root.guard.check("raw/archive").rglob("*") if p.is_file()] == []
-    assert len(ctx.root.deletions_log.read_text(encoding="utf-8").splitlines()) == 4
+    # R6.1. A day's trade file also waits for its bars to pass, and the newest day's are provisional.
+    assert summary.raw_deleted_files == 3
+    left = [p.name for p in ctx.root.guard.check("raw/archive").rglob("*") if p.is_file()]
+    assert left == [f"{BTC}-aggTrades-{D2.isoformat()}.zip"]
+    assert len(ctx.root.deletions_log.read_text(encoding="utf-8").splitlines()) == 3
     assert ctx.root.curated_part("trades", "generated", BTC, D1).is_file()
+    # The next day's file makes that day final, and then its raw file goes too.
+    publish_generated_day(fetcher, BTC, D3)
+    later = context(tmp_path / "r", at(D4))
+    run_ingest(later, fetcher, options(delete_raw=True))
+    assert f"{BTC}-aggTrades-{D2.isoformat()}.zip" not in [
+        p.name for p in later.root.guard.check("raw/archive").rglob("*") if p.is_file()
+    ]
 
 
 def test_without_the_flag_raw_stays(tmp_path: Path) -> None:
@@ -1303,15 +1317,15 @@ def test_the_temp_sweep_leaves_the_ledger_and_decisions_alone(tmp_path: Path) ->
     assert all(path.is_file() for path in kept)
 
 
-def test_a_window_needed_beyond_the_allowance_warns(tmp_path: Path) -> None:
-    """Ruling 2 of the leak audit. If a row ran longer than declared, the allowance is false, and it says
-    so."""
-    from dataclasses import replace
-
+def test_a_row_longer_than_the_allowance_fails_its_boundary_and_records_the_allowance_false(
+    tmp_path: Path,
+) -> None:
+    """Ruling 2 and DR-06. Window and allowance are one constant, so this detector can fire, and raising the
+    window to pass a day also moves every knowable time. It used to need a second, wider key, which shipped
+    set apart."""
     rows, candles = _truth(D2)
     stamp = rows[100][0]
-    # Stamped 300 ms before its minute ends, and counted in the next one. The rule's window allows that here,
-    # and the source's declared allowance of 250 ms does not.
+    # Stamped 300 ms before its minute ends, and counted in the next one. The declared allowance is 250 ms.
     rows[100] = (stamp + 29_700, rows[100][1], rows[100][2], rows[100][3])
     candles[100] = (candles[100][0], 100.0, 100.0, 100.0, 100.0, 0.0, 0.0)
     candles[101] = (candles[101][0], 100.0, 100.0, 100.0, 100.0, 2.0, 2.0)
@@ -1325,18 +1339,56 @@ def test_a_window_needed_beyond_the_allowance_warns(tmp_path: Path) -> None:
         trades_csv=agg_trades_csv(rows, first_id=day_first_id(D2)),
         candles_csv=klines_csv(candles),
     )
-    config = small_config(D1)
-    wider = replace(config.reconcile[BTC], boundary_window_ms=500.0)
-    setup = replace(config, reconcile={**config.reconcile, BTC: wider})
-    ctx = make_context(tmp_path / "r", now=at(D4), config=setup, policy=policy_with_raw_reviewed())
+    ctx = context(tmp_path / "r", at(D4), D1)
     run_ingest(ctx, fetcher, options())
-    assert bars_state(ctx)["2026-03-02"] == "done"
     record = ctx.catalog.get_file(ctx.relative(ctx.root.curated_part("bars_1m", "generated", BTC, D2)))
     assert record is not None
-    assert record.check_status == "warn"
+    assert record.check_status == "fail"
     assert record.check_detail is not None
     assert any("allowance is false" in reason for reason in record.check_detail["reasons"])
-    assert not read_parquet(ctx.root.curated_part("bars_1m", "generated", BTC, D2))["gap"].any()
+    # DR-05. Only the boundary it could not explain is flagged, and the next minute stands.
+    bars = read_parquet(ctx.root.curated_part("bars_1m", "generated", BTC, D2))
+    assert bars.filter(pl.col("gap")).height == 1
+    assert [event["date"] for event in ctx.catalog.allowance_events()] == [D2.isoformat()]
+    logged = ctx.root.guard.check("catalog/allowance_events.jsonl").read_text(encoding="utf-8")
+    assert '"needed_ms":300.0' in logged.replace(" ", "")
+
+
+def test_a_row_just_before_midnight_settles_into_the_next_days_first_bar(tmp_path: Path) -> None:
+    """Through derive_day. Tested only in build_bars_1m, a mutant that lost it at each midnight passed the
+    suite."""
+    midnight_ms = day_start_us(D2) // 1000
+    trades_one = [
+        (day_start_us(D1) // 1000 + minute * 60_000 + 30_000, 100.0, 1.0, True) for minute in range(1440)
+    ]
+    # Stamped 100 ms before midnight, inside the allowance of 250 ms, so it was not sure to have printed by
+    # then.
+    trades_one.append((midnight_ms - 100, 100.0, 5.0, False))
+    candles_one = [
+        (day_start_us(D1) // 1000 + minute * 60_000, 100.0, 100.0, 100.0, 100.0, 1.0, 1.0)
+        for minute in range(1439)
+    ]
+    candles_one.append((midnight_ms - 60_000, 100.0, 100.0, 100.0, 100.0, 6.0, 1.0))
+    fetcher = FakeFetcher()
+    publish_generated_day(
+        fetcher,
+        BTC,
+        D1,
+        trades_csv=agg_trades_csv(trades_one, first_id=day_first_id(D1) - 1),
+        candles_csv=klines_csv(candles_one),
+    )
+    publish_generated_day(fetcher, BTC, D2)
+    publish_generated_day(fetcher, BTC, D3)
+    ctx = context(tmp_path / "r", at(D4))
+    run_ingest(ctx, fetcher, options())
+    day_one = read_parquet(ctx.root.curated_part("bars_1m", "generated", BTC, D1))
+    day_two = read_parquet(ctx.root.curated_part("bars_1m", "generated", BTC, D2))
+    assert day_one.row(-1, named=True)["volume"] == 6.0
+    assert day_one.row(-1, named=True)["settled_volume"] == 1.0
+    first = day_two.row(0, named=True)
+    assert first["volume"] == 1.0
+    assert first["settled_volume"] == 6.0
+    assert first["settled_sell_volume"] == 5.0
 
 
 def test_a_replaced_file_rebuilds_its_day_and_its_neighbours(tmp_path: Path) -> None:
@@ -1419,3 +1471,182 @@ def test_a_rebuild_marks_its_task_pending_before_its_first_write(
     with pytest.raises(_Crash):
         derive_day(ctx, "generated", BTC, D1)
     assert bars_state(ctx)["2026-03-01"] == "pending"
+
+
+# ---- N-04, N-18, and the steward's list
+# ---------------------------------------------------------------------------
+
+
+def test_a_stray_file_name_cannot_stop_a_run(tmp_path: Path) -> None:
+    """N-04. A name that was not a date killed the run, and left its row `running` for ever."""
+    fetcher = FakeFetcher()
+    publish_generated_day(fetcher, BTC, D1)
+    ctx = context(tmp_path / "r", at(D2))
+    folder = ctx.root.curated_part("trades", "generated", BTC, D1).parent
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "part-notadate.parquet").write_bytes(b"not a parquet file")
+    summary = run_ingest(ctx, fetcher, options())
+    assert summary.errors == []
+    assert any("not a day" in alert for alert in summary.alerts)
+    assert ctx.catalog.last_runs()["ingest"][0]["finished_at"] is not None
+    assert states(ctx)["2026-03-01"] == "done"
+
+
+def test_whatever_escapes_the_tasks_finishes_the_run_row_as_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N-04. The fixes file said the run row always finishes, and this refuted it."""
+
+    def dies(*_: object, **__: object) -> None:
+        raise RuntimeError("beyond any task")
+
+    monkeypatch.setattr("hft_crypto.data.ingest._run_tasks", dies)
+    ctx = context(tmp_path / "r", at(D2))
+    with pytest.raises(RuntimeError, match="beyond any task"):
+        run_ingest(ctx, FakeFetcher(), options())
+    row = ctx.catalog.last_runs()["ingest"][0]
+    assert row["status"] == "failed"
+    assert row["finished_at"] is not None
+
+
+def test_failing_newest_files_do_not_use_up_the_budget_of_every_run(tmp_path: Path) -> None:
+    """N-18. Work is newest first, so a file that keeps failing used to take the budget ahead of older
+    days."""
+    fetcher = FakeFetcher()
+    for day in (D1, D2, D3):
+        publish_generated_day(fetcher, BTC, day)
+    url = f"{GENERATED}/daily/aggTrades/{BTC}/{BTC}-aggTrades-2026-03-03.zip"
+    fetcher.failures[url] = FetchError("still broken")
+    ctx = context(tmp_path / "r", at(D4))
+    only_trades = {"dataset_ids": ("generated.aggTrades",)}
+    run_ingest(ctx, fetcher, options(time_budget_s=1.0, **only_trades), clock=_ticks_after(1))
+    assert states(ctx)["2026-03-03"] == "failed"
+    # On the next run the failed file waits, and the older days go first.
+    later = context(tmp_path / "r", at(D4, 23))
+    task_row = later.catalog.get_task(f"archive:generated.aggTrades:{BTC}:2026-03-03")
+    assert task_row is not None
+    run_ingest(later, fetcher, options(time_budget_s=1.0, **only_trades), clock=_ticks_after(1))
+    assert states(later)["2026-03-02"] == "done"
+
+
+def _ticks_after(allowed: int) -> Any:
+    """A clock that lets this many tasks start, and then is past any budget."""
+    calls = {"count": 0}
+
+    def clock() -> float:
+        calls["count"] += 1
+        return 0.0 if calls["count"] <= allowed + 1 else 1000.0
+
+    return clock
+
+
+def test_runs_that_keep_running_out_of_time_say_so(tmp_path: Path) -> None:
+    """N-18. One long day is fine, and three in a row is a pattern someone must see."""
+    fetcher = FakeFetcher()
+    for day in (D1, D2, D3):
+        publish_generated_day(fetcher, BTC, day)
+    alerts: list[str] = []
+    for run in range(3):
+        ctx = context(tmp_path / "r", at(D4, 10 + run))
+        for state_day in ("2026-03-01", "2026-03-02", "2026-03-03"):
+            ctx.catalog.set_task(
+                f"archive:generated.aggTrades:{BTC}:{state_day}",
+                dataset_id="generated.aggTrades",
+                symbol=BTC,
+                partition_key=state_day,
+                state="pending",
+                now=ctx.now_iso(),
+            )
+        summary = run_ingest(
+            ctx,
+            fetcher,
+            options(time_budget_s=0.0, dataset_ids=("generated.aggTrades",)),
+            clock=lambda: 1000.0,
+        )
+        alerts = summary.alerts
+    assert any("ran out of time" in alert for alert in alerts)
+
+
+def test_watermarks_are_measured_on_what_the_cache_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3.1. A large raw file leaves with the runner and spends no cache, so it cannot stop a backfill."""
+    fetcher = FakeFetcher()
+    publish_generated_day(fetcher, BTC, D1)
+    monkeypatch.setenv("DATA_QUOTA_GB", "1")
+    monkeypatch.setattr(
+        "hft_crypto.data.ingest.measure_zones",
+        lambda _root: {"raw": 50_000_000_000, "quarantine": 50_000_000_000, "curated": 1000},
+    )
+    ctx = context(tmp_path / "r", at(dt.date(2026, 3, 20)))
+    summary = run_ingest(ctx, fetcher, options(dataset_ids=("generated.aggTrades",)))
+    assert summary.held_by_watermark == 0
+    assert states(ctx)["2026-03-01"] == "done"
+
+
+def test_a_runner_short_of_disk_holds_downloads_and_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3.2. R3.1 removed the only check on raw files during a job, so this takes its place."""
+    fetcher = FakeFetcher()
+    publish_generated_day(fetcher, BTC, D1)
+    monkeypatch.setattr("hft_crypto.data.ingest.free_disk_bytes", lambda _ctx: 1)
+    ctx = context(tmp_path / "r", at(D2))
+    summary = run_ingest(ctx, fetcher, options(dataset_ids=("generated.aggTrades",)))
+    assert summary.held_by_disk == 1
+    assert fetcher.requests == []
+    assert any("free space" in alert for alert in summary.alerts)
+
+
+def test_each_quarantined_file_leaves_a_record_with_no_row_in_it(tmp_path: Path) -> None:
+    """R4.1. The file leaves with the runner, so the record is what data-steward reviews. It gets
+    published."""
+    fetcher = FakeFetcher()
+    secret_price = "98765.4321"
+    bad = (
+        "agg_trade_id,price,quantity,first_trade_id,last_trade_id,transact_time,is_buyer_maker\n"
+        f"1,{secret_price},not_a_number,1,1,1,false\n"
+    )
+    publish_generated_day(fetcher, BTC, D1, trades_csv=bad)
+    ctx = context(tmp_path / "r", at(D2))
+    run_ingest(ctx, fetcher, options(dataset_ids=("generated.aggTrades",)))
+    text = ctx.root.guard.check("catalog/quarantine.jsonl").read_text(encoding="utf-8")
+    record = json.loads(text.splitlines()[0])
+    assert set(record) == {
+        "time",
+        "dataset",
+        "symbol",
+        "partition",
+        "source_url",
+        "path",
+        "size",
+        "sha256",
+        "reason",
+        "code_version",
+        "run_id",
+        "data_kind",
+    }
+    assert record["dataset"] == "generated.aggTrades"
+    assert record["partition"] == "2026-03-01"
+    assert record["data_kind"] == "MARKET"
+    assert record["path"].startswith("quarantine/")
+    assert secret_price not in text
+    assert str(tmp_path) not in text
+    assert str(tmp_path).replace("\\", "\\\\") not in text
+
+
+def test_a_warned_day_keeps_its_raw_file_while_it_is_provisional(tmp_path: Path) -> None:
+    """R6.2. `provisional` outranks `warn`, so a day with a known warning used to lose its raw file."""
+    fetcher = FakeFetcher()
+    lines = make_day_files(D1)[1].splitlines()
+    counted = [lines[0]]
+    for line in lines[1:]:
+        fields = line.split(",")
+        fields[8] = "5"
+        counted.append(",".join(fields))
+    publish_generated_day(fetcher, BTC, D1, candles_csv="\n".join(counted) + "\n")
+    ctx = context(tmp_path / "r", at(D2))
+    run_ingest(ctx, fetcher, options(delete_raw=True))
+    assert bars_state(ctx)["2026-03-01"] == "provisional"
+    left = [p.name for p in ctx.root.guard.check("raw/archive").rglob("*") if p.is_file()]
+    assert f"{BTC}-aggTrades-2026-03-01.zip" in left

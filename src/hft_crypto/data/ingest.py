@@ -9,6 +9,8 @@ downloaded again by a later run.
 from __future__ import annotations
 
 import datetime as dt
+import json
+import re
 import shutil
 import time
 from collections.abc import Callable
@@ -18,8 +20,10 @@ from typing import Any
 
 import polars as pl
 
+from hft_crypto.bars.core import DateGuardError
 from hft_crypto.config import NO_APPROVED_SOURCE, ConfigError, DatasetSpec, quota_bytes
 from hft_crypto.data.atomic import (
+    append_jsonl,
     atomic_write_json,
     atomic_write_parquet,
     sha256_file,
@@ -35,6 +39,7 @@ from hft_crypto.data.derive import (
     STATE_PENDING,
     STATE_PROVISIONAL,
     TRADES,
+    base_dataset,
     derive_dataset_id,
     derive_day,
     derive_task_key,
@@ -59,14 +64,20 @@ from hft_crypto.data.sources import (
     ArchiveFile,
     archive_candidates,
     expected_partitions,
+    partition_last_day,
 )
-from hft_crypto.data.zones import ZONE_DIRS, measure_zones
-from hft_crypto.timeutil import MICROS_PER_SECOND, iso, iso_us, month_key, next_month, to_us
+from hft_crypto.data.zones import ZONE_DIRS, measure_zones, part_period, persisted_bytes
+from hft_crypto.timeutil import MICROS_PER_SECOND, date_range, iso, iso_us, month_key, next_month, to_us
 from hft_crypto.versioning import code_version
 
 STATE_OVERDUE = "overdue"
 RAW_RULE = "raw-archive-after-curated"
+QUARANTINE_LOG = "catalog/quarantine.jsonl"
 _SIDECAR_LIMIT = 4096
+# Runs in a row that left work unstarted for lack of time, before that is worth telling someone.
+UNSTARTED_ALERT_RUNS = 3
+_LONG_NUMBER = re.compile(r"\d[\d.,:_-]*")
+_PATH_LIKE = re.compile(r"[A-Za-z]:[\\/]\S*|(?<![\w.])/\S+")
 
 
 @dataclass(frozen=True)
@@ -118,6 +129,7 @@ class IngestSummary:
     failed: int = 0
     skipped_retry_wait: int = 0
     held_by_watermark: int = 0
+    held_by_disk: int = 0
     book_days_left: int = 0
     not_started_time_budget: int = 0
     bars_built: int = 0
@@ -230,7 +242,8 @@ def plan_tasks(ctx: JobContext, options: IngestOptions) -> list[Task]:
         symbols = options.symbols if options.symbols is not None else ctx.config.symbols
         for symbol in symbols:
             states = ctx.catalog.task_states(spec.id, symbol)
-            for partition in expected_partitions(spec, now, options.start, options.end):
+            ceiling = ctx.config.last_opened_date
+            for partition in expected_partitions(spec, now, options.start, options.end, ceiling=ceiling):
                 task = Task(spec, symbol, partition)
                 if states.get(task.partition_key) != STATE_DONE:
                     tasks.append(task)
@@ -260,10 +273,39 @@ def _set_failed(ctx: JobContext, task: Task, message: str) -> None:
     )
 
 
-def _quarantine_file(ctx: JobContext, path: Path, rel_name: str) -> None:
+def publishable_reason(text: str) -> str:
+    """A reason that can go on a public branch: no numbers, which could be row values, and no paths."""
+    without_paths = _PATH_LIKE.sub("<path>", text)
+    return _LONG_NUMBER.sub("#", without_paths)[:300]
+
+
+def _quarantine_file(
+    ctx: JobContext, path: Path, rel_name: str, *, task: Task, reason: str, source_url: str | None
+) -> None:
+    """Move a bad file aside and record it. The file leaves with the runner, so the record is what stays."""
+    size = path.stat().st_size
+    digest = sha256_file(path)
     target = ctx.root.quarantine_path(rel_name, ctx.now().strftime("%Y%m%dT%H%M%SZ"))
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(path), str(target))
+    append_jsonl(
+        ctx.root.guard.check(QUARANTINE_LOG),
+        {
+            "time": ctx.now_iso(),
+            "dataset": task.spec.id,
+            "symbol": task.symbol,
+            "partition": task.partition_key,
+            "source_url": source_url,
+            "path": ctx.relative(target),
+            "size": size,
+            "sha256": digest,
+            "reason": publishable_reason(reason),
+            "code_version": code_version(),
+            "run_id": ctx.run_id,
+            "data_kind": "SYNTHETIC" if ctx.root.is_synthetic else "MARKET",
+        },
+        guard=ctx.root.guard,
+    )
 
 
 def _fetch_raw(
@@ -272,7 +314,11 @@ def _fetch_raw(
     """Download into a temporary name, verify any checksum, then rename into the raw zone.
 
     refetch ignores a copy already on disk, because a retry after a failed check is looking for a better file.
+    No partition past the last opened date is fetched into a root that a report could open, however it was
+    asked for.
     """
+    if partition_last_day(task.spec, task.partition) > ctx.config.last_opened_date:
+        raise DateGuardError(f"{task.partition} is after the last opened date, so it is not fetched here")
     limits = ctx.config.fetch
     last_missing: NotPublishedError | None = None
     for candidate in archive_candidates(ctx.config, task.spec, task.symbol, task.partition):
@@ -313,8 +359,15 @@ def _fetch_raw(
                     )
                     if digest != expected:
                         raise ValidationError("SHA-256 does not match the checksum sidecar")
-                except ValidationError:
-                    _quarantine_file(ctx, temporary, ctx.relative(final))
+                except ValidationError as exc:
+                    _quarantine_file(
+                        ctx,
+                        temporary,
+                        ctx.relative(final),
+                        task=task,
+                        reason=f"checksum: {exc}",
+                        source_url=candidate.url,
+                    )
                     raise
                 checks["checksum_source"] = "sidecar"
         temporary.replace(final)
@@ -326,7 +379,8 @@ def _parse(ctx: JobContext, task: Task, raw: Path) -> CuratedResult:
     limit = ctx.config.fetch.max_uncompressed_bytes
     kind = task.spec.kind
     venue = task.spec.venue
-    allowance_us = ctx.config.source(venue).fill_span_allowance_us
+    source = ctx.config.source(venue)
+    allowance_us = source.fill_span_allowance_us
     if kind == "aggTrades":
         return parse_agg_trades(
             raw, task.symbol, task.partition, limit, venue=venue, allowance_us=allowance_us
@@ -336,7 +390,16 @@ def _parse(ctx: JobContext, task: Task, raw: Path) -> CuratedResult:
             raw, task.symbol, task.partition, limit, venue=venue, allowance_us=allowance_us
         )
     if kind == "klines":
-        return parse_klines(raw, task.symbol, task.partition, limit, venue=venue, allowance_us=allowance_us)
+        # On bars from candles the candle's own allowance applies. Elsewhere they are only a check on trades.
+        return parse_klines(
+            raw,
+            task.symbol,
+            task.partition,
+            limit,
+            venue=venue,
+            allowance_us=source.bar_allowance_us,
+            last_day=partition_last_day(task.spec, task.partition),
+        )
     if kind == "bookDepth":
         return parse_book_depth(
             raw, task.symbol, task.partition, limit, ctx.config.book_depth_allowance_s, venue=venue
@@ -352,15 +415,6 @@ def _refuse_future_stamps(ctx: JobContext, result: CuratedResult) -> None:
     limit = to_us(ctx.now()) + round(ctx.config.max_future_skew_s * MICROS_PER_SECOND)
     if newest is not None and int(newest) > limit:
         raise ValidationError(f"a row is stamped {iso_us(int(newest))}, ahead of the clock")
-
-
-def _quality_warnings(ctx: JobContext, task: Task, result: CuratedResult) -> list[str]:
-    warnings = list(result.warnings)
-    largest = result.checks.get("largest_time_gap_s")
-    quiet = task.spec.max_quiet_s
-    if quiet is not None and largest is not None and float(largest) > quiet:
-        warnings.append(f"a silence of {largest} s, above the declared {quiet:g} s")
-    return warnings
 
 
 def _book_result(raw: Path, task: Task) -> CuratedResult:
@@ -433,13 +487,14 @@ def run_archive_task(ctx: JobContext, fetcher: Fetcher, task: Task, summary: Ing
         result = _book_result(raw, task) if spec.kind == "orderbook" else _parse(ctx, task, raw)
         _refuse_future_stamps(ctx, result)
     except ValidationError as exc:
-        _quarantine_file(ctx, raw, raw_rel)
+        _quarantine_file(ctx, raw, raw_rel, task=task, reason=f"validation: {exc}", source_url=source.url)
         ctx.catalog.set_file_status(raw_rel, "quarantined", now_iso)
         _set_failed(ctx, task, f"validation: {exc}")
         summary.errors.append(f"{task.key}: {exc}")
         return STATE_FAILED
 
-    warnings = _quality_warnings(ctx, task, result)
+    # A long silence is not here. It is a state of the market, so it never sets a status (DR-13).
+    warnings = list(result.warnings)
     target = curated_path(ctx, spec, task.symbol, task.partition)
     atomic_write_parquet(target, result.frame, guard=ctx.root.guard)
     ctx.register_output(
@@ -470,7 +525,15 @@ def run_archive_task(ctx: JobContext, fetcher: Fetcher, task: Task, summary: Ing
     )
     # What this file feeds has to be built again, whatever state it was left in. A replaced file also changes
     # what its neighbours can conclude about the midnight between them.
-    if spec.curated in (TRADES, OFFICIAL):
+    if spec.curated == base_dataset(ctx.config.source(spec.venue)):
+        # A candle file decides only its own days. A trade file also reaches over both midnights.
+        if spec.curated == OFFICIAL:
+            for day in date_range(task.partition, partition_last_day(spec, task.partition)):
+                reopen_day(ctx, spec.venue, task.symbol, day)
+        else:
+            for offset in (-1, 0, 1):
+                reopen_day(ctx, spec.venue, task.symbol, task.partition + dt.timedelta(days=offset))
+    elif spec.curated == OFFICIAL:
         for offset in (-1, 0, 1):
             reopen_day(ctx, spec.venue, task.symbol, task.partition + dt.timedelta(days=offset))
     return STATE_DONE
@@ -555,12 +618,44 @@ def _bar_targets(ctx: JobContext, options: IngestOptions) -> list[tuple[str, str
     pairs: list[tuple[str, str]] = []
     symbols = options.symbols if options.symbols is not None else ctx.config.symbols
     for spec in ctx.config.datasets:
-        if spec.curated != TRADES or not ctx.config.dataset_enabled(spec):
+        if not ctx.config.dataset_enabled(spec):
+            continue
+        if spec.curated != base_dataset(ctx.config.source(spec.venue)):
             continue
         if options.dataset_ids is not None and spec.id not in options.dataset_ids:
             continue
         pairs.extend((spec.venue, symbol) for symbol in symbols)
     return pairs
+
+
+def _stored_days(
+    ctx: JobContext, options: IngestOptions, summary: IngestSummary
+) -> list[tuple[str, str, dt.date]]:
+    """Each day with a base file. A name that is not a date is a stray no job wrote, and it must not stop a
+    run."""
+    days: list[tuple[str, str, dt.date]] = []
+    for venue, symbol in _bar_targets(ctx, options):
+        source = ctx.config.source(venue)
+        base = base_dataset(source)
+        for part in ctx.root.curated_parts(base, venue, symbol):
+            period = part_period(part)
+            if period is not None and source.official_bars and period[0] != period[1]:
+                # A month of candles decides each of its days.
+                last = min(period[1], ctx.config.last_opened_date)
+                days.extend((venue, symbol, day) for day in date_range(period[0], last))
+                continue
+            if period is None or period[0] != period[1]:
+                alert = f"A file with a name that is not a day was skipped: {ctx.relative(part)}"
+                if alert not in summary.alerts:
+                    summary.alerts.append(alert)
+                continue
+            if period[0] > ctx.config.last_opened_date:
+                alert = f"A file past the last opened date was left unread: {ctx.relative(part)}"
+                if alert not in summary.alerts:
+                    summary.alerts.append(alert)
+                continue
+            days.append((venue, symbol, period[0]))
+    return days
 
 
 def _sweep_open_bars(
@@ -578,11 +673,7 @@ def _sweep_open_bars(
     bounds it too.
     """
     for _ in range(4):
-        days = [
-            (venue, symbol, dt.date.fromisoformat(part.stem.removeprefix("part-")))
-            for venue, symbol in _bar_targets(ctx, options)
-            for part in ctx.root.curated_parts(TRADES, venue, symbol)
-        ]
+        days = _stored_days(ctx, options, summary)
         open_days = [item for item in days if needs_derive(ctx, *item)]
         if not open_days:
             return
@@ -617,6 +708,7 @@ def _persisted(summary: IngestSummary) -> dict[str, Any]:
 def _contain_task_failure(ctx: JobContext, task: Task, exc: Exception, summary: IngestSummary) -> None:
     """Record whatever escaped, keep the evidence out of the way, and let the run go on."""
     message = f"{type(exc).__name__}: {exc}"
+    reason = message
     prefix = (
         f"raw/archive/{task.spec.venue}/{task.spec.kind}/{task.symbol}/date={task.partition.isoformat()}/"
     )
@@ -624,7 +716,9 @@ def _contain_task_failure(ctx: JobContext, task: Task, exc: Exception, summary: 
         try:
             path = ctx.root.guard.check(record.rel_path)
             if path.is_file():
-                _quarantine_file(ctx, path, record.rel_path)
+                _quarantine_file(
+                    ctx, path, record.rel_path, task=task, reason=reason, source_url=record.source_url
+                )
             ctx.catalog.set_file_status(record.rel_path, "quarantined", ctx.now_iso())
         except (PathGuardError, OSError) as quarantine_error:
             message += f"; could not quarantine: {quarantine_error}"
@@ -635,49 +729,60 @@ def _contain_task_failure(ctx: JobContext, task: Task, exc: Exception, summary: 
 def _finish_status(summary: IngestSummary) -> str:
     if summary.nothing_selected:
         return "nothing_selected"
-    if summary.not_started_time_budget or summary.held_by_watermark or summary.bars_left_by_budget:
+    if (
+        summary.not_started_time_budget
+        or summary.held_by_watermark
+        or summary.held_by_disk
+        or summary.bars_left_by_budget
+    ):
         return "partial"
     if summary.failed or summary.bars_failed:
         return "partial"
     return "ok"
 
 
-def run_ingest(
+def free_disk_bytes(ctx: JobContext) -> int:
+    """Free space where raw files land. They leave with the runner, so they spend no cache budget, but they
+    can fill it."""
+    return shutil.disk_usage(ctx.root.path).free
+
+
+def _budget_order(ctx: JobContext, tasks: list[Task]) -> list[Task]:
+    """Tasks never tried take the budget first, and retries get what is left.
+
+    Work is newest first, so if failing newest files could use the whole budget again on every run, older days
+    would never be reached.
+    """
+    fresh: list[Task] = []
+    retries: list[Task] = []
+    for task in tasks:
+        row = ctx.catalog.get_task(task.key)
+        (retries if row is not None and row.state == STATE_FAILED else fresh).append(task)
+    return [*fresh, *retries]
+
+
+def _note_unstarted(ctx: JobContext, summary: IngestSummary) -> None:
+    """Count runs in a row that left work unstarted, and say so once it is a pattern and not one long day."""
+    previous = int(ctx.catalog.get_meta("unstarted_runs") or 0)
+    streak = previous + 1 if summary.not_started_time_budget else 0
+    ctx.catalog.set_meta("unstarted_runs", str(streak))
+    if streak >= UNSTARTED_ALERT_RUNS:
+        summary.alerts.append(
+            f"{streak} runs in a row ran out of time, with {summary.not_started_time_budget} partitions "
+            "left unstarted this time."
+        )
+
+
+def _run_tasks(
     ctx: JobContext,
     fetcher: Fetcher,
     options: IngestOptions,
+    summary: IngestSummary,
     *,
-    clock: Callable[[], float] = time.monotonic,
-) -> IngestSummary:
-    """Run catch-up until the work is done or the time budget ends. Stopping early is never a failure."""
-    check_requested_sources(ctx, options)
-    summary = IngestSummary(run_id=ctx.run_id)
-    started = clock()
-    deadline = None if options.time_budget_s is None else started + options.time_budget_s
-    ctx.catalog.start_run(
-        ctx.run_id,
-        "ingest",
-        now=ctx.now_iso(),
-        code_version=code_version(),
-        config_hash=ctx.config.config_hash,
-    )
-    zones = tuple(zone for zone in ZONE_DIRS if zone not in ("ledger", "decisions"))
-    summary.temp_files_swept = len(sweep_temp_files(ctx.root.guard, zones))
-    summary.catalog_marked_absent, summary.catalog_rebuild_needed = sync_catalog_with_disk(ctx)
-
-    if not ctx.config.enabled_sources():
-        # Not a failure and not a reason to try anything else. The report says so plainly.
-        summary.source_state = NO_APPROVED_SOURCE
-        summary.status = "no_approved_source"
-        write_heartbeat(
-            ctx.root, "ingest", now=ctx.now(), detail={"status": summary.status, "run_id": ctx.run_id}
-        )
-        ctx.catalog.finish_run(
-            ctx.run_id, now=ctx.now_iso(), status=summary.status, summary=_persisted(summary)
-        )
-        return summary
-
-    tasks = plan_tasks(ctx, options)
+    deadline: float | None,
+    clock: Callable[[], float],
+) -> None:
+    tasks = _budget_order(ctx, plan_tasks(ctx, options))
     summary.planned = len(tasks)
     # An approved source with nothing selected must not look like a healthy run that fetched nothing.
     if options.dataset_ids is not None:
@@ -707,11 +812,19 @@ def run_ingest(
         ):
             summary.skipped_retry_wait += 1
             continue
-        used = sum(measure_zones(ctx.root).values())
+        # Against the cache budget, because raw and quarantine leave with the runner and spend none of it.
+        used = persisted_bytes(measure_zones(ctx.root), ctx.config.persisted_zones)
         storage = evaluate_watermarks(used, quota, ctx.policy.watermarks)
         # A backfill stops first. At the critical level only essential work runs, and ingest is not essential.
         if storage.level == LEVEL_CRITICAL or (storage.stop_backfill and task.partition < routine_since):
             summary.held_by_watermark += 1
+            continue
+        # Watermarks no longer see raw files, so this is what stops one from filling the runner's disk.
+        if free_disk_bytes(ctx) < ctx.config.fetch.max_download_bytes:
+            summary.held_by_disk += 1
+            alert = "The runner's disk has less free space than one file may take, so downloads are held."
+            if alert not in summary.alerts:
+                summary.alerts.append(alert)
             continue
         try:
             state = run_archive_task(ctx, fetcher, task, summary)
@@ -748,10 +861,59 @@ def run_ingest(
             summary.alerts.append(f"{task.key} is overdue")
         else:
             summary.failed += 1
-
+    _note_unstarted(ctx, summary)
     _sweep_open_bars(ctx, options, summary, deadline=deadline, clock=clock)
     if options.delete_raw:
         _delete_settled_raw(ctx, summary)
+
+
+def run_ingest(
+    ctx: JobContext,
+    fetcher: Fetcher,
+    options: IngestOptions,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+) -> IngestSummary:
+    """Run catch-up until the work is done or the time budget ends. Stopping early is never a failure.
+
+    The run row always finishes. Whatever escapes the containment around tasks ends the run with status
+    `failed` and goes on up, so that the job says so too.
+    """
+    ctx.root.refuse_unopened("ingest")
+    check_requested_sources(ctx, options)
+    summary = IngestSummary(run_id=ctx.run_id)
+    started = clock()
+    deadline = None if options.time_budget_s is None else started + options.time_budget_s
+    ctx.catalog.start_run(
+        ctx.run_id,
+        "ingest",
+        now=ctx.now_iso(),
+        code_version=code_version(),
+        config_hash=ctx.config.config_hash,
+    )
+    try:
+        zones = tuple(zone for zone in ZONE_DIRS if zone not in ("ledger", "decisions"))
+        summary.temp_files_swept = len(sweep_temp_files(ctx.root.guard, zones))
+        summary.catalog_marked_absent, summary.catalog_rebuild_needed = sync_catalog_with_disk(ctx)
+
+        if not ctx.config.enabled_sources():
+            # Not a failure and not a reason to try anything else. The report says so plainly.
+            summary.source_state = NO_APPROVED_SOURCE
+            summary.status = "no_approved_source"
+            write_heartbeat(
+                ctx.root, "ingest", now=ctx.now(), detail={"status": summary.status, "run_id": ctx.run_id}
+            )
+            ctx.catalog.finish_run(
+                ctx.run_id, now=ctx.now_iso(), status=summary.status, summary=_persisted(summary)
+            )
+            return summary
+
+        _run_tasks(ctx, fetcher, options, summary, deadline=deadline, clock=clock)
+    except Exception as exc:
+        summary.status = "failed"
+        summary.errors.append(f"{type(exc).__name__}: {exc}")
+        ctx.catalog.finish_run(ctx.run_id, now=ctx.now_iso(), status="failed", summary=_persisted(summary))
+        raise
     summary.seconds = round(clock() - started, 3)
     summary.status = _finish_status(summary)
     summary.source_state = ctx.config.source_state()
@@ -765,4 +927,8 @@ def run_ingest(
     atomic_write_json(
         ctx.root.guard.check("catalog/last_ingest.json"), _persisted(summary), guard=ctx.root.guard
     )
+    # Health reads these, which is how they reach the page and the watchdog. Each overdue file already counts
+    # there.
+    carried = [alert for alert in summary.alerts if not alert.endswith("is overdue")]
+    ctx.catalog.set_meta("last_ingest_alerts", json.dumps(carried, sort_keys=True))
     return summary

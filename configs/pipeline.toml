@@ -19,7 +19,7 @@ default_quota_gb = 4.0
 # What survives between runs through the Actions cache. raw and quarantine stay on the runner.
 persisted_zones = ["curated", "features", "catalog"]
 
-# Nothing is downloaded from a source unless it is enabled here, and every source starts disabled. With none
+# Nothing is downloaded from a source unless it is enabled here, and every source ships disabled. With none
 # enabled, the network client refuses every host, and each job reports "no approved source configured".
 # A source is enabled only once it has been named as approved. See docs/03_DATA_SOURCES.md.
 #
@@ -28,21 +28,44 @@ persisted_zones = ["curated", "features", "catalog"]
 #                           batched. Only exact and aggregate_one_price may be read in IDEAL mode.
 #   fill_span_allowance_ms  How long after its stamp a row's fills can run, plus the stamp's resolution. A row is
 #                           knowable at its stamp plus this. UNVERIFIED everywhere until measured on the source,
-#                           including stressed days. It also bounds the midnight window of the reconciliation rule.
-#   allowance_state         placeholder or measured. Health raises an alert for an enabled source on a placeholder.
+#                           including stressed days. It is also the midnight and minute window of the reconciliation
+#                           rule: one constant, so raising the window to pass a day also moves every knowable time.
+#                           Under 60000.
+#   allowance_state         placeholder or measured. measured also needs allowance_evidence: dates, the stressed days
+#                           among them, and who signed. Health raises an alert for an enabled source on a placeholder.
 #   continuity              trade_id if rows carry an id with no skips, which can prove an empty minute. none if
 #                           not, which makes every empty minute a gap, as convention C2 says.
+#   bar_source              trades, as decision D-12 says, or official_1m for a tier T0 path with no trades.
+#   candle_allowance_ms     Required on official_1m, with no default. How long after its close a candle is final. project-manager
+#                           declares it. A source on the word UNDECLARED cannot be enabled, and A must cover it.
+#   candle_allowance_state  Required on official_1m. declared or measured.
+#   candle_check            Required on official_1m. not_shown, or shown once `candle-check` shows a candle holds no print
+#                           from after its close on the declared sample days (leak recheck, section 15). shown also needs
+#                           candle_check_evidence. IDEAL rests on it, and nothing else stops if it is not shown.
+#   attribution             Printed on everything published from this source's data, where its terms ask for it.
 [sources.binance]
-# Adapter kept and tested on generated files only. Decision D-17 rules this source out for research and results.
-# The host and the name are also barred in code, so changing these flags cannot reach it.
+# Decision D-29, which replaces D-17: USD-M perpetual history, for personal, non-monetized research. The code opens only
+# data.binance.vision under /data/futures/um, for this source. Every other Binance host stays barred, and so do spot,
+# coin-margined and option paths. Its terms bar live proprietary execution, automated commercial orders and signals
+# for compensation, so no live path may read from it, and going commercial later means redoing the research.
+# All timing values here are UNVERIFIED placeholders until measured on files fetched for research, and they describe
+# aggregate rows, which the candle path does not read. Bars come from official candles under D-31 and ruling 7 of the
+# leak recheck, which D-12 does not describe, so they say so, and their reconciliation reports not_available. Reads and
+# fetches stop at the last opened date of the fold plan, which is held in code.
 enabled = false
-prohibited = true
+prohibited = false
 archive_base = "https://data.binance.vision/data/futures/um"
 stamp_kind = "aggregate_one_price"
 fill_span_allowance_ms = 250.0
 allowance_state = "placeholder"
 continuity = "trade_id"
-terms_note = "Binance Vision Dataset Terms (2026-08-26): CC BY-NC-SA 4.0, non-commercial. Not used, by decision D-17."
+bar_source = "official_1m"
+# D-33: 10 s, equal to A, in state declared. Not measured, because an archive gives no receipt time.
+candle_allowance_ms = 10000
+candle_allowance_state = "declared"
+candle_check = "not_shown"
+attribution = "Derived from Binance Vision data, CC BY-NC-SA 4.0. Not associated with or endorsed by Binance."
+terms_note = "Binance Vision Dataset Terms (2026-08-26): CC BY-NC-SA 4.0, non-commercial. Research history under decision D-29."
 
 [sources.bybit]
 enabled = false
@@ -56,17 +79,21 @@ fill_span_allowance_ms = 250.0
 allowance_state = "placeholder"
 # Rows carry a random match id, so nothing in a file can prove that no row is missing.
 continuity = "none"
+bar_source = "trades"
 terms_note = "Terms under review in docs/03_DATA_SOURCES.md. Not approved, so not downloaded."
 
 [sources.kraken]
+# Decision D-23: not a source for this project. The hourly poll's client speaks only to Kraken, so the poll stays named
+# here and contacts nothing, and the live path has no source until one is approved.
 enabled = false
-prohibited = false
+prohibited = true
 trades_url = "https://api.kraken.com/0/public/Trades"
 stamp_kind = "taker_many_prices"
 fill_span_allowance_ms = 250.0
 allowance_state = "placeholder"
 continuity = "trade_id"
-terms_note = "Terms under review in docs/03_DATA_SOURCES.md. Not approved, so not downloaded."
+bar_source = "trades"
+terms_note = "Ruled out by decision D-23. Nothing is requested from it."
 
 [fetch]
 timeout_s = 60.0
@@ -90,24 +117,22 @@ book_depth_allowance_s = 1.0
 # A row stamped later than this after we received it is refused, because no clock is that far off.
 max_future_skew_s = 60.0
 
-# Official candles are a reconciliation check, for a venue that publishes them. An aggregate trade file gives
-# each aggregate one timestamp, but official candles count each fill in its own minute, so volume stamped just
-# before a boundary can appear after it. A daily difference must be covered by trades this close to midnight, or
-# it is an error.
+# Official candles are a reconciliation check, for a source whose bars come from trades. An aggregate trade file gives
+# each aggregate one timestamp, but official candles count each fill in its own minute, so volume stamped just before a
+# boundary can appear after it, within the source's fill_span_allowance_ms.
 #
-# PLACEHOLDER, frozen under decision D-18. The design of this rule and boundary_window_ms were informed by Binance
-# files, so all of these are rechecked on the approved source. A failed check flags bars and never removes them, so
-# this window does not decide which days exist. Changing it before that recheck is a counted trial under C12.
+# PLACEHOLDER, not frozen. Freeze under C12 before the first V0 run, from data outside any test block, and a change after
+# that is a counted trial. This rule was designed after seeing Binance files (D-18), so it is rechecked on files fetched
+# for research. A failed check flags minutes and never removes them. bar_price_rel starts near what one venue's trades
+# and candles should agree to (N-05), with no real data seen since; project-manager says whether that counted as a trial.
 [reconcile.BTCUSDT]
 daily_total_abs = 0.000001
-boundary_window_ms = 250.0
-bar_price_rel = 0.02
+bar_price_rel = 0.0005
 fill_count_rel = 0.01
 
 [reconcile.ETHUSDT]
 daily_total_abs = 0.000001
-boundary_window_ms = 250.0
-bar_price_rel = 0.02
+bar_price_rel = 0.0005
 fill_count_rel = 0.01
 
 # ---- Archive datasets. Lower priority numbers run first on the same date. --------------------------------
@@ -115,6 +140,8 @@ fill_count_rel = 0.01
 # max_quiet_s: a silence longer than this is recorded as a gap even when ids run on. PLACEHOLDER, UNVERIFIED until
 # measured on the approved source. Zero means the dataset has no trades to fall quiet.
 
+# USD-M perpetual BTCUSDT and ETHUSDT, the symbols in [universe]. Candles and funding are tier T0, and nothing else
+# from this source is fetched unless named: book depth and aggregate trades stay opt-in.
 [[datasets]]
 id = "binance.klines"
 venue = "binance"
@@ -122,8 +149,10 @@ adapter = "binance_klines"
 kind = "klines"
 curated = "candles_official"
 tier = "T0"
-granularity = "day"
-start = "2024-01-01"
+# Monthly files, as section 4.3 of the coverage record recommends: 384 requests for stage one, against 6,036 for daily.
+granularity = "month"
+# T_start of the fold plan. The last opened date holds in code, and it is what ends these partitions.
+start = "2020-01-01"
 overdue_hours = 36.0
 light = true
 opt_in = false
@@ -139,7 +168,7 @@ kind = "fundingRate"
 curated = "funding"
 tier = "T0"
 granularity = "month"
-start = "2024-01-01"
+start = "2020-01-01"
 overdue_hours = 72.0
 light = true
 opt_in = false
@@ -157,8 +186,8 @@ tier = "T2"
 granularity = "day"
 start = "2026-01-01"
 overdue_hours = 36.0
-light = true
-opt_in = false
+light = false
+opt_in = true
 priority = 2
 live_eligible = false
 max_quiet_s = 0.0
@@ -173,10 +202,11 @@ tier = "T1"
 granularity = "day"
 start = "2026-06-01"
 overdue_hours = 36.0
-light = true
-opt_in = false
+light = false
+opt_in = true
 priority = 3
 live_eligible = false
+# UNVERIFIED placeholder, until measured on files fetched for research.
 max_quiet_s = 900.0
 
 [[datasets]]
@@ -212,6 +242,7 @@ live_eligible = false
 max_quiet_s = 0.0
 
 # ---- Hourly poll of closed trades. Own DATA_ROOT and own cache, so it stays small and fast. ---------------
+# Decision D-23 ruled out its only client's source, so with no live source approved it contacts nothing.
 # It writes its own _live datasets, so an archive of the same venue cannot overwrite what a run really saw.
 
 [poll]
@@ -255,3 +286,6 @@ equity_timeframe_minutes = 60
 # Empty until a source is approved. The report then shows no benchmarks and says why.
 benchmark_venue = ""
 benchmark_symbols = ["BTCUSDT", "ETHUSDT"]
+# Declared in advance and common to all symbols. No fault and no gap in a backfill moves it. T_start of the fold plan,
+# covered by C-5 before the first run. It ends at the last opened date, which is held in code.
+span_start = "2020-01-01"

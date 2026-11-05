@@ -40,6 +40,10 @@ check_bundle() {
       exit 1
     fi
     case "$relative" in
+      run_log/*/* | ledger/*/* | decisions/*/*)
+        echo "Refusing a path that is not on the list: $relative" >&2
+        exit 1
+        ;;
       status.json | live_state.json | run_log/*.jsonl | ledger/* | decisions/*) ;;
       *)
         echo "Refusing a path that is not on the list: $relative" >&2

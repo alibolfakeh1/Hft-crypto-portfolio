@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from helpers import agg_trades_csv, gz_bytes, klines_csv, us, zip_bytes
+from hft_crypto.bars.core import candle_row_faults
 from hft_crypto.data.parsers import (
     ValidationError,
     parse_agg_trades,
@@ -184,8 +185,12 @@ def test_klines_values(tmp_path: Path) -> None:
     ("rows", "message"),
     [
         ([(DAY_MS + 1, 10.0, 12.0, 9.0, 11.0, 5.0, 2.0)], "minute boundary"),
-        ([(DAY_MS, 10.0, 8.0, 9.0, 11.0, 5.0, 2.0)], "high is below"),
         ([(DAY_MS + 86_400_000, 10.0, 12.0, 9.0, 11.0, 5.0, 2.0)], "outside their UTC day"),
+        ([(DAY_MS, 10.0, 12.0, 9.0, 11.0, 5.0, 2.0), (DAY_MS, 10.0, 12.0, 9.0, 11.0, 5.0, 2.0)], "twice"),
+        ([(DAY_MS, 0.0, 12.0, 9.0, 11.0, 5.0, 2.0)], "non-positive"),
+        ([(DAY_MS, 10.0, 12.0, 0.0, 11.0, 5.0, 2.0)], "non-positive"),
+        ([(DAY_MS, 10.0, 12.0, 9.0, 11.0, -5.0, 2.0)], "negative"),
+        ([(DAY_MS, 10.0, 12.0, 9.0, 11.0, 5.0, -2.0)], "negative"),
     ],
 )
 def test_bad_klines_are_refused(
@@ -194,6 +199,57 @@ def test_bad_klines_are_refused(
     path = write(tmp_path, "k.zip", zip_bytes("k.csv", klines_csv(rows)))
     with pytest.raises(ValidationError, match=message):
         parse_klines(path, "BTCUSDT", DAY, LIMIT, **ARGS)
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        (DAY_MS, 10.0, 8.0, 9.0, 11.0, 5.0, 2.0),  # high below open, close and low
+        (DAY_MS, 10.0, 10.5, 9.0, 11.0, 5.0, 2.0),  # high below close
+        (DAY_MS, 10.0, 12.0, 10.5, 11.0, 5.0, 2.0),  # low above open
+        (DAY_MS, 10.0, 12.0, 9.0, 11.0, 5.0, 6.0),  # taker buy above volume
+    ],
+)
+def test_a_row_that_fails_a_check_at_the_row_is_kept_to_be_flagged(
+    tmp_path: Path, row: tuple[int, float, float, float, float, float, float]
+) -> None:
+    """Ruling 7 condition 5: a failure flags that minute. On a monthly file a refusal would cost a whole
+    month."""
+    path = write(tmp_path, "k.zip", zip_bytes("k.csv", klines_csv([row])))
+    frame = parse_klines(path, "BTCUSDT", DAY, LIMIT, **ARGS).frame
+    assert frame.height == 1
+    assert candle_row_faults(frame).tolist() == [True]
+
+
+def test_a_row_with_no_trades_may_carry_any_price(tmp_path: Path) -> None:
+    """What the venue writes there is UNVERIFIED, so a zero must not refuse a whole file. It is removed in any
+    case."""
+    text = klines_csv([(DAY_MS, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)]).replace(",0.0,1,0.0,", ",0.0,0,0.0,")
+    frame = parse_klines(
+        write(tmp_path, "k.zip", zip_bytes("k.csv", text)), "BTCUSDT", DAY, LIMIT, **ARGS
+    ).frame
+    assert frame["trade_count"].to_list() == [0]
+    assert candle_row_faults(frame).tolist() == [False]
+
+
+def test_a_candle_whose_close_field_is_not_the_end_of_its_minute_is_refused(tmp_path: Path) -> None:
+    text = klines_csv([(DAY_MS, 10.0, 12.0, 9.0, 11.0, 5.0, 2.0)]).replace(
+        str(DAY_MS + 59_999), str(DAY_MS + 60_000)
+    )
+    with pytest.raises(ValidationError, match="close time"):
+        parse_klines(write(tmp_path, "k.zip", zip_bytes("k.csv", text)), "BTCUSDT", DAY, LIMIT, **ARGS)
+
+
+@pytest.mark.parametrize("value", ["NaN", "inf"])
+@pytest.mark.parametrize("column", [7, 10], ids=["quote volume", "taker buy quote volume"])
+def test_every_numeric_candle_column_must_be_finite(tmp_path: Path, column: int, value: str) -> None:
+    """N-11. Two columns took NaN and inf, because no code read them. The candle path reads one of them."""
+    lines = klines_csv([(DAY_MS, 10.0, 12.0, 9.0, 11.0, 5.0, 2.0)]).splitlines()
+    fields = lines[1].split(",")
+    fields[column] = value
+    text = "\n".join([lines[0], ",".join(fields)]) + "\n"
+    with pytest.raises(ValidationError):
+        parse_klines(write(tmp_path, "k.zip", zip_bytes("k.csv", text)), "BTCUSDT", DAY, LIMIT, **ARGS)
 
 
 def test_book_depth_is_knowable_after_its_truncated_second(tmp_path: Path) -> None:

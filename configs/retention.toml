@@ -40,9 +40,8 @@ watermark_bypass_pct = 85.0
 klines = ["candles_official:pass"]
 fundingRate = ["funding:pass"]
 bookDepth = ["book_depth:pass"]
-# provisional stays accepted: the curated trades remain, and a later failure fetches the file again.
-aggTrades = ["trades:pass", "bars_1m:pass,provisional"]
-trades = ["trades:pass", "bars_1m:pass,provisional"]
+aggTrades = ["trades:pass", "bars_1m:pass"]
+trades = ["trades:pass", "bars_1m:pass"]
 orderbook = ["book_replay:pass"]
 
 # Bars and other flow data stay. This limits the trades behind them, which take most of the cache. Without it

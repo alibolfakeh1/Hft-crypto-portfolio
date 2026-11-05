@@ -8,20 +8,69 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import statistics
 from typing import Any
 
 from hft_crypto.config import NO_APPROVED_SOURCE, DatasetSpec, PipelineConfig, RetentionPolicy, quota_bytes
 from hft_crypto.data.atomic import is_temp_file
-from hft_crypto.data.catalog import Catalog
-from hft_crypto.data.retention import evaluate_watermarks
-from hft_crypto.data.sources import expected_partitions
+from hft_crypto.data.catalog import Catalog, FileRecord
+from hft_crypto.data.derive import base_dataset
+from hft_crypto.data.ingest import QUARANTINE_LOG
+from hft_crypto.data.retention import evaluate_watermarks, is_sample_day
+from hft_crypto.data.sources import expected_partitions, partition_last_day
 from hft_crypto.data.zones import DataRoot, measure_zones
-from hft_crypto.timeutil import iso, parse_iso
+from hft_crypto.data.zones import persisted_bytes as sum_persisted
+from hft_crypto.timeutil import date_range, iso, parse_iso
+
+# 80% of GitHub's stated 10 GB for all of a repository's caches (ruling R7.1). A policy value and not a
+# measurement.
+ACTIONS_CACHE_ALERT_BYTES = 8_000_000_000
+# A share of the quota that sample days may hold before someone is told (ruling R5.1). Nothing is deleted for
+# it.
+SAMPLE_DAYS_ALERT_SHARE = 0.25
 
 
 def persisted_bytes(zones: dict[str, int], config: PipelineConfig) -> int:
     """Bytes that survive between runs through the Actions cache."""
-    return sum(size for zone, size in zones.items() if zone in config.persisted_zones)
+    return sum_persisted(zones, config.persisted_zones)
+
+
+def dataset_sizes(records: list[FileRecord]) -> list[dict[str, Any]]:
+    """Bytes, files and rows per dataset, with a typical partition. Only reported, and it never sets a
+    status."""
+    grouped: dict[str, list[FileRecord]] = {}
+    for record in records:
+        grouped.setdefault(record.dataset_id, []).append(record)
+    rows = []
+    for dataset_id, items in sorted(grouped.items()):
+        counted = [item.row_count for item in items if item.row_count is not None]
+        rows.append(
+            {
+                "dataset": dataset_id,
+                "files": len(items),
+                "bytes": sum(item.size_bytes for item in items),
+                "rows": sum(counted),
+                "median_bytes_per_partition": statistics.median(item.size_bytes for item in items),
+                "median_rows_per_partition": statistics.median(counted) if counted else None,
+            }
+        )
+    return rows
+
+
+def _recent_quarantine(root: DataRoot, now: dt.datetime) -> int:
+    """Files quarantined in the last day. The log is the record, because the files leave with the runner."""
+    path = root.guard.check(QUARANTINE_LOG)
+    if not path.is_file():
+        return 0
+    since = now - dt.timedelta(days=1)
+    recent = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            if line.strip() and parse_iso(json.loads(line)["time"]) >= since:
+                recent += 1
+        except (ValueError, KeyError, TypeError):
+            recent += 1
+    return recent
 
 
 def _missing_ranges(missing: list[str], limit: int = 12) -> list[str]:
@@ -43,9 +92,9 @@ def _missing_ranges(missing: list[str], limit: int = 12) -> list[str]:
 
 
 def coverage_for_dataset(
-    catalog: Catalog, spec: DatasetSpec, symbol: str, now: dt.datetime
+    catalog: Catalog, spec: DatasetSpec, symbol: str, now: dt.datetime, *, ceiling: dt.date
 ) -> dict[str, Any]:
-    partitions = expected_partitions(spec, now)
+    partitions = expected_partitions(spec, now, ceiling=ceiling)
     keys = [p.isoformat()[:7] if spec.granularity == "month" else p.isoformat() for p in partitions]
     states = catalog.task_states(spec.id, symbol)
     done = [key for key in keys if states.get(key) == "done"]
@@ -73,10 +122,14 @@ def coverage_for_dataset(
 
 
 def _bars_coverage(
-    catalog: Catalog, venue: str, symbol: str, spec: DatasetSpec, now: dt.datetime
+    catalog: Catalog, venue: str, symbol: str, spec: DatasetSpec, now: dt.datetime, *, ceiling: dt.date
 ) -> dict[str, Any]:
-    partitions = expected_partitions(spec, now)
-    keys = [p.isoformat() for p in partitions]
+    partitions = expected_partitions(spec, now, ceiling=ceiling)
+    keys = [
+        day.isoformat()
+        for partition in partitions
+        for day in date_range(partition, partition_last_day(spec, partition))
+    ]
     states = catalog.task_states(f"derived.bars.{venue}", symbol)
     final = [key for key in keys if states.get(key) == "done"]
     provisional = [key for key in keys if states.get(key) == "provisional"]
@@ -149,8 +202,9 @@ def build_health(
     if growth is not None and growth > 0:
         days_until_full = round(max(0, quota - persisted) / growth, 1)
     live_growth = _growth_per_day(catalog, "raw/live", now)
+    # Against what the cache holds. Raw and quarantine leave with the runner and spend none of this budget.
     state = evaluate_watermarks(
-        total,
+        persisted,
         quota,
         policy.watermarks,
         days_until_full=days_until_full,
@@ -164,10 +218,12 @@ def build_health(
             continue
         for symbol in config.symbols:
             # An enabled dataset that nothing has started is a coverage problem, and it shows here.
-            item = coverage_for_dataset(catalog, spec, symbol, now)
+            item = coverage_for_dataset(catalog, spec, symbol, now, ceiling=config.last_opened_date)
             coverage.append(item)
-            if spec.curated == "trades":
-                bars.append(_bars_coverage(catalog, spec.venue, symbol, spec, now))
+            if spec.curated == base_dataset(config.source(spec.venue)):
+                bars.append(
+                    _bars_coverage(catalog, spec.venue, symbol, spec, now, ceiling=config.last_opened_date)
+                )
 
     alerts = list(state.alerts)
     if not config.enabled_sources():
@@ -189,6 +245,31 @@ def build_health(
             alerts.append(
                 f"Source {name} runs on a placeholder fill span allowance. It has not been measured."
             )
+    events = catalog.allowance_events()
+    if events:
+        alerts.append(
+            f"A row ran longer than its source's declared allowance on {len(events)} symbol-days, so that "
+            "allowance is false and IDEAL reads of that source are refused."
+        )
+    recent_quarantine = _recent_quarantine(root, now)
+    if recent_quarantine:
+        alerts.append(f"{recent_quarantine} files went to quarantine in the last 24 hours.")
+    cache_total = (actions_cache or {}).get("active_caches_size_in_bytes")
+    if isinstance(cache_total, int | float) and cache_total > ACTIONS_CACHE_ALERT_BYTES:
+        alerts.append(
+            f"This repository's caches use {cache_total / 1e9:.1f} GB, past 80% of GitHub's limit. "
+            "Past the limit, GitHub chooses what to evict."
+        )
+    present = catalog.files(status="present")
+    sample_bytes = sum(record.size_bytes for record in present if is_sample_day(record, policy))
+    if sample_bytes > SAMPLE_DAYS_ALERT_SHARE * quota:
+        alerts.append(
+            f"Sample days hold {sample_bytes / 1e9:.2f} GB, over a quarter of the quota. "
+            "Nothing is deleted for this: it goes to data-steward."
+        )
+    carried = catalog.get_meta("last_ingest_alerts")
+    if carried:
+        alerts.extend(alert for alert in json.loads(carried) if alert not in alerts)
     changed = catalog.changed_files("raw/archive/")
     if changed:
         alerts.append(f"{len(changed)} delivered files changed after they were recorded.")
@@ -221,6 +302,8 @@ def build_health(
         "coverage": coverage,
         "bars_coverage": bars,
         "gaps": catalog.gaps(),
+        "datasets": dataset_sizes(present),
+        "sample_days_bytes": sample_bytes,
         "exclusions": exclusions,
         "changed_delivered_files": changed,
         "disk": {

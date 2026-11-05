@@ -188,3 +188,15 @@ def test_a_bad_zip_is_refused(tmp_path: Path) -> None:
 def test_result_serialises_with_its_verdict() -> None:
     result = replay(SNAPSHOT)
     assert result.to_dict()["ok"] is True
+
+
+def test_a_corrupt_zip_is_a_malformed_result_and_not_a_traceback(tmp_path: Path) -> None:
+    """N-10. `replay_zip` was the fourth reader, and the fixes file said three. 16 of 400 fuzzed files ended
+    this way."""
+    lines = [book_message("delta", index, [[str(100 + index % 7), "1"]], []) for index in range(1, 4000)]
+    body = zip_bytes("x.data", book_lines(lines).decode("utf-8"))
+    middle = len(body) // 3
+    path = tmp_path / "x.zip"
+    path.write_bytes(body[:middle] + bytes(b ^ 0xFF for b in body[middle : middle + 8]) + body[middle + 8 :])
+    with pytest.raises(ValidationError):
+        replay_zip(path)

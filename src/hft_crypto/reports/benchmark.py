@@ -84,25 +84,47 @@ def sharpe(daily_returns: Sequence[float]) -> float | None:
     return float(np.mean(values) / deviation * math.sqrt(DAYS_PER_YEAR))
 
 
+def compute_span_stats(
+    first_price: float,
+    last_price: float,
+    one_day_returns: Sequence[float],
+    days: float,
+    equity_prices: Sequence[float],
+) -> BenchmarkStats:
+    """Statistics over a span that may hold holes.
+
+    Total return and CAGR run from the first price to the last across any hole, over the calendar days between
+    them. Volatility and Sharpe use only one-day returns, so a return across a hole never counts as one day.
+    Max drawdown uses the marks that exist.
+    """
+    if days <= 0:
+        raise ValueError("days must be positive")
+    total = last_price / first_price - 1.0
+    equity = normalise_to_100(equity_prices)
+    return BenchmarkStats(
+        total_return=total,
+        cagr=cagr(total, days),
+        annualised_volatility=annualised_volatility(one_day_returns),
+        sharpe=sharpe(one_day_returns),
+        max_drawdown=max_drawdown(equity),
+        days=days,
+        daily_returns=len(one_day_returns),
+        equity_marks=len(equity),
+    )
+
+
 def compute_stats(daily_prices: Sequence[float], equity_prices: Sequence[float]) -> BenchmarkStats:
-    """Statistics from daily marks and from finer equity marks over the same span.
+    """Statistics from daily marks with no holes, and from finer equity marks over the same span.
 
     Total return, CAGR, volatility and Sharpe use the daily marks. Max drawdown uses the finer marks, so it
     agrees with the chart. Both series must start and end on the same price.
     """
     if len(daily_prices) < 2:
         raise ValueError("at least two daily prices are needed")
-    days = float(len(daily_prices) - 1)
-    returns = simple_returns(daily_prices)
-    total = daily_prices[-1] / daily_prices[0] - 1.0
-    equity = normalise_to_100(equity_prices)
-    return BenchmarkStats(
-        total_return=total,
-        cagr=cagr(total, days),
-        annualised_volatility=annualised_volatility(returns),
-        sharpe=sharpe(returns),
-        max_drawdown=max_drawdown(equity),
-        days=days,
-        daily_returns=len(returns),
-        equity_marks=len(equity),
+    return compute_span_stats(
+        daily_prices[0],
+        daily_prices[-1],
+        simple_returns(daily_prices),
+        float(len(daily_prices) - 1),
+        equity_prices,
     )

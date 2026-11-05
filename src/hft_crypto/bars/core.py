@@ -3,15 +3,21 @@
 - A bar covers (open_time, close_time], so a trade exactly on a boundary closes the bar ending there.
 - A minute with no trades is a real row with null prices and zero volume, and it says how we know that.
   `empty_proof` is `traded` for a minute with trades, `id_run` when the rows on either side have consecutive
-  ids, and `none` otherwise. Unproven means a gap: a hole must never pass as a quiet market. Nothing is
-  forward filled.
+  ids, `official` when the venue's own candle says no trade happened, and `none` otherwise. Unproven means a
+  gap: a hole must never pass as a quiet market. Nothing is forward filled.
 - A row carrying one stamp over an interval can hold fills from after that stamp, so nothing built from it is
   known at the stamp. A trade is knowable at its stamp plus the source's declared allowance, and a bar at its
   close plus that allowance, or when this system received it if that was later. See the leak audit's ruling 2.
-- `volume` and its relatives put a whole row in the bar of its stamp. The `settled_*` columns move a row that
-  could run past the close into the next bar, so they hold only what had printed by the close. IDEAL mode
-  reads only them.
+- `volume` and its relatives put a whole row in the bar of its stamp. The `settled_*` columns count a row in a
+  bar only when it was stamped at least the allowance before that bar's close, so they read the stamp and
+  nothing else. A row's fill count cannot decide this, because it includes fills from after the close. IDEAL
+  mode reads only them.
+- A flag can rest on something later: a skip shows only in the row after it, and a midnight only in the next
+  day's first candle. Such a flag is a state event with its own time, so `knowable_time` waits for it,
+  `gap_at_close` holds what was known without it, and a read as of a moment gets the standing of that moment.
 - A higher-timeframe bar is emitted only when it has closed, by a closing time the caller states.
+- Under decision D-12 bars come from trades. `bar_source` says so on every row, and a tier T0 path on a
+  source's official candles says `official_1m` there, because those bars are not what D-12 describes.
 
 Every argument that decides timing is required, so that no caller gets the optimistic reading by leaving one
 out.
@@ -22,7 +28,7 @@ many threads a data frame engine happens to use, which keeps the output byte-ide
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from typing import Literal, cast
 
@@ -37,7 +43,12 @@ Continuity = Literal["trade_id", "none"]
 
 PROOF_TRADED = "traded"
 PROOF_ID_RUN = "id_run"
+PROOF_OFFICIAL = "official"
 PROOF_NONE = "none"
+SOURCE_TRADES = "trades"
+SOURCE_OFFICIAL = "official_1m"
+BOUNDARY_TRADES = "(open, close]"
+BOUNDARY_OFFICIAL = "[open, close)"
 
 BAR_SCHEMA: dict[str, pl.DataType] = {
     "venue": pl.String(),
@@ -60,9 +71,14 @@ BAR_SCHEMA: dict[str, pl.DataType] = {
     "fill_count": pl.Int64(),
     "empty_proof": pl.String(),
     "gap": pl.Boolean(),
+    "gap_at_close": pl.Boolean(),
+    "bar_source": pl.String(),
+    "boundary": pl.String(),
     "knowable_time": UTC_TIME,
 }
-_HIGHER_COLUMNS = {key: value for key, value in BAR_SCHEMA.items() if key != "empty_proof"}
+_HIGHER_COLUMNS = {
+    key: value for key, value in BAR_SCHEMA.items() if key not in ("empty_proof", "gap_at_close")
+}
 HIGHER_BAR_SCHEMA: dict[str, pl.DataType] = {
     **_HIGHER_COLUMNS,
     "n_1m": pl.Int32(),
@@ -80,6 +96,8 @@ TRADE_INPUT_COLUMNS = (
 )
 _FLOW_COLUMNS = ("volume", "quote_volume", "buy_volume", "sell_volume")
 
+# A candle's taker buy volume may sit this far above its volume by rounding alone.
+_TAKER_SLACK = 1.000001
 # Decimal places kept on summed quantities. The inputs have far fewer, so this removes only float noise.
 _QTY_DECIMALS = 10
 _QUOTE_DECIMALS = 6
@@ -91,6 +109,10 @@ _BoolArray = npt.NDArray[np.bool_]
 
 class TimingContractError(Exception):
     """A value was used before its knowable time, or a run asked for something it could not have."""
+
+
+class DateGuardError(TimingContractError):
+    """A read reached a date after the last opened date. Fold plan section 3."""
 
 
 @dataclass(frozen=True)
@@ -177,6 +199,7 @@ def build_bars_1m(
     fill_span_allowance_us: int,
     received_at_us: int | None,
     gap_close_us: Collection[int] = frozenset(),
+    late_gap_close_us: Mapping[int, int] | None = None,
 ) -> pl.DataFrame:
     """Build one-minute bars on an explicit grid, from first_close_us through last_close_us.
 
@@ -187,7 +210,9 @@ def build_bars_1m(
 
     continuity says whether trade ids can prove an empty minute. fill_span_allowance_us is how long after its
     stamp a row can run. received_at_us is when this system had the data, or None for an archive. gap_close_us
-    marks bars known to be incomplete for reasons outside the rows.
+    marks bars known to be incomplete for reasons outside the rows, known by the time the bar is.
+    late_gap_close_us does the same for a flag that rests on something later, as close -> when it became
+    known.
     """
     for column in TRADE_INPUT_COLUMNS:
         if column not in trades.columns:
@@ -224,6 +249,7 @@ def build_bars_1m(
         knowable = np.maximum(knowable, received_at_us)
     proof = np.full(size, PROOF_NONE, dtype=object)
     gaps: _BoolArray = np.isin(grid, list(gap_close_us)) if gap_close_us else np.zeros(size, dtype=bool)
+    at_close = gaps.copy()
 
     if trades.height:
         order, ts_us, ids = _sorted_view(trades)
@@ -267,7 +293,6 @@ def build_bars_1m(
             price=price,
             qty=qty,
             taker_buy=taker_buy,
-            n_fills=n_fills,
             allowance_us=fill_span_allowance_us,
         )
         if continuity == "trade_id":
@@ -278,7 +303,56 @@ def build_bars_1m(
                 gaps |= touched
                 knowable[touched] = np.maximum(knowable[touched], skip.known_at_us)
 
+    if late_gap_close_us:
+        for close_us, known_at_us in late_gap_close_us.items():
+            slot = (close_us - first_close_us) // MICROS_PER_MINUTE
+            if first_close_us <= close_us <= last_close_us and close_us % MICROS_PER_MINUTE == 0:
+                gaps[slot] = True
+                knowable[slot] = max(int(knowable[slot]), known_at_us)
     gaps |= proof == PROOF_NONE
+    # An empty minute's proof comes from a later row, so at its close nothing yet vouches for it.
+    at_close |= count == 0
+    return _bars_frame(
+        venue,
+        symbol,
+        grid,
+        open_,
+        high,
+        low,
+        close,
+        (volume, quote, buy, sell),
+        (settled_volume, settled_quote, settled_buy, settled_sell),
+        count,
+        fills,
+        proof,
+        gaps,
+        at_close,
+        SOURCE_TRADES,
+        knowable,
+    )
+
+
+def _bars_frame(
+    venue: str,
+    symbol: str,
+    grid: _IntArray,
+    open_: _FloatArray,
+    high: _FloatArray,
+    low: _FloatArray,
+    close: _FloatArray,
+    flows: tuple[_FloatArray, _FloatArray, _FloatArray, _FloatArray],
+    settled: tuple[_FloatArray, _FloatArray, _FloatArray, _FloatArray],
+    count: _IntArray,
+    fills: _IntArray,
+    proof: npt.NDArray[np.object_],
+    gaps: _BoolArray,
+    at_close: _BoolArray,
+    bar_source: str,
+    knowable: _IntArray,
+) -> pl.DataFrame:
+    volume, quote, buy, sell = flows
+    settled_volume, settled_quote, settled_buy, settled_sell = settled
+    size = grid.size
     return pl.DataFrame(
         [
             pl.repeat(venue, size, eager=True, dtype=pl.String).alias("venue"),
@@ -301,8 +375,126 @@ def build_bars_1m(
             pl.Series("fill_count", fills, dtype=pl.Int64),
             pl.Series("empty_proof", proof.tolist(), dtype=pl.String),
             pl.Series("gap", gaps, dtype=pl.Boolean),
+            pl.Series("gap_at_close", at_close, dtype=pl.Boolean),
+            pl.repeat(bar_source, size, eager=True, dtype=pl.String).alias("bar_source"),
+            pl.repeat(_boundary_of(bar_source), size, eager=True, dtype=pl.String).alias("boundary"),
             _time_series("knowable_time", knowable),
         ]
+    )
+
+
+def _boundary_of(bar_source: str) -> str:
+    return BOUNDARY_OFFICIAL if bar_source == SOURCE_OFFICIAL else BOUNDARY_TRADES
+
+
+def candle_row_faults(candles: pl.DataFrame) -> _BoolArray:
+    """Which candle rows break a check at the row (ruling 7 condition 5). A failure flags that minute.
+
+    A row with zero trades carries no print, so its prices are not checked: they are removed in any case.
+    """
+    if candles.is_empty():
+        return np.zeros(0, dtype=bool)
+    traded = pl.col("trade_count") > 0
+    faults = candles.select(
+        (
+            (
+                traded
+                & (
+                    (pl.col("high") < pl.max_horizontal("open", "close"))
+                    | (pl.col("low") > pl.min_horizontal("open", "close"))
+                )
+            )
+            | (pl.col("taker_buy_volume") > pl.col("volume") * _TAKER_SLACK + 1e-9)
+            | ((pl.col("trade_count") == 0) & (pl.col("volume") > 0))
+        ).alias("fault")
+    )
+    result: _BoolArray = faults["fault"].to_numpy().astype(bool)
+    return result
+
+
+def bars_from_official(
+    candles: pl.DataFrame,
+    *,
+    venue: str,
+    symbol: str,
+    first_close_us: int,
+    last_close_us: int,
+    candle_allowance_us: int,
+) -> pl.DataFrame:
+    """One-minute bars from a venue's official candles, for a tier T0 path with no trades. They say so on
+    every row.
+
+    This is ruling 7 of the leak recheck, and not what decision D-12 describes, where bars come from trades.
+    Each row states `bar_source` of `official_1m` and `boundary` of `[open, close)`, and they live in their
+    own datasets, so they can never be read as trade-built bars. A candle covers [open, open + 60 s), so a
+    print exactly on a boundary is in the later bar.
+
+    `close_time` is `open_time + 60 s` on the grid, and is known at `close_time + candle_allowance`. The
+    file's own close field has already been checked and is not used, and neither is the date a file was
+    published: the contract asks when a live system could have had the value.
+
+    A row with no trades has null prices, whether or not the venue carries the last close forward
+    (`UNVERIFIED`), because a carried price could touch a stop. Its `empty_proof` is `official`, and the proof
+    is the row itself, so nothing here rests on a later row. A missing row is a gap, and so is a row that
+    fails a check at the row. Nothing has checked these values against anything else, so reconciliation is
+    reported as not available.
+    """
+    if first_close_us % MICROS_PER_MINUTE != 0 or last_close_us % MICROS_PER_MINUTE != 0:
+        raise ValueError("the grid is not on a minute boundary")
+    if candle_allowance_us < 0:
+        raise ValueError("a candle allowance cannot be negative")
+    if first_close_us > last_close_us:
+        return _empty(BAR_SCHEMA)
+    grid: _IntArray = np.arange(first_close_us, last_close_us + 1, MICROS_PER_MINUTE, dtype=np.int64)
+    size = grid.size
+    faulty: _BoolArray = np.zeros(size, dtype=bool)
+    open_: _FloatArray = np.full(size, np.nan)
+    high: _FloatArray = np.full(size, np.nan)
+    low: _FloatArray = np.full(size, np.nan)
+    close: _FloatArray = np.full(size, np.nan)
+    volume: _FloatArray = np.zeros(size)
+    quote: _FloatArray = np.zeros(size)
+    buy: _FloatArray = np.zeros(size)
+    count: _IntArray = np.zeros(size, dtype=np.int64)
+    proof = np.full(size, PROOF_NONE, dtype=object)
+    if candles.height:
+        closes = _us(candles["open_time"]) + MICROS_PER_MINUTE
+        inside = (closes >= first_close_us) & (closes <= last_close_us)
+        slots = (closes[inside] - first_close_us) // MICROS_PER_MINUTE
+        traded = candles["trade_count"].to_numpy().astype(np.int64)[inside] > 0
+
+        def field(name: str) -> _FloatArray:
+            values: _FloatArray = candles[name].to_numpy().astype(np.float64)[inside]
+            return values
+
+        for target, name in ((open_, "open"), (high, "high"), (low, "low"), (close, "close")):
+            target[slots[traded]] = field(name)[traded]
+        volume[slots] = field("volume")
+        quote[slots] = field("quote_volume")
+        buy[slots] = field("taker_buy_volume")
+        count[slots] = candles["trade_count"].to_numpy().astype(np.int64)[inside]
+        proof[slots] = np.where(traded, PROOF_TRADED, PROOF_OFFICIAL)
+        faulty[slots] = candle_row_faults(candles)[inside]
+    gaps: _BoolArray = (proof == PROOF_NONE) | faulty
+    sell: _FloatArray = np.maximum(volume - buy, 0.0)
+    flows = (volume, quote, buy, sell)
+    return _bars_frame(
+        venue,
+        symbol,
+        grid,
+        open_,
+        high,
+        low,
+        close,
+        flows,
+        flows,
+        count,
+        count,
+        proof,
+        gaps,
+        gaps,
+        SOURCE_OFFICIAL,
+        grid + candle_allowance_us,
     )
 
 
@@ -319,23 +511,16 @@ def _add_settled(
     price: _FloatArray,
     qty: _FloatArray,
     taker_buy: _BoolArray,
-    n_fills: _IntArray,
     allowance_us: int,
 ) -> None:
     """Fill the columns holding only what had printed by each close.
 
-    A row that can span time, because it aggregates fills or shares its stamp with others, and that is stamped
-    within the allowance before a close, may have run past that close. Such a row counts in the next bar. A
-    row with one fill and its own stamp happened at its stamp, and stays. Only earlier stamps decide a bar, so
-    this stays causal.
+    A row counts in a bar only when it was stamped at least the allowance before that bar's close, and
+    otherwise in the next bar. The test reads the stamp alone. A row's fill count includes fills from after
+    the close, so a rule that looked at it would read the future, which is the leak audit's correction to its
+    own ruling 2. With an allowance of zero, nothing moves.
     """
-    shared = np.zeros(ts_us.size, dtype=bool)
-    if ts_us.size > 1:
-        same = np.diff(ts_us) == 0
-        shared[:-1] |= same
-        shared[1:] |= same
-    can_span = (n_fills > 1) | shared
-    defer = can_span & ((closes - ts_us) < allowance_us)
+    defer = (closes - ts_us) < allowance_us
     settle_close = closes + np.where(defer, MICROS_PER_MINUTE, 0)
     inside = (settle_close >= grid_first) & (settle_close <= grid_last)
     if not inside.any():
@@ -402,6 +587,9 @@ def aggregate_bars(bars_1m: pl.DataFrame, minutes: int, *, through_close_us: int
     # Prices from different venues are never merged into one bar, under C1.
     if bars_1m["venue"].n_unique() != 1 or bars_1m["symbol"].n_unique() != 1:
         raise ValueError("one venue and one symbol at a time")
+    # Trade bars and candle bars have different boundaries, so one bar cannot hold both.
+    if bars_1m["bar_source"].n_unique() != 1:
+        raise ValueError("one bar source at a time")
     ordered = bars_1m.sort("close_time")
     close_us = _us(ordered["close_time"])
     width = minutes * MICROS_PER_MINUTE
@@ -460,6 +648,7 @@ def aggregate_bars(bars_1m: pl.DataFrame, minutes: int, *, through_close_us: int
     size = len(rows)
     venue = str(ordered["venue"][0])
     symbol = str(ordered["symbol"][0])
+    bar_source = str(ordered["bar_source"][0])
     return pl.DataFrame(
         [
             pl.repeat(venue, size, eager=True, dtype=pl.String).alias("venue"),
@@ -481,6 +670,8 @@ def aggregate_bars(bars_1m: pl.DataFrame, minutes: int, *, through_close_us: int
             pl.Series("trade_count", [r["trade_count"] for r in rows], dtype=pl.Int64),
             pl.Series("fill_count", [r["fill_count"] for r in rows], dtype=pl.Int64),
             pl.Series("gap", [r["gap"] for r in rows], dtype=pl.Boolean),
+            pl.repeat(bar_source, size, eager=True, dtype=pl.String).alias("bar_source"),
+            pl.repeat(_boundary_of(bar_source), size, eager=True, dtype=pl.String).alias("boundary"),
             _time_series("knowable_time", knowable_values),
             pl.Series("n_1m", [r["n_1m"] for r in rows], dtype=pl.Int32),
             pl.Series("complete", [r["complete"] for r in rows], dtype=pl.Boolean),
@@ -530,16 +721,62 @@ def trades_for_run(trades: pl.DataFrame, t_cut_us: int, t_dec_us: int) -> pl.Dat
     return selected
 
 
-def ideal_view(bars: pl.DataFrame, *, ideal_allowed: bool) -> pl.DataFrame:
+def standing_as_of(bars_1m: pl.DataFrame, at_us: int) -> pl.DataFrame:
+    """One-minute bars closed by a moment, each with its standing as known at that moment.
+
+    A `gap`, a proof or a completeness is a state event with its own time, and does not exist before the row
+    that shows it is knowable. So a minute whose standing rests on something later reads as a build with no
+    later row would give: an empty minute is unproven and a gap, and a traded minute has only the flags known
+    at its close. The result on full data equals the result on data truncated at the moment, on every column
+    but `knowable_time`, and that is why the views built on this drop `knowable_time`: it would hand the
+    reader the time of the next trade.
+    """
+    moment = _time_literal(at_us)
+    closed = bars_1m.filter(pl.col("close_time") <= moment)
+    # A candle's proof is the row itself, so on these bars nothing rests on a later row (ruling 7 condition
+    # 4).
+    late = (pl.col("knowable_time") > moment) & (pl.col("bar_source") != SOURCE_OFFICIAL)
+    return closed.with_columns(
+        pl.when(late).then(pl.col("gap_at_close")).otherwise(pl.col("gap")).alias("gap"),
+        pl.when(late & (pl.col("trade_count") == 0))
+        .then(pl.lit(PROOF_NONE))
+        .otherwise(pl.col("empty_proof"))
+        .alias("empty_proof"),
+    )
+
+
+def as_of_view(
+    bars_1m: pl.DataFrame, minutes: int, at_us: int, *, through_us: int | None = None
+) -> pl.DataFrame:
+    """Closed bars of a timeframe as they stood at a moment. Higher bars come from that view, not from stored
+    ones.
+
+    through_us limits the closes when a read comes after the decision it serves, as in IDEAL-1M.
+    """
+    last = at_us if through_us is None else through_us
+    standing = standing_as_of(bars_1m, at_us).filter(pl.col("close_time") <= _time_literal(last))
+    if minutes == 1:
+        return standing.drop("knowable_time", "gap_at_close")
+    return aggregate_bars(standing, minutes, through_close_us=last).drop("knowable_time")
+
+
+def ideal_view(bars: pl.DataFrame, *, ideal_allowed: bool, keep_fill_count: bool = False) -> pl.DataFrame:
     """Bars as IDEAL mode may read them: only what had printed by each close.
 
     A decision at a close with no allowance cannot use a volume that might include later fills, so the settled
-    columns replace the plain ones and the plain ones are gone. A source whose prices can carry an after-close
-    print gets no IDEAL view at all.
+    columns replace the plain ones and the plain ones are gone, along with `fill_count`, which has no settled
+    form and moves with a fill after the close. A source whose prices can carry an after-close print gets no
+    IDEAL view at all.
+
+    On official candles, once ruling 7's condition 2 is shown, the plain columns are already settled and
+    `fill_count` holds only what printed in the minute, so the reader keeps it.
     """
     if not ideal_allowed:
         raise TimingContractError(
-            "this source's row shape can put later prints in a bar, so it has no IDEAL view"
+            "this source's row shape can put later prints in a bar, or its allowance is not measured, "
+            "so it has no IDEAL view"
         )
     renamed = {f"settled_{name}": name for name in _FLOW_COLUMNS}
-    return bars.drop(list(_FLOW_COLUMNS)).rename(renamed)
+    extras = [name for name in ("knowable_time", "gap_at_close") if name in bars.columns]
+    dropped = [*_FLOW_COLUMNS, *extras] if keep_fill_count else [*_FLOW_COLUMNS, "fill_count", *extras]
+    return bars.drop(dropped).rename(renamed)

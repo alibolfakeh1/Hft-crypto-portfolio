@@ -28,7 +28,7 @@ from hft_crypto.data.atomic import append_jsonl, sha256_file
 from hft_crypto.data.catalog import Catalog, FileRecord
 from hft_crypto.data.context import JobContext
 from hft_crypto.data.guard import PathGuardError, canonical_rel_path
-from hft_crypto.data.zones import DataClass, DataRoot, classify, measure_zones
+from hft_crypto.data.zones import DataClass, DataRoot, classify, measure_zones, persisted_bytes
 from hft_crypto.timeutil import iso, parse_iso
 from hft_crypto.versioning import code_version
 
@@ -66,13 +66,19 @@ def evaluate_watermarks(
     level = LEVEL_NORMAL
     if used_pct >= marks.critical_pct:
         level = LEVEL_CRITICAL
-        alerts.append(f"URGENT: storage at {used_pct:.1f}%. Only essential work continues.")
+        alerts.append(f"URGENT: storage at {used_pct:.1f}%. Ingest holds all its work. A poll keeps running.")
     elif used_pct >= marks.purge_runs_pct:
         level = LEVEL_PURGE_RUNS
-        alerts.append(f"Storage at {used_pct:.1f}%. Feature rebuilds paused. The owner must look.")
+        alerts.append(
+            f"Storage at {used_pct:.1f}%. New backfills stay stopped, and nothing here deletes anything. "
+            "The owner must look."
+        )
     elif used_pct >= marks.purge_raw_pct:
         level = LEVEL_PURGE_RAW
-        alerts.append(f"Storage at {used_pct:.1f}%. Deleting raw data past its derived-data check.")
+        alerts.append(
+            f"Storage at {used_pct:.1f}%. New backfills stay stopped. Nothing is deleted by this: "
+            "the retention job is a dry run, and raw files leave with the runner."
+        )
     elif used_pct >= marks.stop_backfill_pct:
         level = LEVEL_STOP_BACKFILL
         alerts.append(f"Storage at {used_pct:.1f}%. New backfills stopped.")
@@ -155,7 +161,7 @@ def _summary(deletable: list[PlanItem], blocked: list[PlanItem]) -> dict[str, di
     return rows
 
 
-def _is_sample_day(record: FileRecord, policy: RetentionPolicy) -> bool:
+def is_sample_day(record: FileRecord, policy: RetentionPolicy) -> bool:
     """The monthly regression sample. Selected by a fixed rule, never by looking at the data."""
     sample = policy.sample_days
     if record.partition_key is None or len(record.partition_key) != 10:
@@ -178,7 +184,7 @@ def effective_class(
     base = classify(record.rel_path)
     if base is None:
         return None
-    if _is_sample_day(record, policy):
+    if is_sample_day(record, policy):
         return DataClass.IRREPLACEABLE
     if base is not DataClass.DERIVED or record.rel_path.startswith("results/"):
         return base
@@ -203,6 +209,9 @@ def check_preconditions(
 ) -> str | None:
     """Step 2 of the protocol. Return why a deletion must not happen, or None if it may."""
     required = rule.requires.get(record.kind) or rule.requires.get("*") or ()
+    # A day's file answers to that day's derived files. The bars of the days on either side also read it, but
+    # this day's own status already says whether its neighbours agree, and looking further would make the
+    # answer depend on which day happened to be built first.
     if record.rel_path.startswith("raw/"):
         # Fail closed: raw data with no stated requirement has no evidence that anything replaced it.
         if not required:
@@ -212,7 +221,13 @@ def check_preconditions(
     if required:
         descendants = catalog.descendants_of(record.rel_path)
         for kind, accepted in required:
-            matching = [d for d in descendants if d.kind == kind and d.status == "present"]
+            matching = [
+                d
+                for d in descendants
+                if d.kind == kind
+                and d.status == "present"
+                and (record.partition_key is None or d.partition_key == record.partition_key)
+            ]
             if not matching:
                 return f"derived data missing: {kind}"
             for child in matching:
@@ -442,7 +457,7 @@ def execute_plan(ctx: JobContext, plan: RetentionPlan) -> ExecutionResult:
     """
     result = ExecutionResult()
     quota = quota_bytes(ctx.config.default_quota_gb)
-    used = sum(measure_zones(ctx.root).values())
+    used = persisted_bytes(measure_zones(ctx.root), ctx.config.persisted_zones)
     for item in plan.deletable:
         try:
             rule = ctx.policy.rule(item.rule_id)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -204,3 +205,134 @@ def test_an_enabled_source_on_a_placeholder_allowance_raises_an_alert(tmp_path: 
     shipped = make_context(tmp_path / "s", now=NOW)
     plain = build_health(shipped.root, shipped.catalog, shipped.config, shipped.policy, NOW)
     assert not any("placeholder" in alert for alert in plain["alerts"])
+
+
+# ---- the steward's list
+# -------------------------------------------------------------------------------------------
+
+
+def _with_files(ctx: Any, *rows: tuple[str, str, int, int | None, str]) -> None:
+    for rel, dataset, size, count, day in rows:
+        path = ctx.root.guard.check(rel)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x" * size)
+        ctx.register_output(
+            path,
+            dataset_id=dataset,
+            kind=dataset.split(".")[1] if "." in dataset else dataset,
+            zone="/".join(rel.split("/")[:1]),
+            partition_key=day,
+            date_start=day,
+            date_end=day,
+            rows=count,
+            check_status="pass",
+            check_detail={},
+        )
+
+
+def test_health_reports_each_dataset_by_size_and_rows(tmp_path: Path) -> None:
+    """R2.1. It reported by zone, which met neither the ruling nor the daily report the lifecycle asks for."""
+    ctx = make_context(tmp_path / "r", now=NOW, config=_config())
+    _with_files(
+        ctx,
+        ("curated/a/x1.parquet", "curated.a.v.S", 100, 10, "2026-03-02"),
+        ("curated/a/x2.parquet", "curated.a.v.S", 300, 30, "2026-03-03"),
+        ("curated/b/x1.parquet", "curated.b.v.S", 50, None, "2026-03-02"),
+    )
+    rows = {
+        row["dataset"]: row
+        for row in build_health(ctx.root, ctx.catalog, ctx.config, ctx.policy, NOW)["datasets"]
+    }
+    assert rows["curated.a.v.S"] == {
+        "dataset": "curated.a.v.S",
+        "files": 2,
+        "bytes": 400,
+        "rows": 40,
+        "median_bytes_per_partition": 200.0,
+        "median_rows_per_partition": 20.0,
+    }
+    assert rows["curated.b.v.S"]["median_rows_per_partition"] is None
+
+
+def test_sample_days_over_a_quarter_of_the_quota_raise_an_alert_and_delete_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R5.1. Sample days are never deleted, so they add up. It goes to data-steward."""
+    monkeypatch.setenv("DATA_QUOTA_GB", "0.000001")
+    ctx = make_context(tmp_path / "r", now=NOW, config=_config())
+    _with_files(ctx, ("curated/trades/x1.parquet", "curated.trades.v.S", 300, 1, "2026-03-01"))
+    report = build_health(ctx.root, ctx.catalog, ctx.config, ctx.policy, NOW)
+    assert report["sample_days_bytes"] == 300
+    assert any("Sample days" in alert for alert in report["alerts"])
+    assert ctx.root.guard.check("curated/trades/x1.parquet").is_file()
+    other = make_context(tmp_path / "other", now=NOW, config=_config())
+    _with_files(other, ("curated/trades/x2.parquet", "curated.trades.v.S", 300, 1, "2026-03-02"))
+    assert not any(
+        "Sample days" in alert
+        for alert in build_health(other.root, other.catalog, other.config, other.policy, NOW)["alerts"]
+    )
+
+
+def test_a_file_quarantined_in_the_last_day_raises_an_alert(tmp_path: Path) -> None:
+    """R4.3. The record is what data-steward reviews, so a new one must reach someone."""
+    ctx = make_context(tmp_path / "r", now=NOW, config=_config())
+    log = ctx.root.guard.check("catalog/quarantine.jsonl")
+    old = NOW - dt.timedelta(days=2)
+    log.write_text(json.dumps({"time": old.strftime("%Y-%m-%dT%H:%M:%SZ")}) + "\n", encoding="utf-8")
+    alerts = build_health(ctx.root, ctx.catalog, ctx.config, ctx.policy, NOW)["alerts"]
+    assert not any("quarantine" in alert for alert in alerts)
+    recent = NOW - dt.timedelta(hours=2)
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"time": recent.strftime("%Y-%m-%dT%H:%M:%SZ")}) + "\n")
+    alerts = build_health(ctx.root, ctx.catalog, ctx.config, ctx.policy, NOW)["alerts"]
+    assert any("1 files went to quarantine" in alert for alert in alerts)
+
+
+def test_a_repository_cache_total_near_the_limit_raises_an_alert(tmp_path: Path) -> None:
+    """R7.1. Past the limit GitHub chooses what to evict, and nothing compared the total with it."""
+    ctx = make_context(tmp_path / "r", now=NOW, config=_config())
+
+    def alerts(total: int) -> list[str]:
+        cache = {"active_caches_size_in_bytes": total, "active_caches_count": 1}
+        report = build_health(ctx.root, ctx.catalog, ctx.config, ctx.policy, NOW, actions_cache=cache)
+        found: list[str] = report["alerts"]
+        return found
+
+    assert not any("caches use" in alert for alert in alerts(8_000_000_000))
+    assert any("caches use 8.0 GB" in alert for alert in alerts(8_000_000_001))
+
+
+def test_what_a_run_left_as_alerts_reaches_health(tmp_path: Path) -> None:
+    ctx = make_context(tmp_path / "r", now=NOW, config=_config())
+    ctx.catalog.set_meta(
+        "last_ingest_alerts", json.dumps(["A file with a name that is not a day was skipped: x"])
+    )
+    assert any(
+        "not a day" in alert
+        for alert in build_health(ctx.root, ctx.catalog, ctx.config, ctx.policy, NOW)["alerts"]
+    )
+
+
+def test_a_false_allowance_reaches_the_alerts(tmp_path: Path) -> None:
+    ctx = make_context(tmp_path / "r", now=NOW, config=_config())
+    ctx.catalog.add_allowance_event("generated", "S", "2026-03-01", 300.0, 250.0, now="2026-03-02T00:00:00Z")
+    assert any(
+        "allowance is false" in alert
+        for alert in build_health(ctx.root, ctx.catalog, ctx.config, ctx.policy, NOW)["alerts"]
+    )
+
+
+def test_storage_state_is_measured_on_what_the_cache_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R3.1. Raw and quarantine leave with the runner, so they cannot read as the cache being full."""
+    monkeypatch.setenv("DATA_QUOTA_GB", "0.01")
+    ctx = make_context(tmp_path / "r", now=NOW, config=_config())
+    raw = ctx.root.guard.check("raw/archive/x/y.bin")
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    # Five times the quota on the runner, and the cache itself far under it.
+    raw.write_bytes(b"x" * 50_000_000)
+    report = build_health(ctx.root, ctx.catalog, ctx.config, ctx.policy, NOW)
+    assert report["disk"]["total_bytes"] >= 50_000_000
+    assert report["disk"]["persisted_bytes"] < 10_000_000
+    assert not any("Storage at" in alert for alert in report["alerts"])

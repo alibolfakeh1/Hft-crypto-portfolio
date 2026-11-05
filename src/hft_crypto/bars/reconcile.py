@@ -1,12 +1,14 @@
 """Checks on bars: against official candles, against a rebuild, against an archive, and between venues.
 
-A failed check never removes a bar. It says from which minute a day's bars can no longer be trusted, working
-forward through the day, so a minute's standing never depends on what happened later. Removing the whole day
-would let an event at 23:59 decide which bars exist at 08:00, and that would select the sample by something in
-its own future.
+A failed check never removes a bar. It flags the minutes it cannot explain, and only those: a break that lasts
+is bad at every boundary it touches, and one long row is bad at one boundary and heals at the next. Each
+boundary's standing uses only what came at or before it, so a minute's standing never depends on what happened
+later. A flag that does rest on something later, a disagreement over a midnight, says so, and its own time
+comes from the caller.
 
-The rule for official candles was designed after seeing files from a source now ruled out by D-17. Under D-18
-it must be checked again on the approved source, and its window is a declared placeholder until then.
+The rule for official candles was designed after seeing files from Binance Vision, before D-29 chose that
+source. It must be checked again on files fetched for research, and its window is the source's declared fill
+span allowance, a placeholder until measured and frozen under C12.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ STATUS_PASS = "pass"  # noqa: S105
 STATUS_WARN = "warn"
 STATUS_FAIL = "fail"
 STATUS_NOT_APPLICABLE = "not_applicable"
+STATUS_NOT_AVAILABLE = "not_available"
 # Quantities are compared as whole units of this fraction of a coin.
 _QTY_SCALE = 100_000_000
 _MINUTE_US = 60_000_000
@@ -41,8 +44,11 @@ class DayFlow:
     carry_out: float
     carry_in_buy: float
     carry_out_buy: float
-    # False when the day's own path broke. Its figure for the far midnight is then not what crossed it.
-    reliable: bool = True
+    # A carry in is known at the day's first boundary, so a later break does not touch it. A carry out needs
+    # the whole path to hold. A neighbour reads only the figure it needs, so a fault at 10:00 cannot reach
+    # back to the midnight before it.
+    carry_in_reliable: bool = True
+    carry_out_reliable: bool = True
 
     @classmethod
     def from_detail(cls, detail: dict[str, Any]) -> DayFlow:
@@ -51,7 +57,8 @@ class DayFlow:
             float(detail["carry_out"]),
             float(detail["carry_in_buy"]),
             float(detail["carry_out_buy"]),
-            bool(detail["flow_reliable"]),
+            bool(detail["carry_in_reliable"]),
+            bool(detail["carry_out_reliable"]),
         )
 
 
@@ -62,14 +69,17 @@ class OfficialReconciliation:
     status: str
     needs_previous_day: bool
     needs_next_day: bool
-    flag_from_close_us: int | None
+    flag_close_us: tuple[int, ...]
     flag_first_bar: bool
     flag_last_bar: bool
+    unconfirmed_previous: bool
+    unconfirmed_next: bool
     carry_in: float
     carry_out: float
     carry_in_buy: float
     carry_out_buy: float
-    flow_reliable: bool
+    carry_in_reliable: bool
+    carry_out_reliable: bool
     trades_volume: float
     official_volume: float
     volume_diff: float
@@ -150,14 +160,21 @@ def _walk(
     adjusted = running + carry
     bad = (adjusted < -eps) | (adjusted > explainable + eps)
     hits = np.flatnonzero(bad)
+    # How long a row must have run, to explain each difference. This reads every boundary, also the bad ones,
+    # or a row longer than the window could never show. A bad boundary counts only if it stands alone, because
+    # a break that lasts is a data error and says nothing about how long a row runs.
     largest = 0
-    for index in np.flatnonzero((adjusted > 0) & ~bad):
+    for index in np.flatnonzero(adjusted > 0):
+        alone = (index == 0 or not bad[index - 1]) and (index + 1 == bad.size or not bad[index + 1])
+        if bad[index] and not alone:
+            continue
         cursor = int(positions[index]) - 1
         covered = 0
         while cursor >= 0 and covered < int(adjusted[index]):
             covered += int(qty[cursor])
             cursor -= 1
-        largest = max(largest, int(boundaries[index]) - int(ts_us[cursor + 1]))
+        if covered >= int(adjusted[index]) and cursor + 1 < ts_us.size:
+            largest = max(largest, int(boundaries[index]) - int(ts_us[cursor + 1]))
     return _Path(carry, int(adjusted[-1]), bad, int(hits[0]) if hits.size else None, largest)
 
 
@@ -167,6 +184,7 @@ def reconcile_official(
     official: pl.DataFrame,
     tolerance: ReconTolerance,
     *,
+    window_ms: float,
     previous_tail: pl.DataFrame | None,
     previous_flow: DayFlow | None,
     next_flow: DayFlow | None,
@@ -184,10 +202,12 @@ def reconcile_official(
     final until both neighbours are known, because a difference near midnight can be excused only by a
     neighbour that agrees.
 
-    previous_tail holds the end of the previous file. previous_flow and next_flow are what those days
-    reported, or None if they are not known yet. is_first_day says that no previous file will ever exist.
+    window_ms is the source's declared fill span allowance. There is one constant for both, because they bound
+    the same mechanism, so raising the window to pass a day also moves every knowable time. previous_tail
+    holds the end of the previous file. previous_flow and next_flow are what those days reported, or None if
+    they are not known yet. is_first_day says that no previous file will ever exist.
     """
-    window_us = round(tolerance.boundary_window_ms * 1000)
+    window_us = round(window_ms * 1000)
     eps = round(tolerance.daily_total_abs * _QTY_SCALE)
     order = np.argsort(file_trades["ts"].dt.timestamp("us").to_numpy().astype(np.int64), kind="stable")
     ts_us = file_trades["ts"].dt.timestamp("us").to_numpy().astype(np.int64)[order]
@@ -201,7 +221,7 @@ def reconcile_official(
     day_end = int(boundaries[-1])
     day_start = day_end - _DAY_US
 
-    trusted_previous = previous_flow is not None and previous_flow.reliable
+    trusted_previous = previous_flow is not None and previous_flow.carry_out_reliable
     previous_in = round(previous_flow.carry_out * _QTY_SCALE) if previous_flow and trusted_previous else None
     previous_in_buy = (
         round(previous_flow.carry_out_buy * _QTY_SCALE) if previous_flow and trusted_previous else None
@@ -261,22 +281,24 @@ def reconcile_official(
 
     reasons: list[str] = []
     failed = False
-    first_bad: list[int] = []
+    flag_closes: set[int] = set()
     flag_first = False
     flag_last = False
     cannot_confirm = False
+    unconfirmed_previous = False
+    unconfirmed_next = False
     needs_previous = False
     needs_next = False
 
     if volume_path.first_bad is not None:
         failed = True
-        first_bad.append(int(boundaries[volume_path.first_bad]))
+        flag_closes |= {int(value) for value in boundaries[volume_path.bad]}
         reasons.append(
             f"{int(volume_path.bad.sum())} minute boundaries differ by more than nearby trades explain"
         )
     if buy_path.first_bad is not None:
         failed = True
-        first_bad.append(int(boundaries[buy_path.first_bad]))
+        flag_closes |= {int(value) for value in boundaries[buy_path.bad]}
         reasons.append(f"taker buy volume differs at {int(buy_path.bad.sum())} minute boundaries")
     if volume_diff > up_allowed + eps + volume_path.carry_in:
         failed = True
@@ -291,16 +313,17 @@ def reconcile_official(
         )
     if over_price.any():
         failed = True
-        first_price = int(np.flatnonzero(over_price)[0])
-        first_bad.append(int(joined["open_time"].dt.timestamp("us")[first_price]) + _MINUTE_US)
+        opens = joined["open_time"].dt.timestamp("us").to_numpy().astype(np.int64)
+        flag_closes |= {int(value) + _MINUTE_US for value in opens[over_price]}
         reasons.append(f"{int(over_price.sum())} bars outside the price tolerance")
 
     # What the neighbours say must match. Neither day alone can tell which one is wrong, so both are flagged
     # at the boundary they share, and only there: the rest of each day stands on its own path.
     own_path_holds = volume_path.first_bad is None and buy_path.first_bad is None
+    own_carry_in_holds = not bool(volume_path.bad[0]) and not bool(buy_path.bad[0])
     has_carry_in = volume_path.carry_in > eps or buy_path.carry_in > eps
     has_carry_out = volume_path.carry_out > eps or buy_path.carry_out > eps
-    if previous_flow is not None and previous_flow.reliable:
+    if previous_flow is not None and previous_flow.carry_out_reliable:
         if (
             abs(volume_path.carry_in - round(previous_flow.carry_out * _QTY_SCALE)) > eps
             or abs(buy_path.carry_in - round(previous_flow.carry_out_buy * _QTY_SCALE)) > eps
@@ -317,13 +340,14 @@ def reconcile_official(
         if has_carry_in:
             cannot_confirm = True
             flag_first = True
+            unconfirmed_previous = previous_flow is not None
             reasons.append(
                 f"carry into the day of {volume_path.carry_in / _QTY_SCALE:.8f} cannot be confirmed, "
                 "not explained by midnight"
             )
     else:
         needs_previous = True
-    if next_flow is not None and next_flow.reliable:
+    if next_flow is not None and next_flow.carry_in_reliable:
         if own_path_holds and (
             abs(volume_path.carry_out - round(next_flow.carry_in * _QTY_SCALE)) > eps
             or abs(buy_path.carry_out - round(next_flow.carry_in_buy * _QTY_SCALE)) > eps
@@ -338,6 +362,7 @@ def reconcile_official(
         if own_path_holds and has_carry_out:
             cannot_confirm = True
             flag_last = True
+            unconfirmed_next = True
             reasons.append(
                 f"carry out of the day of {volume_path.carry_out / _QTY_SCALE:.8f} cannot be confirmed, "
                 "not explained by midnight"
@@ -354,14 +379,17 @@ def reconcile_official(
         status=status,
         needs_previous_day=needs_previous,
         needs_next_day=needs_next,
-        flag_from_close_us=min(first_bad) if first_bad else None,
+        flag_close_us=tuple(sorted(flag_closes)),
         flag_first_bar=flag_first,
         flag_last_bar=flag_last,
+        unconfirmed_previous=unconfirmed_previous,
+        unconfirmed_next=unconfirmed_next,
         carry_in=round(volume_path.carry_in / _QTY_SCALE, 8),
         carry_out=round(volume_path.carry_out / _QTY_SCALE, 8),
         carry_in_buy=round(buy_path.carry_in / _QTY_SCALE, 8),
         carry_out_buy=round(buy_path.carry_out / _QTY_SCALE, 8),
-        flow_reliable=own_path_holds,
+        carry_in_reliable=own_carry_in_holds,
+        carry_out_reliable=own_path_holds,
         trades_volume=round(float(qty.sum()) / _QTY_SCALE, 6),
         official_volume=round(float(official_qty.sum()) / _QTY_SCALE, 6),
         volume_diff=round(volume_diff / _QTY_SCALE, 8),

@@ -1,4 +1,4 @@
-"""Every route to a prohibited host, the source switches, and the HTTP client past its refusal path.
+"""Every route to a prohibited host, the one approved route, the source switches, and the HTTP client.
 
 No test here reaches a network. The client runs against a handler that records what it was asked for.
 """
@@ -7,17 +7,29 @@ from __future__ import annotations
 
 import http.client
 import io
+import os
 import shutil
+import subprocess
+import sys
 import urllib.error
 import urllib.request
-import zlib
+from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from helpers import REPO_ROOT, base_config
-from hft_crypto.config import ConfigError, is_prohibited_host, load_pipeline_config, load_retention_policy
+from hft_crypto.config import (
+    ARCHIVE_ONLY_SOURCES,
+    PROHIBITED_SOURCES,
+    ConfigError,
+    is_prohibited_host,
+    load_pipeline_config,
+    load_retention_policy,
+    route_problem,
+)
 from hft_crypto.data.fetch import (
     ALLOWED_HOSTS,
     FetchError,
@@ -29,8 +41,11 @@ from hft_crypto.data.fetch import (
 )
 
 SHIPPED = (REPO_ROOT / "configs" / "pipeline.toml").read_text(encoding="utf-8")
-BANNED_URL = "https://data.binance.vision/data/futures/um"
+BANNED_URL = "https://api.kraken.com/0/public/Trades"
 ALLOWED = frozenset({"public.bybit.com"})
+ROUTE = "https://data.binance.vision/data/futures/um"
+# The guard's own class, which tests/conftest.py loaded before this file was collected.
+NetworkTouched: type[BaseException] = sys.modules["network_guard"].NetworkTouched
 
 
 def load(tmp_path: Path, text: str) -> Any:
@@ -58,35 +73,219 @@ def test_the_shipped_file_loads_and_enables_nothing() -> None:
     assert config.enabled_hosts() == frozenset()
 
 
-# ---- each route in F-10's table
-# --------------------------------------------------------------------------------
+# ---- D-29: one source, one host, one path, and no other way in
+# -------------------------------------------------------
+
+
+def test_the_candle_allowance_is_the_declared_value_and_a_source_cannot_be_enabled_without_one(
+    tmp_path: Path,
+) -> None:
+    """D-33: 10 s, in state declared. The key stays required, and a file that gives none cannot enable the
+    source."""
+    assert base_config().source("binance").candle_allowance_ms == 10000.0
+    assert base_config().source("binance").bar_allowance_us == 10_000_000
+    assert base_config().source("binance").candle_allowance_state == "declared"
+    undeclared = SHIPPED.replace("candle_allowance_ms = 10000", 'candle_allowance_ms = "UNDECLARED"', 1)
+    assert load(tmp_path, undeclared).source("binance").candle_allowance_ms is None
+    enabled = undeclared.replace("enabled = false", "enabled = true", 1)
+    with pytest.raises(ConfigError, match="candle_allowance_ms"):
+        load(tmp_path, enabled)
+    # Switched on in memory, it is still unusable.
+    config = base_config()
+    moved = replace(config.source("binance"), enabled=True, candle_allowance_ms=None)
+    assert not replace(config, sources={**config.sources, "binance": moved}).source_usable("binance")
+
+
+def test_the_allowance_a_must_cover_the_candle_allowance(tmp_path: Path) -> None:
+    """The mode table: A >= candle_allowance, in one unit. The run refuses too, and so does the file."""
+    with pytest.raises(ConfigError, match="candle allowance"):
+        load(tmp_path, SHIPPED.replace("candle_allowance_ms = 10000", "candle_allowance_ms = 10001", 1))
+
+
+@pytest.mark.parametrize("key", ["candle_allowance_ms", "candle_allowance_state", "candle_check"])
+def test_the_candle_keys_are_required_on_official_bars(tmp_path: Path, key: str) -> None:
+    start, end = _section("binance")
+    block = "\n".join(line for line in SHIPPED[start:end].splitlines() if not line.startswith(key))
+    with pytest.raises(ConfigError, match=key):
+        load(tmp_path, SHIPPED[:start] + block + SHIPPED[end:])
+
+
+@pytest.mark.parametrize("value", ["-1.0", "60000.0", "true", '"soon"'])
+def test_a_declared_candle_allowance_is_checked(tmp_path: Path, value: str) -> None:
+    text = SHIPPED.replace("candle_allowance_ms = 10000", f"candle_allowance_ms = {value}", 1)
+    with pytest.raises(ConfigError, match="candle_allowance_ms"):
+        load(tmp_path, text)
+
+
+def test_condition_2_cannot_be_declared_shown_without_its_evidence(tmp_path: Path) -> None:
+    text = SHIPPED.replace('candle_check = "not_shown"', 'candle_check = "shown"', 1)
+    with pytest.raises(ConfigError, match="evidence"):
+        load(tmp_path, text)
+    shown = load(
+        tmp_path,
+        text.replace('candle_check = "shown"', 'candle_check = "shown"\ncandle_check_evidence = "x"', 1),
+    )
+    assert shown.source("binance").ideal_allowed is True
+    assert base_config().source("binance").ideal_allowed is False
+
+
+def test_the_approved_source_can_be_enabled_and_opens_only_its_own_host(tmp_path: Path) -> None:
+    config = load(tmp_path, _edit_source("binance", "enabled = false", "enabled = true"))
+    assert config.enabled_sources() == ("binance",)
+    assert config.enabled_hosts() == {"data.binance.vision"}
+    assert config.source_usable("binance")
+
+
+def test_what_ships_for_the_approved_source_is_disabled_candles_with_credit() -> None:
+    source = base_config().source("binance")
+    assert source.enabled is False
+    assert source.prohibited is False
+    assert source.bar_source == "official_1m"
+    assert source.candle_check == "not_shown"
+    assert source.allowance_state == "placeholder"
+    assert "CC BY-NC-SA 4.0" in source.attribution
+    assert source.attribution == (
+        "Derived from Binance Vision data, CC BY-NC-SA 4.0. Not associated with or endorsed by Binance."
+    )
+    assert source.name in ARCHIVE_ONLY_SOURCES
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "daily/klines/BTCUSDT/1m/BTCUSDT-1m-2026-03-01.zip",
+        "daily/klines/BTCUSDT/1m/BTCUSDT-1m-2026-03-01.zip.CHECKSUM",
+        "daily/klines/ETHUSDT/1m/ETHUSDT-1m-2026-03-01.zip",
+        "monthly/fundingRate/BTCUSDT/BTCUSDT-fundingRate-2026-03.zip",
+        "monthly/fundingRate/ETHUSDT/ETHUSDT-fundingRate-2026-03.zip.CHECKSUM",
+        "daily/aggTrades/BTCUSDT/BTCUSDT-aggTrades-2026-03-01.zip",
+        "daily/bookDepth/BTCUSDT/BTCUSDT-bookDepth-2026-03-01.zip",
+    ],
+)
+def test_the_files_this_project_needs_are_on_the_route(path: str) -> None:
+    check_url(f"{ROUTE}/{path}", frozenset({"data.binance.vision"}))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # Other products on the same host.
+        "https://data.binance.vision/data/spot/daily/klines/BTCUSDT/1m/BTCUSDT-1m-2026-03-01.zip",
+        "https://data.binance.vision/data/futures/cm/daily/klines/BTCUSD_PERP/1m/BTCUSD_PERP-1m-2026-03-01.zip",
+        "https://data.binance.vision/data/option/daily/BVOLIndex/BTCBVOLUSDT/x.zip",
+        # A dated contract is not a perpetual, and its symbol holds an underscore.
+        f"{ROUTE}/daily/klines/BTCUSDT_260327/1m/BTCUSDT_260327-1m-2026-03-01.zip",
+        # Ways out of the path.
+        f"{ROUTE}/../spot/daily/klines/BTCUSDT/1m/x.zip",
+        f"{ROUTE}/%2e%2e/spot/daily/klines/BTCUSDT/1m/x.zip",
+        f"{ROUTE}/daily/klines/BTCUSDT/1m/BTCUSDT-1m-2026-03-01.zip?x=1",
+        f"{ROUTE}/daily/klines/BTCUSDT/1m/BTCUSDT-1m-2026-03-01.zip#x",
+        # The route itself, and things that only look like it.
+        ROUTE,
+        f"{ROUTE}/",
+        f"{ROUTE}x/daily/klines/BTCUSDT/1m/BTCUSDT-1m-2026-03-01.zip",
+        "http://data.binance.vision/data/futures/um/daily/klines/BTCUSDT/1m/BTCUSDT-1m-2026-03-01.zip",
+    ],
+)
+def test_nothing_else_on_that_host_is_open(url: str) -> None:
+    with pytest.raises(ForbiddenHostError):
+        check_url(url, ALLOWED_HOSTS)
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "api.binance.com",
+        "fapi.binance.com",
+        "dapi.binance.com",
+        "binance.com",
+        "www.binance.com",
+        "x.binance.us",
+        "testnet.binancefuture.com",
+        "binance.vision",
+        "www.binance.vision",
+        "x.data.binance.vision",
+        "api.kraken.com",
+        "kraken.com",
+    ],
+)
+def test_every_other_host_of_those_companies_stays_barred(host: str) -> None:
+    assert is_prohibited_host(host) is True
+    with pytest.raises(ForbiddenHostError):
+        check_url(f"https://{host}/data/futures/um/daily/klines/BTCUSDT/1m/x.zip", ALLOWED_HOSTS)
+
+
+def test_the_route_belongs_to_one_named_source() -> None:
+    url = f"{ROUTE}/daily/klines/BTCUSDT/1m/BTCUSDT-1m-2026-03-01.zip"
+    assert route_problem("binance", url) is None
+    assert route_problem("mirror", url) is not None
+    assert route_problem("binance", "https://data.binance.vision/data/spot") is not None
+
+
+def test_a_source_cannot_point_its_base_elsewhere(tmp_path: Path) -> None:
+    for other in ("/data/spot", "/data/futures/cm", "/data/futures/um/../cm"):
+        text = SHIPPED.replace(
+            f'archive_base = "{ROUTE}"', f'archive_base = "https://data.binance.vision{other}"'
+        )
+        assert text != SHIPPED
+        with pytest.raises(ConfigError):
+            load(tmp_path, text)
+
+
+def test_another_source_on_the_approved_host_is_a_config_error(tmp_path: Path) -> None:
+    start, end = _section("bybit")
+    block = SHIPPED[start:end].replace("https://public.bybit.com/trading", ROUTE, 1)
+    with pytest.raises(ConfigError):
+        load(tmp_path, SHIPPED[:start] + block + SHIPPED[end:])
+
+
+def test_a_live_dataset_on_an_archive_only_source_is_a_config_error(tmp_path: Path) -> None:
+    """Its terms bar live execution and signals, so no live path may read from it."""
+    start = SHIPPED.index('id = "binance.klines"')
+    end = SHIPPED.index("[[datasets]]", start)
+    block = SHIPPED[start:end].replace("live_eligible = false", "live_eligible = true", 1)
+    with pytest.raises(ConfigError, match="archive research only"):
+        load(tmp_path, SHIPPED[:start] + block + SHIPPED[end:])
+
+
+def test_the_poll_cannot_be_pointed_at_an_archive_only_source(tmp_path: Path) -> None:
+    text = SHIPPED.replace('venue = "kraken"', 'venue = "binance"', 1)
+    assert text != SHIPPED
+    with pytest.raises(ConfigError):
+        load(tmp_path, text)
+
+
+# ---- each route in F-10's table, now for the source D-23 rules out
+# ----------------------------------------------------
 
 
 def test_route_0_flipping_the_flag_alone_is_a_config_error(tmp_path: Path) -> None:
-    text = _edit_source("binance", "enabled = false", "enabled = true")
+    text = _edit_source("kraken", "enabled = false", "enabled = true")
     with pytest.raises(ConfigError, match="prohibited"):
         load(tmp_path, text)
 
 
 def test_route_1_deleting_the_ban_and_enabling_is_a_config_error(tmp_path: Path) -> None:
     """The ban is in code too. Removing the line from a file cannot lift it."""
-    text = _edit_source("binance", "enabled = false", "enabled = true")
-    start, end = text.index("[sources.binance]\n"), text.index("\n[", text.index("[sources.binance]\n") + 1)
+    text = _edit_source("kraken", "enabled = false", "enabled = true")
+    start, end = text.index("[sources.kraken]\n"), text.index("\n[", text.index("[sources.kraken]\n") + 1)
     block = "\n".join(line for line in text[start:end].splitlines() if not line.startswith("prohibited"))
     with pytest.raises(ConfigError):
         load(tmp_path, text[:start] + block + text[end:])
 
 
 def test_route_1b_setting_the_ban_to_false_is_a_config_error(tmp_path: Path) -> None:
-    text = _edit_source("binance", "enabled = false", "enabled = true")
-    text = text.replace("prohibited = true", "prohibited = false", 1)
+    text = _edit_source("kraken", "prohibited = true", "prohibited = false")
+    with pytest.raises(ConfigError, match="prohibited"):
+        load(tmp_path, text)
+    text = text.replace("enabled = false", "enabled = true")
     with pytest.raises(ConfigError):
         load(tmp_path, text)
 
 
 def test_route_2_a_string_for_the_ban_is_a_config_error(tmp_path: Path) -> None:
     """`bool("")` is false, so this used to lift the ban."""
-    text = _edit_source("binance", "prohibited = true", 'prohibited = ""')
+    text = _edit_source("kraken", "prohibited = true", 'prohibited = ""')
     with pytest.raises(ConfigError, match="true or false"):
         load(tmp_path, text)
 
@@ -94,15 +293,15 @@ def test_route_2_a_string_for_the_ban_is_a_config_error(tmp_path: Path) -> None:
 def test_route_3_another_source_on_a_prohibited_host_is_a_config_error(tmp_path: Path) -> None:
     start, end = _section("bybit")
     block = SHIPPED[start:end].replace("enabled = false", "enabled = true", 1)
-    block = block.replace("https://public.bybit.com", "https://data.binance.vision", 1)
-    assert "data.binance.vision" in block
+    block = block.replace("https://public.bybit.com", "https://api.kraken.com", 1)
+    assert "api.kraken.com" in block
     with pytest.raises(ConfigError, match="prohibited"):
         load(tmp_path, SHIPPED[:start] + block + SHIPPED[end:])
 
 
 @pytest.mark.parametrize(
     "host",
-    ["data.binance.vision", "DATA.BINANCE.VISION", "api.binance.com", "x.binance.us", "binancefuture.com"],
+    ["api.kraken.com", "API.KRAKEN.COM", "api.binance.com", "x.binance.us", "binancefuture.com"],
 )
 def test_route_4_a_new_source_on_a_prohibited_host_is_a_config_error(tmp_path: Path, host: str) -> None:
     start, end = _section("bybit")
@@ -129,7 +328,7 @@ def test_route_5b_a_file_named_by_the_variable_gets_every_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (tmp_path / "pipeline.toml").write_text(
-        _edit_source("binance", "enabled = false", "enabled = true"), encoding="utf-8"
+        _edit_source("kraken", "enabled = false", "enabled = true"), encoding="utf-8"
     )
     monkeypatch.setenv("HFT_CONFIG_DIR", str(tmp_path))
     with pytest.raises(ConfigError, match="prohibited"):
@@ -137,15 +336,23 @@ def test_route_5b_a_file_named_by_the_variable_gets_every_check(
 
 
 @pytest.mark.parametrize(
-    "hosts", [ALLOWED_HOSTS, frozenset({"data.binance.vision"}), ALLOWED_HOSTS | {"data.binance.vision"}]
+    "hosts", [ALLOWED_HOSTS, frozenset({"api.kraken.com"}), ALLOWED_HOSTS | {"api.kraken.com"}]
 )
 def test_route_6_code_cannot_hand_the_client_a_prohibited_host(tmp_path: Path, hosts: frozenset[str]) -> None:
     fetcher = HttpFetcher(base_config().fetch, allowed_hosts=hosts)
-    url = f"{BANNED_URL}/daily/x.zip"
     with pytest.raises(ForbiddenHostError):
-        fetcher.get_bytes(url, 10)
+        fetcher.get_bytes(BANNED_URL, 10)
     with pytest.raises(ForbiddenHostError):
-        fetcher.download(url, tmp_path / "x", 10)
+        fetcher.download(BANNED_URL, tmp_path / "x", 10)
+
+
+def test_route_6b_code_cannot_hand_the_client_the_approved_host_off_its_route(tmp_path: Path) -> None:
+    fetcher = HttpFetcher(base_config().fetch, allowed_hosts=frozenset({"data.binance.vision"}))
+    spot = "https://data.binance.vision/data/spot/daily/klines/BTCUSDT/1m/x.zip"
+    with pytest.raises(ForbiddenHostError):
+        fetcher.get_bytes(spot, 10)
+    with pytest.raises(ForbiddenHostError):
+        fetcher.download(spot, tmp_path / "x", 10)
 
 
 @pytest.mark.parametrize("value", ['"false"', '"true"', '"no"', "0", "1"])
@@ -199,26 +406,43 @@ def test_the_benchmark_venue_must_be_usable(tmp_path: Path) -> None:
         load(tmp_path, SHIPPED.replace('benchmark_venue = ""', 'benchmark_venue = "bybit"', 1))
 
 
-def test_a_shipped_source_with_every_flag_as_given_cannot_reach_a_prohibited_host_by_name() -> None:
+def test_a_source_named_as_prohibited_stays_unusable_with_its_flags_changed_in_memory() -> None:
     config = base_config()
-    from dataclasses import replace
-
+    assert {"kraken"} == set(PROHIBITED_SOURCES)
     enabled_but_named = replace(
         config,
         sources={
             **config.sources,
-            "binance": replace(config.source("binance"), enabled=True, prohibited=False),
+            "kraken": replace(config.source("kraken"), enabled=True, prohibited=False),
         },
     )
-    assert not enabled_but_named.source_usable("binance")
-    assert "data.binance.vision" not in enabled_but_named.enabled_hosts()
+    assert not enabled_but_named.source_usable("kraken")
+    assert "api.kraken.com" not in enabled_but_named.enabled_hosts()
+
+
+def test_the_approved_source_stays_unusable_off_its_route_with_its_url_changed_in_memory() -> None:
+    config = base_config()
+    moved = replace(
+        config.source("binance"),
+        enabled=True,
+        urls={"archive_base": "https://data.binance.vision/data/spot"},
+    )
+    changed = replace(config, sources={**config.sources, "binance": moved})
+    assert not changed.source_usable("binance")
+    assert changed.enabled_hosts() == frozenset()
 
 
 @pytest.mark.parametrize(
     ("host", "banned"),
     [
-        ("data.binance.vision", True),
+        ("data.binance.vision", False),
+        # The door is opened for one exact name. Any other spelling of it stays under the domain's ban.
         ("DATA.binance.VISION.", True),
+        ("binance.vision", True),
+        ("x.binance.vision", True),
+        ("kraken.com", True),
+        ("api.kraken.com", True),
+        ("notkraken.com", False),
         ("binance.com", True),
         ("fapi.binance.com", True),
         ("notbinance.com", False),
@@ -265,7 +489,7 @@ def test_a_plain_allowed_url_passes() -> None:
 
 def test_a_prohibited_host_is_refused_even_if_someone_puts_it_on_the_list() -> None:
     with pytest.raises(ForbiddenHostError, match="prohibited"):
-        check_url(f"{BANNED_URL}/x", frozenset({"data.binance.vision"}))
+        check_url(BANNED_URL, frozenset({"api.kraken.com"}))
 
 
 # ---- redirects, which no test used to cover: removing the check survived mutation
@@ -345,8 +569,6 @@ def offline_opener(network: _Network) -> urllib.request.OpenerDirector:
 
 
 def client(routes: dict[str, _Response | Exception], *, attempts: int = 3) -> tuple[HttpFetcher, _Network]:
-    from dataclasses import replace
-
     network = _Network(routes)
     limits = replace(base_config().fetch, attempts=attempts, backoff_s=0.0)
     fetcher = HttpFetcher(limits, allowed_hosts=ALLOWED, sleep=lambda _: None)
@@ -357,11 +579,49 @@ def client(routes: dict[str, _Response | Exception], *, attempts: int = 3) -> tu
 GOOD = "https://public.bybit.com/x"
 
 
-def test_the_guard_below_every_http_library_is_on() -> None:
-    """The suite's own network guard, in tests/conftest.py. A real client gets no further than this."""
+def test_the_guard_below_every_http_library_is_on_and_the_client_cannot_swallow_it() -> None:
+    """N-06. The alarm comes through the client's own catch as itself, and does not become a FetchError."""
     fetcher = HttpFetcher(base_config().fetch, allowed_hosts=ALLOWED, sleep=lambda _: None)
-    with pytest.raises(FetchError, match="network"):
+    with pytest.raises(NetworkTouched):
         fetcher.get_bytes(GOOD, 100)
+
+
+def test_the_guard_refuses_every_way_into_a_socket() -> None:
+    """N-06. The routes the recheck found past the old guard. Nothing listens at this address anyway."""
+    import _socket
+    import socket
+
+    address = ("127.0.0.1", 9)
+    calls: list[Callable[[], object]] = [
+        lambda: socket.socket().connect(address),
+        lambda: _socket.socket().connect(address),
+        lambda: socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"x", address),
+        lambda: socket.gethostbyname("localhost"),
+        lambda: socket.getaddrinfo("localhost", 9),
+        lambda: socket.gethostbyaddr("127.0.0.1"),
+        lambda: socket.create_connection(address, timeout=0.1),
+    ]
+    for call in calls:
+        with pytest.raises(NetworkTouched):
+            call()
+
+
+@pytest.mark.parametrize("program", ["curl", "wget", "gh", "ssh", "nc", "scp", "powershell"])
+def test_the_guard_refuses_a_program_that_could_reach_a_network(program: str) -> None:
+    with pytest.raises(NetworkTouched):
+        subprocess.run([program, "--version"], capture_output=True, check=False)
+
+
+def test_a_python_child_carries_the_same_guard() -> None:
+    script = "import socket; socket.socket().connect(('127.0.0.1', 9))"
+    done = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False, timeout=60
+    )
+    assert done.returncode != 0
+    assert "NetworkTouched" in done.stderr
+    # Children see a dead proxy, and git may use local paths only.
+    assert os.environ["GIT_ALLOW_PROTOCOL"] == "file"
+    assert os.environ["HTTPS_PROXY"].startswith("http://127.0.0.1")
 
 
 @pytest.mark.parametrize(
@@ -451,7 +711,6 @@ def test_a_refusal_by_the_host_is_not_retried(code: int) -> None:
         ConnectionResetError("reset"),
         OSError("disk or socket"),
         ValueError("not a number"),
-        zlib.error("not this layer, but it must not end the run"),
     ],
     ids=lambda e: type(e).__name__,
 )
@@ -463,6 +722,19 @@ def test_every_kind_of_broken_response_is_retried_and_then_a_fetch_error(error: 
     assert len(network.seen) == 3
 
 
+@pytest.mark.parametrize(
+    "error",
+    [TypeError("bad argument"), AttributeError("no such name"), KeyError("x"), ZeroDivisionError("bug")],
+    ids=lambda e: type(e).__name__,
+)
+def test_a_programming_error_is_not_dressed_up_as_a_host_failure(error: Exception) -> None:
+    """N-09. A bug here used to spend three attempts and a backoff, and then read as a failed download."""
+    fetcher, network = client({GOOD: error}, attempts=3)
+    with pytest.raises(type(error)):
+        fetcher.get_bytes(GOOD, 100)
+    assert len(network.seen) == 1
+
+
 def test_a_retry_succeeds_when_the_host_recovers() -> None:
     class Flaky(_Network):
         def _serve(self, request: urllib.request.Request) -> _Response:
@@ -472,8 +744,6 @@ def test_a_retry_succeeds_when_the_host_recovers() -> None:
             return _Response(b"good", url=request.full_url)
 
         https_open = _serve
-
-    from dataclasses import replace
 
     network = Flaky({})
     fetcher = HttpFetcher(
@@ -506,3 +776,9 @@ def test_a_short_or_unreadable_length_fails_the_attempt(tmp_path: Path, declared
 def test_the_retention_rule_for_raw_ships_unreviewed() -> None:
     """A writer does not approve its own rule. data-steward confirms it after the fixes are reviewed."""
     assert load_retention_policy(REPO_ROOT / "configs").rule("raw-archive-after-curated").reviewed is False
+
+
+def test_the_state_of_a_candle_allowance_is_one_of_two_words(tmp_path: Path) -> None:
+    text = SHIPPED.replace('candle_allowance_state = "declared"', 'candle_allowance_state = "guessed"', 1)
+    with pytest.raises(ConfigError, match="candle_allowance_state"):
+        load(tmp_path, text)

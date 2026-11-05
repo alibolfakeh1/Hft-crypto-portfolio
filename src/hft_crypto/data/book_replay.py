@@ -11,6 +11,7 @@ import io
 import json
 import math
 import zipfile
+import zlib
 from bisect import bisect_left, insort
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -189,5 +190,5 @@ def replay_zip(path: str | Path) -> BookReplayResult:
             with archive.open(members[0]) as raw:
                 buffered = io.BufferedReader(cast(Any, raw), buffer_size=1024 * 1024)
                 return replay_stream(buffered)
-    except (zipfile.BadZipFile, EOFError, OSError, RuntimeError) as exc:
+    except (zipfile.BadZipFile, zlib.error, EOFError, OSError, RuntimeError) as exc:
         raise ValidationError(f"unreadable zip: {exc}") from exc

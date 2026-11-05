@@ -5,11 +5,12 @@ from __future__ import annotations
 import datetime as dt
 import os
 import re
+from collections.abc import Collection, Mapping
 from enum import StrEnum
 from pathlib import Path
 
 from hft_crypto.data.guard import PathGuard, canonical_rel_path, is_link
-from hft_crypto.timeutil import month_key
+from hft_crypto.timeutil import month_key, next_month
 
 ZONE_DIRS = (
     "raw/archive",
@@ -23,6 +24,10 @@ ZONE_DIRS = (
     "catalog",
 )
 SYNTHETIC_MARKER = "catalog/SYNTHETIC"
+# CHECK_ROOT, for dates nobody may read yet. Nothing opens it but the coverage check (leak recheck, FP-01).
+ROOT_KIND = "ROOT_KIND"
+COVERAGE_OUTPUT = "coverage/coverage_check.json"
+CANDLE_CHECK_OUTPUT = "coverage/candle_check.json"
 _COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
@@ -85,10 +90,39 @@ def measure_zones(root: DataRoot) -> dict[str, int]:
     return {zone: _directory_size(root.guard.check(zone)) for zone in MEASURED_ZONES}
 
 
+def persisted_bytes(zones: Mapping[str, int], persisted: Collection[str]) -> int:
+    """Bytes that survive between runs. Raw and quarantine leave with the runner, so they spend no cache
+    budget."""
+    return sum(size for zone, size in zones.items() if zone in persisted)
+
+
+def part_period(part: Path) -> tuple[dt.date, dt.date] | None:
+    """The first and last day a part file covers, read from its name, or None for a name that is neither.
+
+    A part is named for a day or a month. Anything else is a stray that no job wrote, and it must not stop
+    one.
+    """
+    stem = part.stem.removeprefix("part-")
+    try:
+        if len(stem) == 10:
+            day = dt.date.fromisoformat(stem)
+            return day, day
+        if len(stem) == 7:
+            first = dt.date.fromisoformat(f"{stem}-01")
+            return first, next_month(first) - dt.timedelta(days=1)
+    except ValueError:
+        return None
+    return None
+
+
 def _safe(component: str) -> str:
     if _COMPONENT.match(component) is None:
         raise DataRootError(f"unsafe path component: {component!r}")
     return component
+
+
+def _is_check_root(path: Path) -> bool:
+    return any((path / name).is_file() for name in (ROOT_KIND, COVERAGE_OUTPUT, CANDLE_CHECK_OUTPUT))
 
 
 class DataRoot:
@@ -96,7 +130,9 @@ class DataRoot:
 
     def __init__(self, root: str | Path, *, create: bool = True) -> None:
         path = Path(root)
-        _refuse_inside_repository(path)
+        refuse_inside_repository(path)
+        if _is_check_root(path):
+            raise DataRootError("this folder is a check root for unopened dates, and only the check opens it")
         if create:
             path.mkdir(parents=True, exist_ok=True)
         self.guard = PathGuard(path)
@@ -109,6 +145,15 @@ class DataRoot:
     def is_synthetic(self) -> bool:
         """True for a root holding generated data. Every output from it is labelled SYNTHETIC."""
         return self.guard.check(SYNTHETIC_MARKER).is_file()
+
+    @property
+    def is_unopened(self) -> bool:
+        """True for a check root. Its output says so too, so losing one file does not open it."""
+        return _is_check_root(self.path)
+
+    def refuse_unopened(self, what: str) -> None:
+        if self.is_unopened:
+            raise DataRootError(f"this root holds unopened dates, so {what} cannot open it")
 
     @property
     def catalog_path(self) -> Path:
@@ -161,7 +206,7 @@ class DataRoot:
         return self.guard.check(Path("quarantine") / name.parent / f"{stamp}-{name.name}")
 
 
-def _refuse_inside_repository(path: Path) -> None:
+def refuse_inside_repository(path: Path) -> None:
     """Refuse a DATA_ROOT inside a git work tree, because market data must never get near a commit."""
     # Both the path as written and where it really leads, so a link into a work tree cannot get past this.
     for start in (Path(os.path.normpath(path.absolute())), Path(os.path.realpath(path))):

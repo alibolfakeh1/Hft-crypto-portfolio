@@ -12,18 +12,20 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
+from http.client import HTTPException
 from pathlib import Path
 from typing import Protocol
 
 from hft_crypto import __version__
-from hft_crypto.config import FetchConfig, is_prohibited_host
+from hft_crypto.config import APPROVED_ROUTES, FetchConfig, is_prohibited_host
 
-# The outer limit, whatever a configuration says. A prohibited host is refused separately, and first.
+# The outer limit, whatever a configuration says. A prohibited host is refused separately, and first. A host
+# with an approved route is open only along that route.
 ALLOWED_HOSTS = frozenset(
     {
+        "data.binance.vision",
         "public.bybit.com",
         "quote-saver.bycsi.com",
-        "api.kraken.com",
     }
 )
 _USER_AGENT = f"hft-crypto/{__version__} (public research data pipeline)"
@@ -72,6 +74,11 @@ def check_url(url: str, allowed: frozenset[str]) -> None:
         raise ForbiddenHostError(f"refused URL: {parsed.hostname} is prohibited")
     if parsed.scheme != "https" or parsed.hostname not in allowed:
         raise ForbiddenHostError(f"refused URL: {parsed.scheme}://{parsed.hostname}")
+    route = APPROVED_ROUTES.get(parsed.hostname)
+    if route is not None and (parsed.query or parsed.fragment or not route.file_path.fullmatch(parsed.path)):
+        raise ForbiddenHostError(
+            f"refused URL: {parsed.path} is outside the approved route of {parsed.hostname}"
+        )
 
 
 class _CheckedRedirects(urllib.request.HTTPRedirectHandler):
@@ -125,12 +132,9 @@ class HttpFetcher:
                 if exc.code in (403, 451):
                     raise FetchError(f"HTTP {exc.code} from {_host(url)}") from exc
                 last_error = exc
-            except (ForbiddenHostError, FetchError):
-                raise
-            except Exception as exc:
-                # A broken response raises from several families, some with no base but Exception: an
-                # incomplete read, a bad status line, a Content-Length that is not a number. All are one more
-                # failed attempt.
+            except (OSError, EOFError, ValueError, HTTPException) as exc:
+                # A broken response, in each of the families it can come from. Anything else is a bug in our
+                # own code, and must not read as a host failing.
                 last_error = exc
         raise FetchError(f"{_host(url)}: {last_error}") from last_error
 

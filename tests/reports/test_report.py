@@ -59,7 +59,7 @@ def config() -> PipelineConfig:
             symbols=SYMBOLS,
             datasets=tuple(replace(spec, start=FIRST) for spec in base.datasets),
             timeframes_minutes=(60, 1440),
-            report=replace(base.report, benchmark_venue="generated"),
+            report=replace(base.report, benchmark_venue="generated", span_start=FIRST),
         )
     )
 
@@ -237,20 +237,96 @@ def test_a_lost_cache_shows_partial_coverage(tmp_path: Path) -> None:
     assert status["partial_coverage"] is True
     html = (tmp_path / "out" / "site" / "index.html").read_text(encoding="utf-8")
     assert "PARTIAL COVERAGE" in html
-    assert status["benchmarks"]["BTCUSDT"]["days"] == 1.0
-    assert status["benchmarks"]["BTCUSDT"]["start"] == "2026-03-03T00:00:00Z"
+    btc = status["benchmarks"]["BTCUSDT"]
+    assert btc["days"] == 1.0
+    assert btc["start"] == "2026-03-03T00:00:00Z"
+    assert btc["days_in_span"] == 3
+    assert btc["days_used"] == 1
+    assert btc["days_excluded"] == 0
+    assert btc["days_without_data"] == 2
 
 
-def test_a_hole_in_history_is_not_bridged_by_a_multi_day_return(tmp_path: Path) -> None:
-    """Day 3 does not exist. Statistics must use only the unbroken run at the end."""
+def test_a_hole_in_history_is_never_a_one_day_return_and_does_not_move_the_span(tmp_path: Path) -> None:
+    """DR-08. Statistics used to keep only the newest unbroken run, so a hole chose what they covered, and one
+    fault flipped a benchmark's sign in the audit's probe. Day 3 does not exist, and its neighbours stay
+    provisional."""
     days = {0: 100.0, 1: 100.0, 3: 120.0, 4: 120.0, 5: 120.0}
     ctx = _deliver(tmp_path / "r", days, dt.datetime(2026, 3, 7, 10, tzinfo=dt.UTC))
     status = report(ctx, tmp_path / "out")
     btc = status["benchmarks"]["BTCUSDT"]
-    assert btc["days"] == 1.0
-    assert btc["start"] == "2026-03-05T00:00:00Z"
-    assert btc["total_return"] == pytest.approx(0.0)
-    assert btc["missing_days_before_start"] is True
+    assert btc["start"] == "2026-03-01T00:00:00Z"
+    assert btc["end"] == "2026-03-06T00:00:00Z"
+    # From the first open to the last close, across the hole, over the calendar days between them.
+    assert btc["total_return"] == pytest.approx(0.20)
+    assert btc["days"] == 5.0
+    # Only the first day's open to close. No pair of adjacent days is left, so nothing bridges the hole.
+    assert btc["daily_returns"] == 1
+    assert btc["annualised_volatility"] is None
+    assert btc["days_in_span"] == 5
+    assert btc["days_used"] == 2
+    assert btc["days_excluded"] == 0
+    assert btc["days_without_data"] == 3
+    assert "missing_days_before_start" not in btc
+
+
+def test_a_fault_at_the_start_of_the_span_cannot_change_where_it_starts(tmp_path: Path) -> None:
+    """DR-08, in the audit's own shape: a window restarted after a bad day says something else entirely."""
+    fetcher = FakeFetcher()
+    for symbol in SYMBOLS:
+        _publish_one_bad_price(fetcher, symbol, FIRST, 100.0, 1000.0)
+        for offset, price in {1: 90.0, 2: 80.0, 3: 110.0, 4: 110.0}.items():
+            publish_day(fetcher, symbol, FIRST + dt.timedelta(days=offset), price)
+    ctx = make_context(tmp_path / "r", now=dt.datetime(2026, 3, 6, 10, tzinfo=dt.UTC), config=config())
+    run_ingest(
+        ctx, fetcher, IngestOptions(dataset_ids=("generated.klines", "generated.aggTrades"), symbols=SYMBOLS)
+    )
+    btc = report(ctx, tmp_path / "out")["benchmarks"]["BTCUSDT"]
+    assert btc["span_start"] == FIRST.isoformat()
+    assert btc["days_excluded"] == 1
+    assert btc["days_in_span"] == 4
+    assert btc["days_used"] == 3
+
+
+def test_the_declared_span_starts_where_it_says_whatever_is_on_disk(tmp_path: Path) -> None:
+    ctx = build(tmp_path / "r")
+    later = FIRST + dt.timedelta(days=1)
+    ctx.config = replace(ctx.config, report=replace(ctx.config.report, span_start=later))
+    btc = report(ctx, tmp_path / "out")["benchmarks"]["BTCUSDT"]
+    assert btc["start"] == f"{later.isoformat()}T00:00:00Z"
+    assert btc["days_in_span"] == 2
+
+
+def test_the_benchmark_ends_at_the_last_opened_date(tmp_path: Path) -> None:
+    """Item 6: the span ends there, however much is on disk and however late the report runs."""
+    ctx = build(tmp_path / "r")
+    ctx.config = replace(ctx.config, last_opened_date=FIRST + dt.timedelta(days=1))
+    status = report(ctx, tmp_path / "out")
+    btc = status["benchmarks"]["BTCUSDT"]
+    assert btc["end"] == "2026-03-03T00:00:00Z"
+    assert btc["span_end"] == "2026-03-02"
+    assert btc["days_in_span"] == 2
+    # Closes of 100 and then 110, and the 99 and the 500 on disk are past the guard.
+    assert btc["total_return"] == pytest.approx(0.10)
+    assert btc["newest_day_provisional"] is False
+    assert status["last_opened_date"] == "2026-03-02"
+
+
+def test_a_reconciliation_past_the_guard_is_not_counted(tmp_path: Path) -> None:
+    ctx = build(tmp_path / "r")
+    wide = report(ctx, tmp_path / "out")["reconciliation"]["official_candles"]["days"]
+    ctx.config = replace(ctx.config, last_opened_date=FIRST)
+    assert report(ctx, tmp_path / "out2")["reconciliation"]["official_candles"]["days"] < wide
+
+
+def test_a_newer_day_says_provisional_only_as_of_the_stated_time(tmp_path: Path) -> None:
+    """The one mutant of the audit's 30 that passed everything: daily bars read with no as-of filter."""
+    ctx = build(tmp_path / "r")
+    assert report(ctx, tmp_path / "late")["benchmarks"]["BTCUSDT"]["newest_day_provisional"] is True
+    # At this moment the bar after the last counted one is on disk, and it is not yet knowable.
+    ctx.now = lambda: dt.datetime(2026, 3, 4, 0, 0, tzinfo=dt.UTC)
+    btc = report(ctx, tmp_path / "out")["benchmarks"]["BTCUSDT"]
+    assert btc["end"] == "2026-03-03T00:00:00Z"
+    assert btc["newest_day_provisional"] is False
 
 
 # ---- only a whole, passing day counts
@@ -287,7 +363,12 @@ def test_a_slipped_digit_cannot_reach_the_published_statistics(tmp_path: Path) -
     btc = status["benchmarks"]["BTCUSDT"]
     assert btc["total_return"] == pytest.approx(0.0)
     assert btc["max_drawdown"] == pytest.approx(0.0)
-    assert btc["start"] == "2026-03-04T00:00:00Z"
+    # The bad day is a hole, and the span still starts where it was declared to.
+    assert btc["start"] == "2026-03-01T00:00:00Z"
+    assert btc["days_excluded"] == 1
+    assert btc["days_used"] == 4
+    assert btc["days_in_span"] == 5
+    assert btc["daily_returns"] == 3
     assert status["reconciliation"]["exclusions"] == 2
     assert any("left out of results" in alert for alert in status["health"]["alerts"])
     html = (tmp_path / "out" / "site" / "index.html").read_text(encoding="utf-8")
@@ -300,6 +381,7 @@ def test_the_newest_day_is_not_counted_until_it_is_final(tmp_path: Path) -> None
     btc = status["benchmarks"]["BTCUSDT"]
     assert btc["end"] == "2026-03-04T00:00:00Z"
     assert btc["newest_day_provisional"] is True
+    assert btc["span_end"] == "2026-03-03"
 
 
 def _drop_marks(ctx: JobContext, day: dt.date) -> None:
@@ -360,18 +442,18 @@ def _with_venue(root_config: PipelineConfig, venue: str | None) -> PipelineConfi
 
 
 def test_a_prohibited_venue_is_never_published_even_with_its_files_on_disk(tmp_path: Path) -> None:
-    """F-12. With that venue as the benchmark, a report exited 0 and said data_kind MARKET, venue binance."""
+    """F-12. With a banned venue as the benchmark, a report exited 0 and said data_kind MARKET."""
     ctx = build(tmp_path / "r")
     base = ctx.config
     banned = replace(
         base,
-        sources={**base.sources, "binance": base_config().source("binance")},
-        report=replace(base.report, benchmark_venue="binance"),
+        sources={**base.sources, "kraken": base_config().source("kraken")},
+        report=replace(base.report, benchmark_venue="kraken"),
     )
     for dataset in ("bars_1d", "bars_1h"):
         for part in ctx.root.curated_parts(dataset, "generated", "BTCUSDT"):
             target = ctx.root.guard.check(
-                part.relative_to(ctx.root.path).as_posix().replace("venue=generated", "venue=binance")
+                part.relative_to(ctx.root.path).as_posix().replace("venue=generated", "venue=kraken")
             )
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(part.read_bytes())
@@ -674,6 +756,78 @@ def test_a_day_that_only_warned_is_left_out_of_results(tmp_path: Path) -> None:
     assert daily["complete"].to_list() == [True]
     status = report(ctx, tmp_path / "out")
     btc = status["benchmarks"]["BTCUSDT"]
-    assert btc["start"] == "2026-03-03T00:00:00Z"
-    assert btc["missing_days_before_start"] is True
+    # A warned day is a hole now, and the span keeps its start.
+    assert btc["start"] == "2026-03-01T00:00:00Z"
+    assert btc["days_excluded"] == 1
+    assert btc["days_used"] == 3
+    assert btc["days_in_span"] == 4
     assert status["reconciliation"]["exclusions"] == 2
+
+
+def test_a_poll_log_saying_generated_cannot_enter_a_report_on_real_data(tmp_path: Path) -> None:
+    """N-07. Whatever became of that root's marker, the log line itself says what it is about."""
+    ctx = build(tmp_path / "r")
+    log = tmp_path / "poll.jsonl"
+    log.write_text(
+        json.dumps({"job_started_at": "2026-03-04T09:00:00Z", "data_kind": "SYNTHETIC", "run_id": "x"})
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="SYNTHETIC"):
+        report(ctx, tmp_path / "out", poll_logs=(log,))
+    assert not (tmp_path / "out").exists() or not list((tmp_path / "out").rglob("status.json"))
+
+
+def test_a_catalog_that_says_generated_needs_the_marker_whatever_the_datasets_say(tmp_path: Path) -> None:
+    ctx = make_context(tmp_path / "r", now=DEFAULT_NOW)
+    assert ctx.catalog.holds_generated_data() is False
+    ctx.catalog.set_meta("data_kind", "SYNTHETIC")
+    assert ctx.catalog.holds_generated_data() is True
+
+
+def test_the_polls_own_storage_alerts_reach_the_page_and_the_status(tmp_path: Path) -> None:
+    """R3.4. The poll's root has its own quota, and only its own run log reports it."""
+    ctx = build(tmp_path / "r")
+    log = tmp_path / "poll.jsonl"
+    log.write_text(
+        json.dumps(
+            {
+                "run_id": "a",
+                "job_started_at": "2026-03-04T09:00:00Z",
+                "delay_s": 1.0,
+                "missed_slots": 0,
+                "duration_s": 1.0,
+                "status": "ok",
+                "caught_up": True,
+                "gaps": [],
+                "symbols": {},
+                "storage_used_pct": 83.5,
+                "watermark_level": "stop_backfill",
+                "alerts": ["Storage at 83.5%. New backfills stopped."],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    status = report(ctx, tmp_path / "out", poll_logs=(log,))
+    assert status["live_poll"]["storage_used_pct"] == 83.5
+    assert "Hourly poll: Storage at 83.5%. New backfills stopped." in status["health"]["alerts"]
+
+
+def test_the_quarantine_record_leaves_with_the_report(tmp_path: Path) -> None:
+    """R4.2. The bad files leave with the runner, so this record is the evidence a reviewer has."""
+    ctx = build(tmp_path / "r")
+    path = ctx.root.guard.check("catalog/quarantine.jsonl")
+    path.write_text(
+        json.dumps({"time": "2026-03-04T09:00:00Z", "reason": "validation"}) + "\n", encoding="utf-8"
+    )
+    report(ctx, tmp_path / "out")
+    assert (tmp_path / "out" / "results" / "run_log" / "quarantine.jsonl").read_text(
+        encoding="utf-8"
+    ) == path.read_text(encoding="utf-8")
+
+
+def test_a_source_with_no_credit_to_give_prints_none(tmp_path: Path) -> None:
+    ctx = build(tmp_path / "r")
+    status = report(ctx, tmp_path / "out")
+    assert status["attributions"] == []

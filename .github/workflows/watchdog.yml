@@ -1,10 +1,10 @@
 name: Watchdog
 
-# Checks the last result on the results branch, and alerts the owner through Telegram if it is old, says its data is
-# stale, or carries alerts. The same message is sent once, and a change sends again.
-# It alerts only when the Telegram secrets are set. Without them, or before the branch exists, it writes a note to the
-# run summary and succeeds, so it stays harmless and quiet. It never fails the run, to avoid mail about itself.
-# It runs on the same platform as everything else, so a GitHub outage can silence it too.
+# Checks the last result on the results branch, and alerts the owner through Telegram. The logic is in
+# .github/scripts/watchdog.py, which says what it does in each case and uses the standard library only.
+# It fails the run when an alert could not be delivered, and never because of bad data in the result, which is itself
+# something to report. Set the repository variable WATCHDOG_EXPECT_RESULT_AFTER to a UTC time to have "no result"
+# alert from then on, in place of waiting for it to have been missing longer than the age limit.
 
 on:
   schedule:
@@ -23,6 +23,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Remember what was last sent
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -30,76 +33,14 @@ jobs:
           key: watchdog-v1-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: watchdog-v1-
       - name: Check the last result
-        id: check
         env:
           GH_TOKEN: ${{ github.token }}
           MAX_AGE_HOURS: ${{ vars.WATCHDOG_MAX_AGE_HOURS || '48' }}
+          WATCHDOG_EXPECT_RESULT_AFTER: ${{ vars.WATCHDOG_EXPECT_RESULT_AFTER }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_OWNER_IDS: ${{ secrets.TELEGRAM_OWNER_IDS }}
           STATE_DIR: ${{ runner.temp }}/watchdog
-        run: |
-          note() { echo "$1" >> "$GITHUB_STEP_SUMMARY"; echo "$1"; }
-          mkdir -p "$STATE_DIR"
-          status=$(gh api "repos/$GITHUB_REPOSITORY/contents/status.json?ref=results" \
-            -H "Accept: application/vnd.github.raw+json" 2>/dev/null) || status=""
-          generated_at=$(printf '%s' "$status" | jq -r '.generated_at // empty' 2>/dev/null) || generated_at=""
-          if [ -z "$generated_at" ]; then
-            note "No result on the results branch yet, so there is nothing to check."
-            exit 0
-          fi
-          # A bad date must not fail this step, because it never fails. It counts as stale.
-          now=$(date -u +%s)
-          if then_s=$(date -u -d "$generated_at" +%s 2>/dev/null); then
-            age_hours=$(( (now - then_s) / 3600 ))
-          else
-            age_hours=$(( MAX_AGE_HOURS + 1 ))
-            note "The last result has an unreadable time: $generated_at"
-          fi
-          reported_stale=$(printf '%s' "$status" | jq -r '.stale // false' 2>/dev/null) || reported_stale="false"
-          alerts=$(printf '%s' "$status" | jq -r '(.health.alerts // [])[]' 2>/dev/null) || alerts=""
-          note "Last result: $generated_at, $age_hours hours ago. Limit: $MAX_AGE_HOURS hours."
-          text=""
-          if [ "$age_hours" -gt "$MAX_AGE_HOURS" ]; then
-            text="The last result on the results branch is $age_hours hours old (limit $MAX_AGE_HOURS)."
-          elif [ "$reported_stale" = "true" ]; then
-            text="The newest result says its own data is stale."
-          fi
-          if [ -n "$alerts" ]; then
-            text="$text
-          Alerts:
-          $alerts"
-          fi
-          # The same message is sent once. A change sends again, and silence is a real all-clear.
-          digest=$(printf '%s' "$text" | sha256sum | cut -d' ' -f1)
-          last=$(cat "$STATE_DIR/last_digest" 2>/dev/null) || last=""
-          if [ -z "$text" ]; then
-            printf '%s' "$digest" > "$STATE_DIR/last_digest"
-            exit 0
-          fi
-          if [ "$digest" = "$last" ]; then
-            note "Nothing has changed since the last alert, so none was sent."
-            exit 0
-          fi
-          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_OWNER_IDS" ]; then
-            note "There is something to report. The Telegram secrets are not set, so no alert was sent."
-            printf '%s\n' "$text" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          text="Watchdog, $GITHUB_REPOSITORY: $text"
-          sent=0
-          for chat in $(echo "$TELEGRAM_OWNER_IDS" | tr ',' ' '); do
-            if curl --silent --show-error --max-time 30 --output /dev/null \
-              --data-urlencode "chat_id=$chat" --data-urlencode "text=$text" \
-              "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage"; then
-              sent=1
-            else
-              note "A Telegram alert could not be sent."
-            fi
-          done
-          if [ "$sent" = "1" ]; then
-            printf '%s' "$digest" > "$STATE_DIR/last_digest"
-            note "An alert was sent."
-          fi
+        run: python3 .github/scripts/watchdog.py
       - name: Keep what was last sent
         if: always()
         continue-on-error: true

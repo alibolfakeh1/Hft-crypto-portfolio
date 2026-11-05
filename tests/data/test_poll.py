@@ -13,7 +13,7 @@ from typing import Any
 import polars as pl
 import pytest
 
-from helpers import MINUTE, base_config, make_context, us, with_sources_enabled
+from helpers import MINUTE, POLL_VENUE, base_config, make_context, us, with_sources_enabled
 from hft_crypto.bars.reconcile import compare_emitted_with_rebuild
 from hft_crypto.config import ConfigError, PipelineConfig
 from hft_crypto.data.atomic import read_parquet
@@ -30,6 +30,7 @@ from hft_crypto.data.poll import (
     parse_trades_response,
     read_poll_log,
     rebuild_day_bars,
+    rebuild_digest_lines,
     run_poll,
     scheduled_time,
 )
@@ -95,11 +96,11 @@ def run(ctx: JobContext, fake: FakeKraken, **kwargs: Any) -> dict[str, Any]:
 
 
 def bars_of(ctx: JobContext, day: dt.date) -> pl.DataFrame:
-    return read_parquet(ctx.root.curated_part(BARS_1M_LIVE, "kraken", SYMBOL, day))
+    return read_parquet(ctx.root.curated_part(BARS_1M_LIVE, POLL_VENUE, SYMBOL, day))
 
 
 def trades_of(ctx: JobContext, day: dt.date) -> pl.DataFrame:
-    return read_parquet(ctx.root.curated_part(TRADES_LIVE, "kraken", SYMBOL, day))
+    return read_parquet(ctx.root.curated_part(TRADES_LIVE, POLL_VENUE, SYMBOL, day))
 
 
 # ---- response parsing --------------------------------------------------------------------------------------
@@ -387,7 +388,7 @@ def test_an_empty_answer_is_not_a_quiet_market(tmp_path: Path) -> None:
     assert result["caught_up"] is False
     assert result["data_gap"] is True
     assert result["new_bars"] == 0
-    assert not ctx.root.curated_part(BARS_1M_LIVE, "kraken", SYMBOL, START).exists()
+    assert not ctx.root.curated_part(BARS_1M_LIVE, POLL_VENUE, SYMBOL, START).exists()
 
 
 def test_a_short_page_mid_history_is_not_caught_up(tmp_path: Path) -> None:
@@ -446,8 +447,8 @@ def test_a_row_stamped_ahead_of_the_clock_is_refused(tmp_path: Path) -> None:
     result = record["symbols"][SYMBOL]
     assert result["status"] == "failed"
     assert "ahead of the clock" in result["error"]
-    assert not ctx.root.curated_part(BARS_1M_LIVE, "kraken", SYMBOL, START).exists()
-    assert not ctx.root.curated_part(TRADES_LIVE, "kraken", SYMBOL, START).exists()
+    assert not ctx.root.curated_part(BARS_1M_LIVE, POLL_VENUE, SYMBOL, START).exists()
+    assert not ctx.root.curated_part(TRADES_LIVE, POLL_VENUE, SYMBOL, START).exists()
 
 
 def test_a_run_refuses_an_allowance_shorter_than_the_span(tmp_path: Path) -> None:
@@ -507,9 +508,9 @@ def test_higher_timeframes_appear_only_when_closed(tmp_path: Path) -> None:
     fake.rows[PAIR] = [row(100, START_US + 1_000_000), row(101, START_US + 11 * MINUTE + 5)]
     ctx = context(tmp_path / "r", "2026-03-01T00:12:30")  # newest close 00:11
     run(ctx, fake)
-    five = read_parquet(ctx.root.curated_part("bars_5m_live", "kraken", SYMBOL, START))
+    five = read_parquet(ctx.root.curated_part("bars_5m_live", POLL_VENUE, SYMBOL, START))
     assert five["close_time"].dt.minute().to_list() == [5, 10]
-    hourly = read_parquet(ctx.root.curated_part("bars_1h_live", "kraken", SYMBOL, START))
+    hourly = read_parquet(ctx.root.curated_part("bars_1h_live", POLL_VENUE, SYMBOL, START))
     assert hourly.is_empty()
 
 
@@ -656,7 +657,7 @@ def test_dc01a_a_gap_found_in_a_failed_pass_flags_bars_emitted_by_a_later_pass(t
     ctx = context(tmp_path / "r", "2026-03-01T00:05:30", config)
     failed = run(ctx, fake)
     assert failed["status"] == "failed"
-    assert not ctx.root.curated_part(BARS_1M_LIVE, "kraken", SYMBOL, START).exists()
+    assert not ctx.root.curated_part(BARS_1M_LIVE, POLL_VENUE, SYMBOL, START).exists()
     assert any("jump" in gap["reason"] for gap in ctx.catalog.gaps())
 
     fake.error = None
@@ -722,7 +723,7 @@ def test_c17_a_stop_inside_a_hole_cannot_pass_as_a_quiet_market(tmp_path: Path) 
     )
     assert hole.height == 31
     assert hole["gap"].all()
-    hourly = read_parquet(ctx.root.curated_part("bars_1h_live", "kraken", SYMBOL, START))
+    hourly = read_parquet(ctx.root.curated_part("bars_1h_live", POLL_VENUE, SYMBOL, START))
     affected = hourly.filter(pl.col("close_time").dt.hour() == 13).row(0, named=True)
     assert affected["gap"] is True
     assert affected["complete"] is False
@@ -739,7 +740,7 @@ def test_a_failed_fetch_keeps_the_cursor_and_the_next_run_recovers(tmp_path: Pat
     assert record["symbols"][SYMBOL]["error"] == "connection reset"
     # What arrived before the failure is kept. No bars come out of a failed pass.
     assert trades_of(ctx, START).height == 3
-    assert not ctx.root.curated_part(BARS_1M_LIVE, "kraken", SYMBOL, START).exists()
+    assert not ctx.root.curated_part(BARS_1M_LIVE, POLL_VENUE, SYMBOL, START).exists()
 
     fake.error = None
     later = context(tmp_path / "r", "2026-03-01T00:07:30")
@@ -769,7 +770,7 @@ def test_a_format_change_fails_the_pass_without_writing_bad_data(tmp_path: Path)
     record = run(ctx, Raw())
     assert record["status"] == "failed"
     assert "validation" in record["symbols"][SYMBOL]["error"]
-    assert not ctx.root.curated_part(TRADES_LIVE, "kraken", SYMBOL, START).exists()
+    assert not ctx.root.curated_part(TRADES_LIVE, POLL_VENUE, SYMBOL, START).exists()
 
 
 def test_a_lost_cache_rebuilds_through_the_cursor_and_says_so_on_every_bar(tmp_path: Path) -> None:
@@ -1018,7 +1019,7 @@ def test_with_no_approved_source_the_poll_contacts_nothing(tmp_path: Path) -> No
     assert record["data_kind"] == "NONE"
     assert fake.calls == []
     assert record["symbols"] == {}
-    assert not ctx.root.curated_part(TRADES_LIVE, "kraken", SYMBOL, START).exists()
+    assert not ctx.root.curated_part(TRADES_LIVE, POLL_VENUE, SYMBOL, START).exists()
     # Nothing was tried, so nothing failed.
     assert ctx.catalog.last_runs()["live_poll"][0]["status"] == "no_approved_source"
 
@@ -1063,7 +1064,7 @@ def test_a_gap_in_the_catalog_flags_bars_whatever_the_rows_show(tmp_path: Path) 
     fake.rows[PAIR] = [row(100 + i, START_US + i * MINUTE + 30_000_000) for i in range(6)]
     ctx = context(tmp_path / "r", "2026-03-01T00:05:50")
     ctx.catalog.add_gap(
-        f"curated.{TRADES_LIVE}.kraken.{SYMBOL}",
+        f"curated.{TRADES_LIVE}.{POLL_VENUE}.{SYMBOL}",
         iso_us(START_US + 2 * MINUTE + 1),
         iso_us(START_US + 3 * MINUTE + 1),
         "recorded by an earlier pass",
@@ -1074,3 +1075,86 @@ def test_a_gap_in_the_catalog_flags_bars_whatever_the_rows_show(tmp_path: Path) 
     bars = bars_of(ctx, START)
     # 00:01 holds the first row anyone can reach, so nothing shows the minute was whole.
     assert bars.filter(pl.col("gap"))["close_time"].dt.minute().to_list() == [1, 3, 4]
+
+
+# ---- R1.1 and N-15
+# -----------------------------------------------------------------------------------------------
+
+
+def test_the_digest_covers_only_what_a_rebuild_can_reproduce() -> None:
+    """R1.1. `emitted_hash` covers receipts and flags, so it cannot be compared with a rebuild after a lost
+    cache."""
+    frame = pl.DataFrame(
+        {
+            "close_time": pl.Series([START_US + MINUTE, START_US + 2 * MINUTE], dtype=pl.Int64).cast(
+                pl.Datetime("us", "UTC")
+            ),
+            "open": [100.0, None],
+            "high": [101.0, None],
+            "low": [99.0, None],
+            "close": [100.5, None],
+            "volume": [2.0, 0.0],
+            "quote_volume": [200.0, 0.0],
+            "buy_volume": [1.0, 0.0],
+            "sell_volume": [1.0, 0.0],
+            "settled_volume": [2.0, 0.0],
+            "settled_quote_volume": [200.0, 0.0],
+            "settled_buy_volume": [1.0, 0.0],
+            "settled_sell_volume": [1.0, 0.0],
+            "trade_count": [2, 0],
+            "knowable_time": pl.Series([START_US + 99, START_US + 100], dtype=pl.Int64).cast(
+                pl.Datetime("us", "UTC")
+            ),
+            "gap": [False, True],
+        }
+    )
+    lines = rebuild_digest_lines(frame)
+    assert len(lines) == 2
+    assert lines[0].startswith(f"{START_US + MINUTE},")
+    assert ",n,n,n,n," in lines[1]
+    # What differs between a first emission and a rebuild does not reach it.
+    other = frame.with_columns(
+        pl.lit(False).alias("gap"),
+        (pl.col("knowable_time").dt.timestamp("us") + 3_600_000_000)
+        .cast(pl.Datetime("us", "UTC"))
+        .alias("knowable_time"),
+    )
+    assert rebuild_digest_lines(other) == lines
+    # The order of the rows does not, either.
+    assert rebuild_digest_lines(frame.reverse()) == lines
+    # A value that a rebuild would change does.
+    assert rebuild_digest_lines(frame.with_columns(pl.col("volume") + 1.0)) != lines
+
+
+def test_a_run_logs_the_digest_and_what_it_covers(tmp_path: Path) -> None:
+    fake = FakeKraken(page_size=100)
+    fake.rows[PAIR] = [row(100 + m, START_US + m * MINUTE + 30_000_000) for m in range(60)]
+    ctx = context(tmp_path / "r", "2026-03-01T01:07:05")
+    run(ctx, fake)
+    record = read_poll_log(ctx.root.poll_log)[-1]["symbols"][SYMBOL]
+    assert record["rebuild_digest"]
+    assert record["emitted_hash"]
+    assert record["first_close"].startswith("2026-03-01T00:01")
+    assert record["last_close"] is not None
+    assert record["first_trade_id"] == 100
+    assert record["last_trade_id"] >= 150
+
+
+def test_a_page_out_of_order_loses_no_trade(tmp_path: Path) -> None:
+    """N-15. Ids 100, 102, 101, 103 in one page: 101 was dropped and counted as repeated, and its volume was
+    lost."""
+    fake = FakeKraken(page_size=100)
+    stamps = [START_US + 30_000_000 + index * 1_000 for index in range(4)]
+    fake.rows[PAIR] = [
+        row(100, stamps[0]),
+        row(102, stamps[2]),
+        row(101, stamps[1]),
+        row(103, stamps[3]),
+        row(104, START_US + 90 * MINUTE),
+    ]
+    ctx = context(tmp_path / "r", "2026-03-01T02:07:05")
+    run(ctx, fake)
+    stored = trades_of(ctx, START)
+    assert sorted(stored["trade_id"].to_list())[:4] == [100, 101, 102, 103]
+    first = bars_of(ctx, START).row(0, named=True)
+    assert first["volume"] == 4.0

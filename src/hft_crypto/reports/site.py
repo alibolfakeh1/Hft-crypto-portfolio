@@ -329,6 +329,8 @@ def _benchmark_section(status: dict[str, Any], benchmarks: Sequence[Benchmark]) 
                 symbol,
                 f"{item['start'][:10]} to {item['end'][:10]}",
                 f"{item['days']:.0f}",
+                f"{item['days_used']} of {item['days_in_span']}",
+                item["days_excluded"],
                 _pct(item["total_return"]),
                 _pct(item["cagr"]),
                 _pct(item["annualised_volatility"]),
@@ -342,6 +344,8 @@ def _benchmark_section(status: dict[str, Any], benchmarks: Sequence[Benchmark]) 
             ("Symbol", False),
             ("Period, UTC", False),
             ("Days", True),
+            ("Days used, of the declared span", True),
+            ("Days excluded", True),
             ("Total return", True),
             ("CAGR, 365 days", True),
             ("Volatility, annualised", True),
@@ -367,7 +371,8 @@ def _benchmark_section(status: dict[str, Any], benchmarks: Sequence[Benchmark]) 
     return (
         f'<section><div class="legend">{legend}</div>{chart}{table}'
         "<p>Buy and hold from the first traded price of the period. No fees, funding or slippage. "
-        "Volatility and Sharpe use daily close-to-close returns with a zero risk-free rate, annualised on "
+        "Excluded days stay as holes. Total return runs across them. Volatility and Sharpe use only one-day "
+        "close-to-close returns between adjacent days, with a zero risk-free rate, annualised on "
         f"365 days. Max drawdown uses hourly marks, as charted.</p>{caution}</section>"
     )
 
@@ -505,7 +510,14 @@ def _seconds(value: float | None) -> str:
 
 def _reconciliation_section(status: dict[str, Any]) -> str:
     official = status["reconciliation"]["official_candles"]
-    text = (
+    unavailable = (
+        f"<p>Reconciliation is not available on {official['not_available']} symbol-days, because their bars are "
+        "the official candles, so nothing outside those files has checked them. They are never counted as "
+        "passed.</p>"
+        if official.get("not_available")
+        else ""
+    )
+    text = unavailable + (
         f"<p>Canonical bars against official candles: {official['days']} symbol-days checked, "
         f"{official['pass']} pass, {official['warn']} warn, {official['fail']} fail. "
         "At every minute, trades and candles must agree within what fills running past a boundary can explain, "
@@ -583,6 +595,10 @@ def _age_text(status: dict[str, Any]) -> str:
     return f"Data as of {moment.strftime('%Y-%m-%d %H:%M')} UTC, {status['data_age_hours']} hours old."
 
 
+def _attribution(status: dict[str, Any]) -> str:
+    return "".join(f"<p>{_e(line)}</p>" for line in status.get("attributions", []))
+
+
 def render_site(status: dict[str, Any], benchmarks: Sequence[Benchmark]) -> str:
     """Render the whole page. Every value passes through an escape, or is built from numbers."""
     synthetic = status["data_kind"] == "SYNTHETIC"
@@ -620,7 +636,8 @@ def render_site(status: dict[str, Any], benchmarks: Sequence[Benchmark]) -> str:
 <h2>{tag}Storage</h2>
 <section>{_storage_section(status)}</section>
 <footer>
-<p>Code {_e(status["code_version"])}. Config {_e(status["config_hash"][:12])}. Run {_e(status["run_id"])}.</p>
+<p>Nothing here reads a date after {_e(status.get("last_opened_date", ""))}, the last opened date of the fold plan.</p>
+{_attribution(status)}<p>Code {_e(status["code_version"])}. Config {_e(status["config_hash"][:12])}. Run {_e(status["run_id"])}.</p>
 <p>All times are UTC. Only statistics derived from market data are shown here.</p>
 </footer>
 </main>

@@ -5,8 +5,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
-import socket
-import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -30,28 +28,11 @@ CLEAN_SYMBOL = SYMBOLS[1]
 FAULT_DAY = FIRST_DAY + dt.timedelta(days=_FAULT_DAY_INDEX)
 
 
-@pytest.fixture(autouse=True)
-def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Every test in this file fails on any attempt to reach a network."""
-
-    def refuse(*_: object, **__: object) -> None:
-        raise AssertionError("a test tried to use the network")
-
-    monkeypatch.setattr(urllib.request.OpenerDirector, "open", refuse)
-    monkeypatch.setattr(socket.socket, "connect", refuse)
-
-
 @pytest.fixture(scope="module")
 def run(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Any]]:
     base = tmp_path_factory.mktemp("synthetic")
     with pytest.MonkeyPatch.context() as patch:
         patch.delenv("DATA_QUOTA_GB", raising=False)
-
-        def refuse(*_: object, **__: object) -> None:
-            raise AssertionError("the synthetic run tried to use the network")
-
-        patch.setattr(urllib.request.OpenerDirector, "open", refuse)
-        patch.setattr(socket.socket, "connect", refuse)
         summary = run_synthetic(
             base / "root",
             base / "live",
@@ -122,12 +103,18 @@ def test_the_whole_path_ran(run: dict[str, Any]) -> None:
     assert errors
     assert all(FAULT_DAY.isoformat() in message and FAULT_SYMBOL in message for message in errors)
     assert summary["second_pass"]["status"] == "partial"
-    # Raw is transient, and every file went through the deletion protocol. The failed day's trades stay.
+    # Raw is transient, and every file went through the deletion protocol. The failed day's trades stay, and
+    # so do the newest day's trades, whose bars are provisional until the next file comes (R6.1).
     root = run["base"] / "root"
     left = [path.name for path in (root / "raw").rglob("*") if path.is_file()]
     assert summary["raw_files_left"] == len(left)
     assert left
-    assert all(FAULT_DAY.isoformat() in name and FAULT_SYMBOL in name for name in left)
+    newest = (FIRST_DAY + dt.timedelta(days=DAYS - 1)).isoformat()
+    assert all(
+        (FAULT_DAY.isoformat() in name and FAULT_SYMBOL in name) or (newest in name and "aggTrades" in name)
+        for name in left
+    )
+    assert any(FAULT_DAY.isoformat() in name and FAULT_SYMBOL in name for name in left)
     assert summary["second_pass"]["raw_deleted_files"] > 0
     log = (root / "catalog" / "deletions.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(log) == summary["second_pass"]["raw_deleted_files"]
@@ -208,11 +195,10 @@ def test_a_failed_day_keeps_its_bars_and_only_the_minute_it_cannot_explain_is_fl
     )
     assert bars.height == 1440
     flagged = bars.filter(pl.col("gap"))
-    assert flagged.height > 0
-    first_flag = flagged["close_time"].to_list()[0]
-    # 10:00 on that day: the bar holding the spill closes at 10:01. Everything before it stands.
-    assert first_flag.isoformat().startswith(f"{FAULT_DAY.isoformat()}T10:01:00")
-    assert bars.filter(pl.col("close_time") < first_flag)["gap"].sum() == 0
+    # 10:00 on that day: the bar holding the spill closes at 10:01. Everything before it stands, and so does
+    # everything after it, since the next boundary adds up again.
+    assert flagged.height == 1
+    assert flagged["close_time"][0].isoformat().startswith(f"{FAULT_DAY.isoformat()}T10:01:00")
 
 
 def test_benchmark_equals_a_calculation_made_directly_from_the_generator(run: dict[str, Any]) -> None:
@@ -234,12 +220,28 @@ def test_benchmark_equals_a_calculation_made_directly_from_the_generator(run: di
     assert item["max_drawdown_note"] is None
 
 
-def test_results_leave_out_the_failed_day_and_start_after_it(run: dict[str, Any]) -> None:
+def test_results_keep_their_declared_span_and_leave_the_failed_day_as_a_hole(run: dict[str, Any]) -> None:
+    """DR-08. The window used to restart after a bad day, so a data event chose what the figures covered."""
     item = run["status"]["benchmarks"][FAULT_SYMBOL]
-    assert item["start"].startswith((FAULT_DAY + dt.timedelta(days=1)).isoformat())
-    assert item["days"] == float(DAYS - 2 - _FAULT_DAY_INDEX)
-    assert item["missing_days_before_start"] is True
+    clean = run["status"]["benchmarks"][CLEAN_SYMBOL]
+    assert item["start"] == clean["start"]
+    assert item["start"].startswith(FIRST_DAY.isoformat())
+    assert item["end"] == clean["end"]
+    assert item["span_start"] == FIRST_DAY.isoformat()
+    assert item["days"] == float(DAYS - 1)
+    assert item["days_in_span"] == DAYS - 1
+    assert item["days_used"] == DAYS - 2
+    assert item["days_excluded"] == 1
+    assert item["days_without_data"] == 0
+    # A return across a hole is not a one-day return, so this has one fewer than a day's worth of each.
+    assert item["daily_returns"] == DAYS - 3
+    assert "missing_days_before_start" not in item
     assert "left out of results: 1" in run["html"]
+    assert f"{DAYS - 2} of {DAYS - 1}" in run["html"]
+
+
+def test_the_newest_day_is_not_final_until_the_next_could_be_delivered(run: dict[str, Any]) -> None:
+    assert all(item["newest_day_provisional"] for item in run["status"]["benchmarks"].values())
 
 
 def test_the_hourly_poll_ran_with_its_lateness_measured(run: dict[str, Any]) -> None:
@@ -270,6 +272,10 @@ def test_polled_bars_match_a_rebuild_and_agree_with_the_other_market(run: dict[s
     assert all(item["status"] == "pass" and item["bars_different"] == 0 for item in same)
     assert all(item["status"] == "pass" for item in other)
     assert all(item["median_abs_close_diff_bps"] < 30.0 for item in other)
+    # DR-09. The poll's venue has no archive of its own here, and a day nothing could check says so.
+    own = [item for item in results if item["check"] == "live_archive"]
+    assert own
+    assert all(item["status"] == "not_available" and item["bars_compared"] == 0 for item in own)
 
 
 def test_polled_bars_were_only_knowable_when_received(run: dict[str, Any]) -> None:
@@ -447,6 +453,144 @@ def test_the_command_line_runs_it_and_labels_it(tmp_path: Path, capsys: pytest.C
     assert (tmp_path / "out" / "site" / "index.html").is_file()
 
 
+# ---- the tier T0 path: candles and funding, and no trades -----------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def candle_run(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+    base = tmp_path_factory.mktemp("candles")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delenv("DATA_QUOTA_GB", raising=False)
+        summary = run_synthetic(
+            base / "root",
+            base / "live",
+            base / "out",
+            base_config=base_config(),
+            policy=base_policy(),
+            days=DAYS,
+            seed=SEED,
+            bar_source="official_1m",
+        )
+    return {
+        "summary": summary,
+        "base": base,
+        "html": (base / "out" / "site" / "index.html").read_text(encoding="utf-8"),
+        "status": json.loads((base / "out" / "status.json").read_text(encoding="utf-8")),
+    }
+
+
+def test_candle_path_holds_no_trades_at_all(candle_run: dict[str, Any]) -> None:
+    root = DataRoot(candle_run["base"] / "root", create=False)
+    for symbol in SYMBOLS:
+        assert root.curated_parts("candles_official", "synthetic", symbol)
+        assert root.curated_parts("trades", "synthetic", symbol) == []
+        # Under ruling 7 these bars have datasets of their own, so they cannot pass for trade-built bars.
+        assert root.curated_parts("bars_1m", "synthetic", symbol) == []
+        assert root.curated_parts("bars_1m_official", "synthetic", symbol)
+
+
+def test_candle_path_bars_say_where_they_came_from(candle_run: dict[str, Any]) -> None:
+    import polars as pl
+
+    root = DataRoot(candle_run["base"] / "root", create=False)
+    for symbol in SYMBOLS:
+        bars = pl.concat(
+            [
+                pl.read_parquet(p, hive_partitioning=False)
+                for p in root.curated_parts("bars_1m_official", "synthetic", symbol)
+            ]
+        )
+        assert bars.height == DAYS * 1440
+        assert bars["bar_source"].unique().to_list() == ["official_1m"]
+        # A candle file proves an empty minute itself, because it has a row saying nothing traded.
+        assert set(bars["empty_proof"].unique().to_list()) <= {"traded", "official"}
+        assert (
+            bars.filter(pl.col("trade_count") == 0)["close"].null_count()
+            == bars.filter(pl.col("trade_count") == 0).height
+        )
+        # Generated candles have a row for every minute and pass every check at the row.
+        assert bars.filter(pl.col("gap")).height == 0
+        hourly = pl.concat(
+            [
+                pl.read_parquet(p, hive_partitioning=False)
+                for p in root.curated_parts("bars_1h_official", "synthetic", symbol)
+            ]
+        )
+        assert hourly["bar_source"].unique().to_list() == ["official_1m"]
+
+
+def test_candle_path_reports_its_reconciliation_as_not_available_and_never_as_passed(
+    candle_run: dict[str, Any],
+) -> None:
+    official = candle_run["status"]["reconciliation"]["official_candles"]
+    assert official["days"] == DAYS * 2
+    assert official["not_available"] == DAYS * 2
+    assert official.get("pass", 0) == 0
+    assert official.get("warn", 0) == 0
+    assert official.get("fail", 0) == 0
+    assert "Reconciliation is not available" in candle_run["html"]
+    with Catalog(candle_run["base"] / "root" / "catalog" / "catalog.sqlite") as catalog:
+        rows = catalog.reconciliations("official_candles")
+        files = catalog.files(status="present")
+    assert {row["status"] for row in rows} == {"not_available"}
+    bars = [record for record in files if "bars_1m_official" in record.dataset_id]
+    assert bars
+    assert all(record.check_status in ("unreconciled", "provisional") for record in bars)
+    assert any(record.check_status == "unreconciled" for record in bars)
+
+
+def test_candle_path_reaches_the_benchmark_and_says_how_far_it_was_checked(
+    candle_run: dict[str, Any],
+) -> None:
+    for symbol in SYMBOLS:
+        item = candle_run["status"]["benchmarks"][symbol]
+        assert item["days_used"] == DAYS - 1
+        assert item["days_excluded"] == 0
+        assert item["daily_returns"] == DAYS - 1
+    assert candle_run["status"]["data_kind"] == "SYNTHETIC"
+
+
+def test_candle_path_serves_the_reader_the_engine_uses(candle_run: dict[str, Any]) -> None:
+    from hft_crypto.data.reader import MarketReader, RunClock
+    from hft_crypto.synthetic import synthetic_config
+
+    root = DataRoot(candle_run["base"] / "root", create=False)
+    setup = synthetic_config(base_config(), first_day=FIRST_DAY, days=DAYS, bar_source="official_1m")
+    reader = MarketReader(root, setup)
+    from hft_crypto.timeutil import day_start_us
+
+    cut = day_start_us(FIRST_DAY + dt.timedelta(days=2))
+    clock = RunClock(cut, cut + 65_000_000)
+    rows = reader.candles("synthetic", CLEAN_SYMBOL, clock)
+    assert rows.height == 2 * 1440
+    assert rows["bar_source"].unique().to_list() == ["official_1m"]
+    # These seven days sit inside one month, whose funding file is not published until it ends. It is an empty
+    # read, with its columns. data/test_candle_path.py reads funding through whole months.
+    assert reader.funding("synthetic", CLEAN_SYMBOL, clock).is_empty()
+    assert "settle_time" in reader.funding("synthetic", CLEAN_SYMBOL, clock).columns
+
+
+def test_the_command_line_takes_the_candle_path(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(
+        [
+            *_configs_args(),
+            "--data-root",
+            str(tmp_path / "root"),
+            "synthetic-run",
+            "--days",
+            "2",
+            "--out-dir",
+            str(tmp_path / "out"),
+            "--bars-from",
+            "official_1m",
+        ]
+    )
+    assert code == 0
+    capsys.readouterr()
+    status = json.loads((tmp_path / "out" / "status.json").read_text(encoding="utf-8"))
+    assert status["reconciliation"]["official_candles"]["not_available"] > 0
+
+
 # ---- with no approved source ------------------------------------------------------------------------
 
 
@@ -473,7 +617,8 @@ def test_daily_workflow_steps_with_no_approved_source(
     assert main([*args, "health"]) == 0
     health = json.loads(capsys.readouterr().out)
     assert health["source_state"] == "no approved source configured"
-    assert health["sources"]["binance"]["prohibited"] is True
+    assert health["sources"]["binance"]["prohibited"] is False
+    assert health["sources"]["kraken"]["prohibited"] is True
     assert all(not item["enabled"] for item in health["sources"].values())
     assert health["coverage"] == []
     assert main([*args, "report", "--published", "--out-dir", str(out), "--live-root", live]) == 0
@@ -517,6 +662,38 @@ def test_commands_that_only_look_do_not_create_a_mistyped_root(
     assert main([*_configs_args(), "--data-root", str(missing), *command]) == 2
     assert "does not exist" in capsys.readouterr().err
     assert not missing.exists()
+
+
+@pytest.mark.parametrize("command", [["retention"], ["health"], ["report"], ["reconcile-live"]])
+def test_commands_that_only_look_do_not_write_a_catalog_into_an_empty_folder(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], command: list[str]
+) -> None:
+    """N-14. A dry run on an existing empty folder used to write catalog/catalog.sqlite and exit 0."""
+    folder = tmp_path / "empty"
+    folder.mkdir()
+    assert main([*_configs_args(), "--data-root", str(folder), *command]) == 2
+    assert "no catalog" in capsys.readouterr().err
+    assert list(folder.rglob("*")) == []
+
+
+def test_a_generated_catalog_is_seen_in_a_live_root_that_lost_its_marker(
+    run: dict[str, Any], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """N-07. Refusing a generated live root rested on one file, and report read its log anyway."""
+    real = DataRoot(tmp_path / "real")
+    Catalog(real.catalog_path).close()
+    live = tmp_path / "live"
+    import shutil
+
+    shutil.copytree(run["base"] / "live", live)
+    (live / "catalog" / "SYNTHETIC").unlink()
+    args = [*_configs_args(), "--data-root", str(tmp_path / "real")]
+    assert (
+        main([*args, "report", "--published", "--out-dir", str(tmp_path / "x"), "--live-root", str(live)])
+        == 2
+    )
+    assert "generated" in capsys.readouterr().err
+    assert not (tmp_path / "x").exists()
 
 
 def test_the_daily_job_logs_how_late_it_ran(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

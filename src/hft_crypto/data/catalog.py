@@ -154,10 +154,21 @@ CREATE TABLE IF NOT EXISTS exclusions (
   boundary_window_ms REAL,
   excluded_at TEXT NOT NULL,
   resolved_at TEXT,
+  fault_day TEXT,
   UNIQUE (venue, symbol, date, reason)
 );
+CREATE TABLE IF NOT EXISTS allowance_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  venue TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  date TEXT NOT NULL,
+  needed_ms REAL NOT NULL,
+  allowance_ms REAL NOT NULL,
+  found_at TEXT NOT NULL,
+  UNIQUE (venue, symbol, date)
+);
 """
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -246,6 +257,10 @@ class Catalog:
         if version != _SCHEMA_VERSION:
             with self._db:
                 self._db.executescript(_SCHEMA)
+                # A catalog restored from an older cache has this table without the column.
+                columns = {row[1] for row in self._db.execute("PRAGMA table_info(exclusions)")}
+                if "fault_day" not in columns:
+                    self._db.execute("ALTER TABLE exclusions ADD COLUMN fault_day TEXT")
                 self._db.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
 
     def close(self) -> None:
@@ -649,20 +664,37 @@ class Catalog:
         window_ms: float | None,
         *,
         now: str,
+        fault_day: str | None = None,
     ) -> bool:
         """Record a day left out of results. Return whether this reason is new for that day."""
         with self._db:
             cursor = self._db.execute(
                 """INSERT OR IGNORE INTO exclusions
-                   (venue, symbol, date, reason, boundary_window_ms, excluded_at)
-                   VALUES (?,?,?,?,?,?)""",
-                (venue, symbol, date, reason, window_ms, now),
+                   (venue, symbol, date, reason, boundary_window_ms, excluded_at, fault_day)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (venue, symbol, date, reason, window_ms, now, fault_day),
             )
             self._db.execute(
                 "UPDATE exclusions SET resolved_at=NULL WHERE venue=? AND symbol=? AND date=? AND reason=?",
                 (venue, symbol, date, reason),
             )
         return cursor.rowcount > 0
+
+    def add_allowance_event(
+        self, venue: str, symbol: str, date: str, needed_ms: float, allowance_ms: float, *, now: str
+    ) -> bool:
+        """A row ran longer than the declared allowance. Return whether this day is new."""
+        with self._db:
+            cursor = self._db.execute(
+                """INSERT OR IGNORE INTO allowance_events
+                   (venue, symbol, date, needed_ms, allowance_ms, found_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (venue, symbol, date, needed_ms, allowance_ms, now),
+            )
+        return cursor.rowcount > 0
+
+    def allowance_events(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in self._db.execute("SELECT * FROM allowance_events ORDER BY date, id")]
 
     def resolve_exclusions(self, venue: str, symbol: str, date: str, *, now: str) -> None:
         """A later good file settled it. The record of the exclusion stays, marked as resolved."""
@@ -686,6 +718,11 @@ class Catalog:
     def get_meta(self, key: str) -> str | None:
         row = self._db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return None if row is None else str(row["value"])
+
+    def holds_generated_data(self) -> bool:
+        """Whether this catalog says its root holds generated data, whatever files sit beside it."""
+        stored = self.get_meta("data_kind") == "SYNTHETIC"
+        return stored or any(venue.startswith("synthetic") for venue in self.dataset_venues())
 
     def dataset_venues(self) -> set[str]:
         rows = self._db.execute("SELECT DISTINCT venue FROM datasets WHERE venue IS NOT NULL")

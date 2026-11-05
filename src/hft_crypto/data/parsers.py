@@ -322,8 +322,21 @@ def parse_bybit_trades(
 
 
 def parse_klines(
-    path: Path, symbol: str, day: dt.date, limit: int, *, venue: str, allowance_us: int
+    path: Path,
+    symbol: str,
+    day: dt.date,
+    limit: int,
+    *,
+    venue: str,
+    allowance_us: int,
+    last_day: dt.date | None = None,
 ) -> CuratedResult:
+    """Candles for one UTC day, or from `day` through `last_day` for a longer file.
+
+    What cannot be a candle at all refuses the file. A row that fails a check at the row is only flagged, by
+    the code that uses it (ruling 7 condition 5), since one bad minute must not cost a whole file. `low` and
+    `high` of a row with no trades are not checked, because such a row holds no print.
+    """
     raw = read_zip_member(path, limit)
     has_header, line = _split_header(raw, KLINES_HEADER, 12)
     text = _read_csv(raw, line, has_header)
@@ -347,19 +360,53 @@ def parse_klines(
     )
     _require_no_nulls(
         typed,
-        ["open_time", "open", "high", "low", "close", "volume", "close_time", "count", "taker_buy_volume"],
+        [
+            "open_time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "close_time",
+            "quote_volume",
+            "count",
+            "taker_buy_volume",
+            "taker_buy_quote_volume",
+        ],
     )
-    _require_finite(typed, ["open", "high", "low", "close", "volume", "taker_buy_volume"])
+    _require_finite(
+        typed,
+        [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "quote_volume",
+            "taker_buy_volume",
+            "taker_buy_quote_volume",
+        ],
+    )
     open_us = typed["open_time"].to_numpy() * 1000
     first_us = day_start_us(day)
-    checks = _time_checks(open_us, first_us, first_us + MICROS_PER_DAY)
+    period_days = 1 if last_day is None else (last_day - day).days + 1
+    checks = _time_checks(open_us, first_us, first_us + period_days * MICROS_PER_DAY)
     if checks["rows_outside_partition"]:
         raise ValidationError("candles outside their UTC day")
     if (open_us % 60_000_000 != 0).any():
         raise ValidationError("candle open times are not on a minute boundary")
-    if (typed["high"] < typed["low"]).any():
-        raise ValidationError("candle high is below its low")
-    checks["expected_rows"] = 1440
+    if typed["open_time"].n_unique() != typed.height:
+        raise ValidationError("the same candle appears twice")
+    traded = typed["count"] > 0
+    if ((typed["open"] <= 0) & traded).any() or ((typed["low"] <= 0) & traded).any():
+        raise ValidationError("non-positive candle price")
+    if (typed["volume"] < 0).any() or (typed["count"] < 0).any() or (typed["taker_buy_volume"] < 0).any():
+        raise ValidationError("negative candle volume or count")
+    # Ruling 7: the file's own close field is checked and then discarded. Used as an instant, it would show a
+    # bar 1 ms before its minute ended.
+    if ((typed["close_time"] - typed["open_time"]) != 59_999).any():
+        raise ValidationError("candle close time is not the end of its minute")
+    checks["expected_rows"] = 1440 * period_days
     frame = (
         typed.with_columns(
             pl.lit(venue).alias("venue"),
@@ -391,8 +438,8 @@ def parse_klines(
         .sort("open_time")
     )
     warnings = []
-    if frame.height != 1440:
-        warnings.append(f"{frame.height} candles instead of 1440")
+    if frame.height != checks["expected_rows"]:
+        warnings.append(f"{frame.height} candles instead of {checks['expected_rows']}")
     return CuratedResult(frame, checks, tuple(warnings))
 
 

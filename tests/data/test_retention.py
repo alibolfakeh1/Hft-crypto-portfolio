@@ -979,8 +979,28 @@ def test_the_shipped_raw_rule_asks_for_a_passing_day_and_is_not_reviewed() -> No
     assert rule.reviewed is False
     for kind in ("aggTrades", "trades"):
         assert ("trades", frozenset({"pass"})) in rule.requires[kind]
-        assert ("bars_1m", frozenset({"pass", "provisional"})) in rule.requires[kind]
+        # R6.1. data-steward overruled `provisional`: it can outrank a known warning, and it means a check is
+        # open.
+        assert ("bars_1m", frozenset({"pass"})) in rule.requires[kind]
     assert base_policy().rule("curated-trades-window").requires["trades"] == (
         ("bars_1m", frozenset({"pass"})),
     )
     assert base_policy().rule("raw-live-after-retention").requires["*"] == (("bars_1m", frozenset({"pass"})),)
+
+
+@pytest.mark.parametrize(
+    ("used_pct", "wanted"),
+    [
+        (70.0, "Time until full"),
+        (80.0, "New backfills stopped"),
+        (85.0, "Nothing is deleted by this"),
+        (90.0, "nothing here deletes anything"),
+        (95.0, "Ingest holds all its work"),
+    ],
+)
+def test_each_alert_says_what_really_happens(used_pct: float, wanted: str) -> None:
+    """R3.3. They used to say raw files were being purged, on a job that is a dry run and on files the cache
+    never held."""
+    result = evaluate_watermarks(int(QUOTA * used_pct / 100.0), QUOTA, base_policy().watermarks)
+    assert any(wanted in alert for alert in result.alerts)
+    assert not any("purg" in alert.lower() for alert in result.alerts)

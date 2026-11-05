@@ -510,10 +510,11 @@ def _run_hours(path: Path, rows: list[list[Any]], hours: range) -> dict[str, pl.
     symbol = config.poll.pairs[0].symbol
     day = dt.date(2026, 3, 1)
     names = [BARS_1M_LIVE, *[live_dataset(m) for m in config.timeframes_minutes]]
+    venue = config.poll.venue
     return {
-        name: read_parquet(last.root.curated_part(name, "kraken", symbol, day))
+        name: read_parquet(last.root.curated_part(name, venue, symbol, day))
         for name in names
-        if last.root.curated_part(name, "kraken", symbol, day).is_file()
+        if last.root.curated_part(name, venue, symbol, day).is_file()
     }
 
 

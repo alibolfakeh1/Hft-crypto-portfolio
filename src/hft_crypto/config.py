@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import re
 import tomllib
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
 
-from hft_crypto.timeutil import parse_date
+from hft_crypto.timeutil import day_start_us, parse_date
 from hft_crypto.versioning import stable_hash
 
 
@@ -20,23 +21,85 @@ class ConfigError(ValueError):
 
 Granularity = Literal["day", "month"]
 Continuity = Literal["trade_id", "none"]
+BarSource = Literal["trades", "official_1m"]
+CandleCheck = Literal["not_shown", "shown"]
 NO_APPROVED_SOURCE = "no approved source configured"
-# Decision D-17. These hold in code, so no configuration file, environment variable or copied URL can reach
+# Fold plan section 3: nothing reads a date after this one. It holds in code, so no configuration file or
+# environment variable can move it. Opening a block is the owner's written decision: a new entry in the log
+# and a change here, and a test compares the two.
+LAST_OPENED_DATE = dt.date(2023, 12, 31)
+LAST_OPENED_DECISION = "D-34"
+UNDECLARED = "UNDECLARED"
+# Decision D-23. These hold in code, so no configuration file, environment variable or copied URL can reach
 # them.
-PROHIBITED_SOURCES = frozenset({"binance"})
-PROHIBITED_HOSTS = frozenset({"binance.vision", "binance.com", "binance.us", "binancefuture.com"})
+PROHIBITED_SOURCES = frozenset({"kraken"})
+# Whole domains, and everything under them. Only an approved route below opens one door in one of them.
+PROHIBITED_HOSTS = frozenset(
+    {"binance.vision", "binance.com", "binance.us", "binancefuture.com", "kraken.com"}
+)
 STAMP_KINDS = frozenset({"exact", "aggregate_one_price", "taker_many_prices", "floored", "batched"})
 # Only these row shapes keep every price in a bar from before its close. See the leak audit, ruling 2.
 IDEAL_STAMP_KINDS = frozenset({"exact", "aggregate_one_price"})
 ACCEPTED_ALLOWANCE_STATES = frozenset({"placeholder", "measured"})
+# A deferral moves a row one bar, so an allowance of a minute or more would settle wrongly (DR-07).
+MAX_FILL_SPAN_ALLOWANCE_MS = 60_000.0
+
+
+@dataclass(frozen=True)
+class ApprovedRoute:
+    """One source's only way into a prohibited domain: one host, and only files under one path."""
+
+    source: str
+    path_prefix: str
+    file_path: re.Pattern[str]
+
+
+# Decision D-29: for non-commercial research, Binance Vision's USD-M perpetual archive and nothing else there.
+# No other Binance host, and no spot, coin-margined or option path. A dated future has an underscore in its
+# symbol, so its files do not match either.
+APPROVED_ROUTES = {
+    "data.binance.vision": ApprovedRoute(
+        source="binance",
+        path_prefix="/data/futures/um",
+        file_path=re.compile(
+            r"/data/futures/um/(?:daily|monthly)/[A-Za-z]+/[A-Z0-9]+(?:/[0-9a-z]+)?/[A-Z0-9]+-[A-Za-z0-9-]+"
+            r"\.zip(?:\.CHECKSUM)?"
+        ),
+    )
+}
+# D-29: its terms cover the archive for research. They bar live proprietary execution and signals for
+# compensation, and nothing here has read its API terms, so no live path may read from it.
+ARCHIVE_ONLY_SOURCES = frozenset({"binance"})
 
 
 def is_prohibited_host(host: str | None) -> bool:
-    """True for a prohibited domain or anything under it, however it is written."""
+    """True for a prohibited domain or anything under it, however it is written. An approved route's host is
+    open."""
     if not host:
         return False
     name = host.lower().rstrip(".")
+    if host in APPROVED_ROUTES:
+        return False
     return any(name == banned or name.endswith(f".{banned}") for banned in PROHIBITED_HOSTS)
+
+
+def route_problem(source: str, url: str) -> str | None:
+    """Why this source may not use this address, or None. It is checked at load and again when a source is
+    used."""
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname
+    if is_prohibited_host(host):
+        return f"{host} is prohibited by a recorded decision"
+    route = APPROVED_ROUTES.get(host or "")
+    if route is None:
+        return None
+    if source != route.source:
+        return f"{host} is open only to source {route.source}"
+    path = parts.path.rstrip("/")
+    walks_out = ".." in path or "%" in path or parts.query or parts.fragment
+    if walks_out or (path != route.path_prefix and not path.startswith(f"{route.path_prefix}/")):
+        return f"{parts.path} is outside the approved route {route.path_prefix} of {host}"
+    return None
 
 
 @dataclass(frozen=True)
@@ -52,6 +115,21 @@ class SourceSpec:
     fill_span_allowance_ms: float
     allowance_state: str
     continuity: Continuity
+    bar_source: BarSource = "trades"
+    # Goes on everything published from this source's data, where its terms ask for that.
+    attribution: str = ""
+    # When an allowance is declared measured: the dates, the stressed days among them, and who signed.
+    allowance_evidence: str = ""
+    # Ruling 7: how long after its close an official candle is final. Its own key, since
+    # fill_span_allowance_ms describes trade rows. None until project-manager declares it, and a source cannot
+    # be enabled until then.
+    candle_allowance_ms: float | None = None
+    # declared, as D-33 says, or measured. An archive gives no receipt time, so it is not measured yet.
+    candle_allowance_state: str = "declared"
+    # Ruling 7 condition 2: whether a candle holding no print from after its close has been shown, on declared
+    # sample days outside any test block. This is what IDEAL rests on for these bars.
+    candle_check: CandleCheck = "not_shown"
+    candle_check_evidence: str = ""
 
     def hosts(self) -> frozenset[str]:
         return frozenset(
@@ -63,9 +141,37 @@ class SourceSpec:
         return round(self.fill_span_allowance_ms * 1000)
 
     @property
+    def official_bars(self) -> bool:
+        return self.bar_source == "official_1m"
+
+    @property
+    def candle_allowance_us(self) -> int:
+        if self.candle_allowance_ms is None:
+            raise ConfigError(f"source {self.name}: candle_allowance_ms is not declared")
+        return round(self.candle_allowance_ms * 1000)
+
+    @property
+    def bar_allowance_us(self) -> int:
+        """How long after a close this source's bars are knowable."""
+        return self.candle_allowance_us if self.official_bars else self.fill_span_allowance_us
+
+    @property
     def ideal_allowed(self) -> bool:
+        if self.official_bars:
+            # The trade rows' state is the wrong test for these bars (ruling 7 condition 7).
+            return self.candle_check == "shown"
         # An allowance nobody has measured cannot say what had printed by a close.
         return self.stamp_kind in IDEAL_STAMP_KINDS and self.allowance_state == "measured"
+
+    def route_problems(self) -> list[str]:
+        return [problem for url in self.urls.values() if (problem := route_problem(self.name, url))]
+
+    def use_problems(self) -> list[str]:
+        """Why this source cannot be used, apart from its switches."""
+        problems = self.route_problems()
+        if self.official_bars and self.candle_allowance_ms is None:
+            problems.append("candle_allowance_ms is not declared, and project-manager declares it")
+        return problems
 
 
 @dataclass(frozen=True)
@@ -89,7 +195,6 @@ class DatasetSpec:
 @dataclass(frozen=True)
 class ReconTolerance:
     daily_total_abs: float
-    boundary_window_ms: float
     bar_price_rel: float
     fill_count_rel: float
 
@@ -135,6 +240,8 @@ class ReportConfig:
     equity_timeframe_minutes: int
     benchmark_venue: str | None
     benchmark_symbols: tuple[str, ...]
+    # Declared in advance and common to all symbols, so that no fault can decide where a benchmark starts.
+    span_start: dt.date
 
 
 @dataclass(frozen=True)
@@ -157,6 +264,13 @@ class PipelineConfig:
     poll: PollConfig
     report: ReportConfig
     config_hash: str = field(default="")
+    # Only code can change this, and only a test builds one that differs. No key in a file reaches it.
+    last_opened_date: dt.date = LAST_OPENED_DATE
+
+    @property
+    def opened_through_us(self) -> int:
+        """24:00 on the last opened date. The bar closing then is the last one readable."""
+        return day_start_us(self.last_opened_date + dt.timedelta(days=1))
 
     def source(self, name: str) -> SourceSpec:
         try:
@@ -165,11 +279,11 @@ class PipelineConfig:
             raise ConfigError(f"unknown source: {name}") from exc
 
     def source_usable(self, name: str) -> bool:
-        """Enabled, not prohibited, and not on a prohibited host. A second check, kept after loading."""
+        """Enabled, not prohibited, and only on its approved route. A second check, kept after loading."""
         source = self.sources.get(name)
         if source is None or not source.enabled or source.prohibited or name in PROHIBITED_SOURCES:
             return False
-        return not any(is_prohibited_host(host) for host in source.hosts())
+        return not source.use_problems()
 
     def enabled_sources(self) -> tuple[str, ...]:
         return tuple(sorted(name for name in self.sources if self.source_usable(name)))
@@ -320,6 +434,13 @@ _SOURCE_KEYS = frozenset(
         "fill_span_allowance_ms",
         "allowance_state",
         "continuity",
+        "bar_source",
+        "attribution",
+        "allowance_evidence",
+        "candle_allowance_ms",
+        "candle_allowance_state",
+        "candle_check",
+        "candle_check_evidence",
         "archive_base",
         "trades_base",
         "book_base",
@@ -362,6 +483,8 @@ def _source(name: str, raw: dict[str, Any]) -> SourceSpec:
     enabled = _bool_key(raw, "enabled", where)
     prohibited = _bool_key(raw, "prohibited", where)
     urls = {key: str(value) for key, value in raw.items() if key.endswith(("_base", "_url"))}
+    bar_source = cast(BarSource, _choice(raw, "bar_source", frozenset({"trades", "official_1m"}), where))
+    candle_allowance, candle_check = _candle_keys(raw, bar_source, where)
     source = SourceSpec(
         name=name,
         enabled=enabled,
@@ -372,15 +495,48 @@ def _source(name: str, raw: dict[str, Any]) -> SourceSpec:
         fill_span_allowance_ms=_non_negative(raw, "fill_span_allowance_ms", where),
         allowance_state=_choice(raw, "allowance_state", ACCEPTED_ALLOWANCE_STATES, where),
         continuity=cast(Continuity, _choice(raw, "continuity", frozenset({"trade_id", "none"}), where)),
+        bar_source=bar_source,
+        attribution=str(raw.get("attribution", "")),
+        allowance_evidence=str(raw.get("allowance_evidence", "")),
+        candle_allowance_ms=candle_allowance,
+        candle_allowance_state=str(raw.get("candle_allowance_state", "declared")),
+        candle_check=candle_check,
+        candle_check_evidence=str(raw.get("candle_check_evidence", "")),
     )
-    banned_hosts = sorted(host for host in source.hosts() if is_prohibited_host(host))
+    if source.fill_span_allowance_ms >= MAX_FILL_SPAN_ALLOWANCE_MS:
+        raise ConfigError(f"{where}: fill_span_allowance_ms must be under {MAX_FILL_SPAN_ALLOWANCE_MS:g}")
+    if source.allowance_state == "measured" and not source.allowance_evidence.strip():
+        raise ConfigError(f"{where}: a measured allowance must name its evidence in allowance_evidence")
+    problems = source.route_problems()
     if name in PROHIBITED_SOURCES and not prohibited:
-        raise ConfigError(f"{where} is prohibited by decision D-17, and the flag cannot be removed")
-    if banned_hosts and not prohibited:
-        raise ConfigError(f"{where} uses a prohibited host: {banned_hosts}")
-    if enabled and (prohibited or banned_hosts or name in PROHIBITED_SOURCES):
+        raise ConfigError(f"{where} is prohibited by a recorded decision, and the flag cannot be removed")
+    if problems and not prohibited:
+        raise ConfigError(f"{where}: {problems[0]}")
+    if enabled and (prohibited or problems or name in PROHIBITED_SOURCES):
         raise ConfigError(f"{where} is prohibited by a recorded decision and cannot be enabled")
+    if enabled and source.use_problems():
+        raise ConfigError(f"{where} cannot be enabled: {source.use_problems()[0]}")
     return source
+
+
+def _candle_keys(raw: dict[str, Any], bar_source: BarSource, where: str) -> tuple[float | None, CandleCheck]:
+    """Required with no default on a source whose bars are official candles, so nothing can read as
+    declared."""
+    if bar_source != "official_1m":
+        return None, "not_shown"
+    for key in ("candle_allowance_ms", "candle_allowance_state", "candle_check"):
+        if key not in raw:
+            raise ConfigError(f"{where}: bars from official candles need {key}")
+    _choice(raw, "candle_allowance_state", frozenset({"declared", "measured"}), where)
+    allowance: float | None = None
+    if raw["candle_allowance_ms"] != UNDECLARED:
+        allowance = _non_negative(raw, "candle_allowance_ms", where)
+        if allowance >= MAX_FILL_SPAN_ALLOWANCE_MS:
+            raise ConfigError(f"{where}: candle_allowance_ms must be under {MAX_FILL_SPAN_ALLOWANCE_MS:g}")
+    check = cast(CandleCheck, _choice(raw, "candle_check", frozenset({"not_shown", "shown"}), where))
+    if check == "shown" and not str(raw.get("candle_check_evidence", "")).strip():
+        raise ConfigError(f"{where}: candle_check of shown must name its evidence in candle_check_evidence")
+    return allowance, check
 
 
 def _choice(raw: dict[str, Any], key: str, allowed: frozenset[str], where: str) -> str:
@@ -402,8 +558,18 @@ def _check_references(config: PipelineConfig) -> None:
     for spec in config.datasets:
         if spec.venue not in config.sources:
             raise ConfigError(f"dataset {spec.id}: unknown source {spec.venue}")
+        if spec.live_eligible and spec.venue in ARCHIVE_ONLY_SOURCES:
+            raise ConfigError(f"dataset {spec.id}: its source is for archive research only, so no live read")
     if config.poll.venue not in config.sources:
         raise ConfigError(f"poll: unknown source {config.poll.venue}")
+    if config.poll.venue in ARCHIVE_ONLY_SOURCES:
+        raise ConfigError(f"poll: source {config.poll.venue} is for archive research only")
+    for name, source in config.sources.items():
+        if source.official_bars and not config.has_official_candles(name):
+            raise ConfigError(f"source {name}: bars from official candles need a candle dataset")
+        allowance = source.candle_allowance_ms
+        if source.official_bars and allowance is not None and config.poll.allowance_a_s * 1000 < allowance:
+            raise ConfigError(f"source {name}: the allowance A must cover its candle allowance")
     venue = config.report.benchmark_venue
     if venue is not None and not config.source_usable(venue):
         raise ConfigError(f"report: benchmark venue {venue} is not an enabled, approved source")
@@ -445,7 +611,6 @@ def load_pipeline_config(config_dir: str | Path | None = None) -> PipelineConfig
             reconcile={
                 symbol: ReconTolerance(
                     daily_total_abs=float(values["daily_total_abs"]),
-                    boundary_window_ms=float(values["boundary_window_ms"]),
                     bar_price_rel=float(values["bar_price_rel"]),
                     fill_count_rel=float(values["fill_count_rel"]),
                 )
@@ -474,11 +639,16 @@ def load_pipeline_config(config_dir: str | Path | None = None) -> PipelineConfig
                 equity_timeframe_minutes=int(raw["report"]["equity_timeframe_minutes"]),
                 benchmark_venue=raw["report"]["benchmark_venue"] or None,
                 benchmark_symbols=tuple(raw["report"]["benchmark_symbols"]),
+                span_start=parse_date(raw["report"]["span_start"]),
             ),
             config_hash=stable_hash(raw),
         )
     except KeyError as exc:
         raise ConfigError(f"pipeline.toml is missing {exc}") from exc
+    for symbol, values in raw["reconcile"].items():
+        _check_keys(
+            values, frozenset({"daily_total_abs", "bar_price_rel", "fill_count_rel"}), f"reconcile {symbol}"
+        )
     _check_references(config)
     return config
 

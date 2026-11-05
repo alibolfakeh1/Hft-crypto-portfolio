@@ -1,9 +1,8 @@
 name: Source check
 
 # Reports whether GitHub-hosted runners can reach a few public, non-dataset endpoints. It stores nothing and needs no
-# secrets. It runs only when started by hand, and it no longer touches any data archive: decision D-17 rules Binance
-# out, and no source is approved yet, so this must not access a dataset host. Add a probe here only for a source that
-# has been approved.
+# secrets. It runs only when started by hand, and it touches no data archive, so this must not access a dataset host.
+# Add a probe here only for a source that has been approved and enabled.
 
 on:
   workflow_dispatch:

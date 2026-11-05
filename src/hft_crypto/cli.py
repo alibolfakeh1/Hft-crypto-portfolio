@@ -25,6 +25,14 @@ from hft_crypto.data.atomic import append_jsonl, atomic_write_json, canonical_js
 from hft_crypto.data.book_replay import replay_zip
 from hft_crypto.data.catalog import Catalog
 from hft_crypto.data.context import JobContext
+from hft_crypto.data.coverage import (
+    CHECK_ROOT_VARIABLE,
+    FROZEN_LISTS,
+    declared_days,
+    init_check_root,
+    run_candle_check,
+    run_coverage_check,
+)
 from hft_crypto.data.fetch import HttpFetcher
 from hft_crypto.data.guard import PathGuardError
 from hft_crypto.data.health import build_health
@@ -34,10 +42,14 @@ from hft_crypto.data.parsers import ValidationError
 from hft_crypto.data.poll import KrakenClient, run_poll, scheduled_time
 from hft_crypto.data.retention import build_plan, evaluate_watermarks, execute_plan
 from hft_crypto.data.zones import (
+    CANDLE_CHECK_OUTPUT,
+    COVERAGE_OUTPUT,
+    ROOT_KIND,
     SYNTHETIC_MARKER,
     DataRoot,
     DataRootError,
     measure_zones,
+    persisted_bytes,
     resolve_data_root,
 )
 from hft_crypto.reports.report import write_report
@@ -68,6 +80,9 @@ def _context(
     args: argparse.Namespace, config: PipelineConfig, policy: RetentionPolicy, *, create: bool = True
 ) -> JobContext:
     root = resolve_data_root(args.data_root, create=create)
+    root.refuse_unopened("this command")
+    if not create and not root.catalog_path.is_file():
+        raise DataRootError("DATA_ROOT has no catalog. Run `init` or `ingest` first, or check the path.")
     return JobContext(
         root=root,
         catalog=Catalog(root.catalog_path),
@@ -85,11 +100,28 @@ def _refuse_synthetic(root: DataRoot) -> None:
 
 
 def _refuse_mixed_roots(root: DataRoot, live_root: str | None) -> None:
-    """Generated poll runs must never show up in a report on real data."""
-    if live_root and not root.is_synthetic and (Path(live_root) / SYNTHETIC_MARKER).is_file():
+    """Generated poll runs must never show up in a report on real data, whatever became of one marker file."""
+    if not live_root:
+        return
+    live = Path(live_root)
+    if any((live / name).is_file() for name in (ROOT_KIND, COVERAGE_OUTPUT, CANDLE_CHECK_OUTPUT)):
+        raise DataRootError(
+            "the live root is a check root for unopened dates, so this command cannot open it"
+        )
+    if root.is_synthetic:
+        return
+    if (live / SYNTHETIC_MARKER).is_file():
         raise ConfigError(
             "the live root holds SYNTHETIC data and DATA_ROOT does not, so they cannot be mixed"
         )
+    if (live / "catalog" / "catalog.sqlite").is_file():
+        catalog = Catalog(live / "catalog" / "catalog.sqlite")
+        generated = catalog.holds_generated_data()
+        catalog.close()
+        if generated:
+            raise ConfigError(
+                "the live root's catalog holds generated data, so it cannot be mixed with this root"
+            )
 
 
 def _refuse_fixed_clock(args: argparse.Namespace) -> None:
@@ -112,6 +144,7 @@ def _cmd_synthetic_run(args: argparse.Namespace, config: PipelineConfig, policy:
         policy=policy,
         days=args.days,
         seed=args.seed,
+        bar_source=args.bars_from,
     )
     _print_json(summary)
     return 0
@@ -197,7 +230,7 @@ def _cmd_validate_book(args: argparse.Namespace, config: PipelineConfig, policy:
 
 def _cmd_retention(args: argparse.Namespace, config: PipelineConfig, policy: RetentionPolicy) -> int:
     ctx = _context(args, config, policy, create=False)
-    used = sum(measure_zones(ctx.root).values())
+    used = persisted_bytes(measure_zones(ctx.root), config.persisted_zones)
     state = evaluate_watermarks(used, quota_bytes(config.default_quota_gb), policy.watermarks)
     plan = build_plan(ctx.root, ctx.catalog, policy, state, ctx.now())
     output: dict[str, Any] = {"mode": "execute" if args.execute else "dry-run", **plan.to_dict()}
@@ -291,7 +324,7 @@ def _write_poll_bundle(root: DataRoot, bundle: Path) -> None:
 def _poll_context(
     args: argparse.Namespace, config: PipelineConfig, policy: RetentionPolicy
 ) -> JobContext | None:
-    if not args.live_root or not Path(args.live_root).is_dir():
+    if not args.live_root or not (Path(args.live_root) / "catalog" / "catalog.sqlite").is_file():
         return None
     root = DataRoot(args.live_root, create=False)
     return JobContext(
@@ -343,6 +376,42 @@ def _cmd_report(args: argparse.Namespace, config: PipelineConfig, policy: Retent
             "alerts": status["health"]["alerts"],
         }
     )
+    return 0
+
+
+def _cmd_coverage_check(args: argparse.Namespace, config: PipelineConfig, policy: RetentionPolicy) -> int:
+    """No workflow starts this. Whether it may run is for project-manager and leak-auditor."""
+    _refuse_fixed_clock(args)
+    named = args.check_root or os.environ.get(CHECK_ROOT_VARIABLE)
+    if not named:
+        raise DataRootError(f"name the check root with --check-root or {CHECK_ROOT_VARIABLE}")
+    if not config.source_usable(args.venue):
+        raise ConfigError(
+            f"source {args.venue} is not approved and enabled, so the coverage check does not run"
+        )
+    check_root = init_check_root(named, data_root=args.data_root)
+    fetcher = HttpFetcher(config.fetch, allowed_hosts=config.enabled_hosts())
+    document = run_coverage_check(
+        check_root, config, fetcher, venue=args.venue, list_name=args.list, now=_clock(args)
+    )
+    _print_json(document)
+    return 0
+
+
+def _cmd_candle_check(args: argparse.Namespace, config: PipelineConfig, policy: RetentionPolicy) -> int:
+    """Condition 2 of ruling 7. No workflow starts this, and it needs no outcome. Only flags leave it."""
+    _refuse_fixed_clock(args)
+    named = args.check_root or os.environ.get(CHECK_ROOT_VARIABLE)
+    if not named:
+        raise DataRootError(f"name the check root with --check-root or {CHECK_ROOT_VARIABLE}")
+    days = declared_days(args.days)
+    if not config.source_usable(args.venue):
+        raise ConfigError(
+            f"source {args.venue} is not approved and enabled, so the candle check does not run"
+        )
+    check_root = init_check_root(named, data_root=args.data_root)
+    fetcher = HttpFetcher(config.fetch, allowed_hosts=config.enabled_hosts())
+    _print_json(run_candle_check(check_root, config, fetcher, venue=args.venue, days=days, now=_clock(args)))
     return 0
 
 
@@ -427,7 +496,33 @@ def _build_parser() -> argparse.ArgumentParser:
     synthetic.add_argument("--live-root", help="data directory for the poll. Defaults to DATA_ROOT-live")
     synthetic.add_argument("--days", type=int, default=30, help="how many generated days")
     synthetic.add_argument("--seed", type=int, default=DEFAULT_SEED, help="same seed, same output")
+    synthetic.add_argument(
+        "--bars-from",
+        choices=["trades", "official_1m"],
+        default="trades",
+        help="build bars from trades, or take the tier T0 path from official candles with no trades",
+    )
     synthetic.set_defaults(func=_cmd_synthetic_run)
+
+    coverage = commands.add_parser(
+        "coverage-check",
+        help="counts over unopened dates, in a root of their own. Only counts and flags leave it",
+    )
+    coverage.add_argument("--check-root", help=f"a new, empty folder. Defaults to {CHECK_ROOT_VARIABLE}")
+    coverage.add_argument(
+        "--list", required=True, choices=sorted(FROZEN_LISTS), help="which frozen file list"
+    )
+    coverage.add_argument("--venue", default="binance", help="the source, which must be enabled")
+    coverage.set_defaults(func=_cmd_coverage_check)
+
+    candle = commands.add_parser(
+        "candle-check",
+        help="whether a candle holds a print from after its close, on sample days. Only flags leave it",
+    )
+    candle.add_argument("--check-root", help=f"a new, empty folder. Defaults to {CHECK_ROOT_VARIABLE}")
+    candle.add_argument("--days", required=True, help="the word declared, or 15ths separated by commas")
+    candle.add_argument("--venue", default="binance", help="the source, which must be enabled")
+    candle.set_defaults(func=_cmd_candle_check)
     return parser
 
 

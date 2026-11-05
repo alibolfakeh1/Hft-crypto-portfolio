@@ -19,9 +19,8 @@ from hft_crypto.config import ReconTolerance
 
 DAY_START = us("2026-02-10T00:00:00")
 DAY_END = DAY_START + DAY
-TOLERANCE = ReconTolerance(
-    daily_total_abs=1e-6, boundary_window_ms=250.0, bar_price_rel=0.02, fill_count_rel=0.01
-)
+TOLERANCE = ReconTolerance(daily_total_abs=1e-6, bar_price_rel=0.02, fill_count_rel=0.01)
+WINDOW_MS = 250.0
 QUIET = DayFlow(0.0, 0.0, 0.0, 0.0)
 SECOND = 1_000_000
 
@@ -77,6 +76,7 @@ def check(
         day_bars(file),
         official,
         TOLERANCE,
+        window_ms=WINDOW_MS,
         previous_tail=tail,
         previous_flow=previous,
         next_flow=following,
@@ -92,7 +92,7 @@ def test_identical_day_passes() -> None:
     assert result.needs_previous_day is False
     assert result.needs_next_day is False
     assert result.boundaries_unexplained == 0
-    assert result.flag_from_close_us is None
+    assert result.flag_close_us == ()
     assert result.flag_first_bar is False
     assert result.flag_last_bar is False
 
@@ -128,7 +128,7 @@ def test_b_invented_volume_at_the_end_of_a_day_fails_on_the_next_days_carry() ->
     assert result.status == "fail"
     assert result.flag_last_bar is True
     assert result.flag_first_bar is False
-    assert result.flag_from_close_us is None
+    assert result.flag_close_us == ()
     assert any("not explained by midnight" in reason for reason in result.reasons)
 
 
@@ -141,7 +141,7 @@ def test_a2_a_lost_trade_at_the_start_of_a_day_fails_on_the_previous_days_carry(
     assert result.status == "fail"
     assert result.carry_in == 3.0
     assert result.flag_first_bar is True
-    assert result.flag_from_close_us is None
+    assert result.flag_close_us == ()
     assert any("not explained by midnight" in reason for reason in result.reasons)
 
 
@@ -186,7 +186,10 @@ def test_a_deficit_that_first_appears_later_in_the_day_fails_whatever_the_neighb
     result = check(file, official_from([(0, 1.0, 1.0), (700, 5.0, 5.0)]), previous=None, following=None)
     assert result.status == "fail"
     assert result.volume_diff == -5.0
-    assert result.flag_from_close_us == DAY_START + 701 * MINUTE
+    # A deficit that never closes is bad at every boundary from its own minute on.
+    assert result.flag_close_us[0] == DAY_START + 701 * MINUTE
+    assert result.flag_close_us[-1] == DAY_END
+    assert len(result.flag_close_us) == 740
 
 
 def test_c2_invented_volume_at_noon_fails_from_its_own_minute() -> None:
@@ -195,7 +198,8 @@ def test_c2_invented_volume_at_noon_fails_from_its_own_minute() -> None:
     file = trades([(noon + 30 * SECOND, 4.0)], buy=False)
     result = check(file, official_from([]))
     assert result.status == "fail"
-    assert result.flag_from_close_us == noon + MINUTE
+    assert result.flag_close_us[0] == noon + MINUTE
+    assert len(result.flag_close_us) == 720
     assert result.boundaries_unexplained == 720
 
 
@@ -207,7 +211,10 @@ def test_e2_hours_stamped_early_fail() -> None:
     # Each row belongs in minute m + 1 by the candles, and is stamped in minute m.
     result = check(trades(early), official)
     assert result.status == "fail"
-    assert result.flag_from_close_us == DAY_START + 601 * MINUTE
+    # The hours that break are flagged, and the day after them, which adds up again, is not.
+    assert result.flag_close_us[0] == DAY_START + 601 * MINUTE
+    assert result.flag_close_us[-1] == DAY_START + 780 * MINUTE
+    assert len(result.flag_close_us) == 180
 
 
 def test_d_taker_side_flipped_for_two_hours_fails_though_the_totals_match() -> None:
@@ -224,7 +231,8 @@ def test_d_taker_side_flipped_for_two_hours_fails_though_the_totals_match() -> N
     assert result.status == "fail"
     assert result.boundaries_unexplained == 0
     assert result.boundaries_unexplained_buy > 0
-    assert result.flag_from_close_us == DAY_START + 61 * MINUTE
+    assert result.flag_close_us[0] == DAY_START + 61 * MINUTE
+    assert result.flag_close_us[-1] == DAY_START + 179 * MINUTE
 
 
 def test_f_a_slipped_digit_in_the_last_price_fails_and_flags_only_that_bar() -> None:
@@ -238,7 +246,7 @@ def test_f_a_slipped_digit_in_the_last_price_fails_and_flags_only_that_bar() -> 
     result = check(file, official_from([(0, 1.0, 1.0), (1439, 1.0, 1.0)]))
     assert result.status == "fail"
     assert result.bars_price_over_tolerance == 1
-    assert result.flag_from_close_us == DAY_END
+    assert result.flag_close_us == (DAY_END,)
 
 
 def test_price_tolerance_is_relative_so_it_means_the_same_at_any_price() -> None:
@@ -282,7 +290,7 @@ def test_a_shift_too_wide_to_be_a_straddle_fails() -> None:
     result = check(file, official_from([(1, 2.0, 2.0)]))
     assert result.status == "fail"
     assert result.boundaries_unexplained == 1
-    assert result.flag_from_close_us == DAY_START + MINUTE
+    assert result.flag_close_us == (DAY_START + MINUTE,)
 
 
 def test_taker_buy_mismatch_alone_is_an_error() -> None:
@@ -317,7 +325,10 @@ def test_a_minutes_standing_never_depends_on_what_came_later_in_the_day() -> Non
     official = official_from([])
     first = check(first_error, official)
     both = check(both_errors, official)
-    assert first.flag_from_close_us == both.flag_from_close_us == DAY_START + 701 * MINUTE
+    assert first.flag_close_us[0] == both.flag_close_us[0] == DAY_START + 701 * MINUTE
+    # A later fault cannot change the standing of any boundary before it.
+    cut = DAY_START + 1000 * MINUTE
+    assert [c for c in first.flag_close_us if c <= cut] == [c for c in both.flag_close_us if c <= cut]
 
 
 def test_a_spill_past_the_window_fails_and_a_wider_window_is_a_different_declared_rule() -> None:
@@ -326,13 +337,17 @@ def test_a_spill_past_the_window_fails_and_a_wider_window_is_a_different_declare
         pl.lit(2, dtype=pl.Int32).alias("n_fills")
     )
     official = official_from([(0, 3.0, 3.0), (1, 2.0, 2.0)])
-    assert check(file, official).status == "fail"
-    wider = ReconTolerance(1e-6, 500.0, 0.02, 0.01)
+    narrow = check(file, official)
+    assert narrow.status == "fail"
+    # The check reports how long the row must have run even when that is what failed it, or a row longer than
+    # the window could never show.
+    assert narrow.largest_window_needed_ms == 300.0
     result = reconcile_official(
         file,
         day_bars(file),
         official,
-        wider,
+        TOLERANCE,
+        window_ms=500.0,
         previous_tail=None,
         previous_flow=QUIET,
         next_flow=QUIET,
@@ -346,9 +361,9 @@ def test_a_broken_days_far_midnight_figure_is_marked_and_a_neighbour_does_not_fa
     """A deficit of 5 at noon leaves a figure of -5 at midnight. That is not volume crossing midnight."""
     file = trades([(DAY_START + 30 * SECOND, 1.0)])
     broken = check(file, official_from([(0, 1.0, 1.0), (700, 5.0, 5.0)]))
-    assert broken.flow_reliable is False
+    assert broken.carry_out_reliable is False
     flow = DayFlow.from_detail(broken.to_dict())
-    assert flow.reliable is False
+    assert flow.carry_out_reliable is False
     clean = trades([(DAY_START + 30 * SECOND, 2.0)])
     neighbour = check(clean, official_from([(0, 2.0, 2.0)]), previous=flow)
     assert neighbour.status == "pass"
@@ -356,7 +371,7 @@ def test_a_broken_days_far_midnight_figure_is_marked_and_a_neighbour_does_not_fa
 
 
 def test_a_carry_that_a_broken_neighbour_cannot_vouch_for_warns() -> None:
-    broken = DayFlow(0.0, -5.0, 0.0, -5.0, reliable=False)
+    broken = DayFlow(0.0, -5.0, 0.0, -5.0, carry_in_reliable=False, carry_out_reliable=False)
     file = trades([(DAY_START + 90 * SECOND, 1.0)])
     result = check(file, official_from([(0, 3.0, 3.0), (1, 1.0, 1.0)]), previous=broken)
     assert result.status == "warn"
@@ -372,6 +387,115 @@ def test_the_day_flow_comes_back_from_what_is_stored() -> None:
     official = official_from([(1439, 0.5, 0.5)])
     result = check(file, official, following=DayFlow(4.5, 0.0, 4.5, 0.0))
     assert DayFlow.from_detail(result.to_dict()) == DayFlow(0.0, 4.5, 0.0, 4.5)
+
+
+def test_dr04_a_fault_at_noon_does_not_reach_back_across_the_midnight_before_it() -> None:
+    """DR-04. A carry in is known at the first boundary, so a break ten hours later says nothing about it.
+
+    Day one sent 0.5 over midnight. Day two took exactly that and then broke at noon. Day one's last bar must
+    stand, and day two's own carry stays readable.
+    """
+    day_two_start = DAY_END
+    day_two = trades([(day_two_start + 30 * SECOND, 1.0)])
+    stamps = [day_two_start + m * MINUTE for m in range(1440)]
+    official_two = official_from([]).with_columns(
+        pl.Series("open_time", stamps, dtype=pl.Int64).cast(UTC_TIME),
+        pl.Series("volume", [1.5 if m == 0 else 5.0 if m == 720 else 0.0 for m in range(1440)]),
+        pl.Series("taker_buy_volume", [1.5 if m == 0 else 5.0 if m == 720 else 0.0 for m in range(1440)]),
+    )
+    bars_two = build_bars_1m(
+        day_two,
+        venue="generated",
+        symbol="BTCUSDT",
+        first_close_us=day_two_start + MINUTE,
+        last_close_us=day_two_start + DAY,
+        continuity="none",
+        fill_span_allowance_us=0,
+        received_at_us=None,
+    )
+    broken = reconcile_official(
+        day_two,
+        bars_two,
+        official_two,
+        TOLERANCE,
+        window_ms=WINDOW_MS,
+        previous_tail=None,
+        previous_flow=None,
+        next_flow=QUIET,
+        is_first_day=False,
+    )
+    assert broken.status == "fail"
+    assert broken.carry_in == 0.5
+    assert broken.carry_in_reliable is True
+    assert broken.carry_out_reliable is False
+    flow = DayFlow.from_detail(broken.to_dict())
+
+    day_one = trades([(DAY_END - 100_000, 2.0)])
+    result = check(day_one, official_from([(1439, 1.5, 1.5)]), following=flow)
+    assert result.carry_out == 0.5
+    assert result.status == "pass"
+    assert result.flag_last_bar is False
+    assert result.unconfirmed_next is False
+
+
+def test_dr04_a_fault_at_the_first_boundary_does_leave_the_carry_unconfirmed() -> None:
+    """The other side of the split: when the first boundary itself is bad, nobody can vouch for that
+    midnight."""
+    # 9.0 stamped 30 s into the day, counted in no candle: bad at the first boundary, so not a carry at all.
+    broken_day = trades([(DAY_START + 30 * SECOND, 9.0)])
+    broken = check(broken_day, official_from([]))
+    assert broken.carry_in_reliable is False
+    day_before = trades([(DAY_START - 100_000, 2.0)])
+    stamps = [DAY_START - DAY + m * MINUTE for m in range(1440)]
+    official_before = official_from([]).with_columns(
+        pl.Series("open_time", stamps, dtype=pl.Int64).cast(UTC_TIME),
+        pl.Series("volume", [1.5 if m == 1439 else 0.0 for m in range(1440)]),
+        pl.Series("taker_buy_volume", [1.5 if m == 1439 else 0.0 for m in range(1440)]),
+    )
+    bars_before = build_bars_1m(
+        day_before,
+        venue="generated",
+        symbol="BTCUSDT",
+        first_close_us=DAY_START - DAY + MINUTE,
+        last_close_us=DAY_START,
+        continuity="none",
+        fill_span_allowance_us=0,
+        received_at_us=None,
+    )
+    result = reconcile_official(
+        day_before,
+        bars_before,
+        official_before,
+        TOLERANCE,
+        window_ms=WINDOW_MS,
+        previous_tail=None,
+        previous_flow=QUIET,
+        next_flow=DayFlow.from_detail(broken.to_dict()),
+        is_first_day=False,
+    )
+    assert result.status == "warn"
+    assert result.flag_last_bar is True
+    assert result.unconfirmed_next is True
+
+
+def test_dr05_one_long_row_flags_only_its_own_boundary_and_the_next_minute_stands() -> None:
+    """DR-05. One aggregate that ran past the window used to flag every bar until midnight."""
+    file = trades([(DAY_START + MINUTE - 300_000, 5.0), (DAY_START + 90 * SECOND, 1.0)])
+    result = check(file, official_from([(0, 3.0, 3.0), (1, 3.0, 3.0)]))
+    assert result.status == "fail"
+    assert result.flag_close_us == (DAY_START + MINUTE,)
+    assert result.boundaries_unexplained == 1
+
+
+def test_dr05_a_failing_day_flags_a_price_bar_and_a_broken_boundary_together() -> None:
+    file = trades_frame(
+        [
+            (DAY_START + MINUTE - 300_000, 100.0, 5.0, True),
+            (DAY_END - 30 * SECOND, 1000.0, 1.0, True),
+        ]
+    )
+    result = check(file, official_from([(0, 3.0, 3.0), (1, 2.0, 2.0), (1439, 1.0, 1.0)]))
+    assert result.flag_close_us == (DAY_START + MINUTE, DAY_END)
 
 
 # ---- other comparisons
