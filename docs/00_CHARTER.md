@@ -66,7 +66,8 @@ Every value has a **knowable time**, the earliest moment a live system could hav
 
 1. A bar covers `(open_time, close_time]` and is knowable at `close_time`. A higher-timeframe bar
    is knowable only when that higher-timeframe bar closes. A bar built from rows with one stamp over an
-   interval is knowable at its close plus the source's declared span.
+   interval is knowable at its close plus the source's declared span. A bar from official candles covers
+   `[open, close)`. It is knowable at its close plus the source's declared candle allowance.
 2. A swing pivot with `R` right-side bars is knowable at the close of the `R`-th right bar. Its
    knowable time is the confirmation time, never the time of the extreme.
 3. A daily or weekly pivot is computed only from completed UTC periods.
@@ -84,7 +85,8 @@ Every value has a **knowable time**, the earliest moment a live system could hav
     fitted only on past data and frozen before the block it is applied to. A fixed-window statistic recomputed at
     each step from data at or before that step (`ATR`, a rolling percentile rank) is a causal indicator with no
     fitted state, and needs no freezing. A threshold on such an indicator is still a fitted object.
-11. Parameters are selected on training folds only. Test blocks are never reused for selection. A training setup
+11. Parameters are selected on training folds only. Test blocks are never reused for selection, except that a
+    finished test block may join the training of later blocks only, under the same purge. A training setup
     is removed from selection when its maximum possible hold reaches the test block, using the maximum hold and not
     the actual exit, so removal does not depend on the outcome.
 12. A stop or target update computed at time `t` applies from `t + latency`. An update computed on a
@@ -158,9 +160,9 @@ silences. The rest of G1 applies unchanged, and this part applies as follows:
    it. The same holds for any stretch of a source's history with no official candles. A source that publishes candles
    does not qualify just because the pipeline does not read them yet.
 2. **The hole checks are shown on that source.** With `continuity = trade_id`, the evidence must show that the source's
-   ids are consecutive by design, so a skip means missing rows. A row number never counts as an id. With
-   `continuity = none`, every empty minute is a gap. The silence limit `max_quiet_s` is measured on that source and is
-   not left as a placeholder.
+   ids are consecutive by design, so a skip means missing rows, and that ids follow stamps. A row number never counts
+   as an id. With `continuity = none`, every empty minute is a gap. The silence limit `max_quiet_s` is measured on data
+   outside any test block and frozen under C12.
 3. **The verdict is at most `PASS WITH CONDITIONS`.** The conditions name what stays unchecked: a hole that shows neither
    an id skip nor a silence over the limit, and a wrong price or volume.
 4. **Nothing tests the declared span.** The check on the span in item 1 of the [timing contract](#3-timing-contract)
