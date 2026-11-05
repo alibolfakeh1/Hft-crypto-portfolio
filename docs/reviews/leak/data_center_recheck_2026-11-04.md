@@ -6,6 +6,27 @@ Date: 2026-11-05, begun 2026-11-04. Auditor: `leak-auditor`. Code at `dafe3f2`, 
 All data here is generated, and all prices are invented. No source was contacted and nothing was downloaded. Adapters ran on generated files only, with sources switched on in memory. Probes
 and mutants ran on a clone outside the repository. All sources stay disabled in the code audited. Under `D-29` the first run is `V0` on official 1-minute candles and funding, tier `T0`, with bars from trades later. Section 5, ruling 7, covers those candles, and section 9 states the other source-dependent rulings by property.
 
+## Re-audit at `cf1880f`, 2026-11-05: may the first candle run start?
+
+**Not yet.** The data layer now holds for this run, and no leak was found in a decision or a fill on my probes. What stands in the way is one false figure beside the run, one leak in the portfolio's size, a cost omission and the order of work. The list below is exact, and sections 17 and 18 carry the detail. The engine's own audit is in [engine_2026-11-05.md](engine_2026-11-05.md).
+
+| # | Must change before the first `V0` run | Who | Where |
+|---|---|---|---|
+| 1 | **EN-01: the gross cap reads what was held, not the headline legs.** Today a later entry's size depends on prices after its decision | `developer` | Engine report |
+| 2 | **RA-01: a flagged minute does not exclude a day.** Strike the exclusion, and a day is a hole only when its own open or close cannot be had | `developer` | Section 17 |
+| 3 | **EN-02 and EN-06: a hole hides no cost and improves no fill.** Today a settlement inside a hole is never charged, and an entry waits across a hole, filling only if the move was favourable | `developer` | Engine report |
+| 4 | **EN-04: the tests must be able to see a leak.** 33 of 99 injected engine leaks pass all 345 tests, 17 of them direct reads of the future, and a portfolio built from each strategy's best line among them. Whole-run cuts and the named tests in section 5 of the engine report. Add a funding test on `t_cut` against `t_dec`, and `as_of_bars` past `t` (section 17.5). **The audit found no such leak in the code. This is about the guard** | `developer` | Engine report |
+| 5 | **RA-02: `stopped` holds only its two words, and a stopped run decides nothing** | `developer`, `data-steward` | Section 17 |
+| 6 | **`configs/engine.toml` states `D-39`,** with the state declared and "the owner decides" gone. The trial count shown includes the 2 symbol runs of `D-32` | `developer` | Section 18 |
+| 7 | **C15 placebos and `V0S` in, reviewed and inside the C-5 commit.** Their code must not be written or changed after `V0` outcomes exist | `developer`, `python-reviewer`, `leak-auditor` | Section 18 |
+| 8 | **The coverage check run once on `closed-dates` and `first-span`, and its result logged,** under plan section 2. It must precede the first outcome, because the fallback rows close then | `data-steward`, after section 17's conditions | Section 17 |
+| 9 | **The C-5 commit:** host push times, the published diff from each anchor with my rulings in section 18 applied, the costs logged in the registry, and H5 | `project-manager`, `feature-integrator` | Section 18 |
+| 10 | **A re-audit of the changed lines** of items 1 to 7 | `leak-auditor` | |
+
+**Not on the list, on purpose.** The condition 2 test may run later, and until it shows `IDEAL` stays off and nothing else stops. The undated part of `D-18` does not hold back stage 1 (`D-38`). `D-37` does not block a local first run.
+
+**`D-34`'s approval of `coverage-check` can be given,** on the conditions in section 17. **`D-35` is confirmed.** Monthly candles are accepted. The `warn` and exclusion choice is struck.
+
 ## 1. Verdict
 
 **Overall, for the data center code at `dafe3f2`: `FAIL`.** It is a much narrower failure than the first one.
@@ -600,4 +621,142 @@ I read `docs/reviews/data/binance_vision_coverage_2026-11-05.md` at `aac99e2`. I
    C-5 may then proceed, because stage 1 reads only the first span. An exclusion cannot help, since no date is named. So the owner decides on each later read with this in front of them.
 
 **Existence checks.** Another venue's 2025-06-01 falls on a test-block date, and it is recorded as existence only. If its contents were opened, it is a read of that date on that venue and joins plan section 4 like any other. I can take that no further, and it stays `UNVERIFIED`.
+
+## 17. Re-audit of items 0 to 4 and section 15, at `cf1880f`
+
+Generated data only. No network. Production code was read on a clone, and mutants and probes ran outside the repository. The working tree moved while I worked, since `developer` is adding placebos, so everything in this section and the next is about the commit `cf1880f`.
+
+**Verdict: `PASS WITH CONDITIONS` for the candle path.** The earlier overall `FAIL` at `dafe3f2` rested on DR-01 to DR-04. Those now show fixes in code, and their re-audit is due before bars from trades, not now. They are not reachable on this run.
+
+### 17.1 Item by item
+
+| Item | Verdict | Evidence, mine and not the fixes file's | What remains |
+|---|---|---|---|
+| 0, the root | `PASS` | `DataRoot` on a check root refused. `MarketReader` and the report ask again. A later part beside the guard's day is never opened: at a cut on the guard, only the part for 2023-12-31 was read | None |
+| 0, the check | `PASS WITH CONDITIONS` | Exact keys and types, no float, nothing per hour, and `except` paths quote no row, all by reading. It runs through no reader | RA-02. Section 17.3 |
+| 1, converter | `PASS` | 376 cuts on two generated markets with holes and failed rows, each truncated and perturbed, so 752 comparisons of decisions and registers, and 1,023,500 bar comparisons across six timeframes: 0 differ. See the engine report for the method | None |
+| 2, condition 2 | `PASS` as built, not run | Section 17.2. The charter and C2 sentences are in | The run decides `IDEAL` only |
+| 3, reader | `PASS` | `candles`, `funding`, `trades`, `as_of_bars` and `ideal_bars` read at the guard and refuse past it. `ideal_bars` refuses while `candle_check` is `not_shown` | None |
+| 3a, guard | `PASS` | As item 0. The value is one constant, with no key, and a test compares it with the log. The report reads no later part and its span ends at that date | The portfolio view takes its dates through the same reader. It holds no root |
+| 4, holes | `PASS WITH CONDITIONS` | The direct leaks that passed last time are all caught now. Section 17.5 | One read my list missed: funding |
+| 5, key | `PASS` | `candle_allowance_ms` required and declared 10000 | None |
+| 6, DR-08 | `PASS WITH CONDITIONS` | The tail rule is gone, and the span is declared | RA-01 undoes part of it |
+| 7, wording | `PASS` | No shipped file says a placeholder is frozen | `configs/engine.toml`, section 18 |
+
+**My earlier trade-row probes were not rerun.** They test items 8 to 12, which fall due before bars from trades, and the interfaces they drove have changed. Their dates in 2026 are now refused by the guard, which is the guard working.
+
+### 17.2 Section 15: the four points
+
+Run from my own generator against the production check, over 15 generated days, 12 quiet and 3 busy, so it does not rest on the developer's generator.
+
+| Case | Result |
+|---|---|
+| Clean | `PASS` on 15 of 15 |
+| Next 1 or 20 fills of rows not yet begun, moved into the candle closing at the first boundary, midday or a random boundary | `FAIL` on 90 of 90 |
+| Every candle reaching 50 ms past its close | `FAIL` on 15 of 15 |
+| Candles built by row stamp | `INCONCLUSIVE` on 15 of 15 |
+| A later fill of a row already stamped, moved into the earlier candle | `PASS` on 15 of 15, the stated limit |
+| One extra fill in the first candle, never given back, where the previous file's last row could not hold it | `FAIL` on 15 of 15 |
+| The same, where that row could hold it | `PASS` on 15 of 15 |
+
+1. **Step 7 per column: confirmed.** The section opens with "each of volume, taker-buy volume and fill count", and step 7 is one of its steps. It also catches something real: a venue could compute taker-buy by stamp while volume goes by fill time. A quiet day where only sell rows cross a boundary is `INCONCLUSIVE`, and 5 such days are allowed. That is the safe direction.
+2. **The "next 1 fill" case: the developer is right, and my table was loose.** A fill just after a boundary can belong to a row already stamped before it. Then the candle holds a later print, and aggregate rows cannot show it, which is the limit I stated. My "fails 11 of 11" was my generator's luck. **The plant takes fills from rows not yet begun,** and the limit stays held by its own test.
+3. **"Fails 8 of 11" is replaced.** A count from one generator is no rule. **It must fail at step 5 whenever the carry it implies exceeds the previous file's last row in any column: always if that row is one fill, and for a taker-buy extra also if that row is a seller's. Otherwise, for an extra no larger than the row's first fill, it cannot be told from a carry and passes.** The 30 cases above fit this exactly.
+4. **`stopped`: allowed, with RA-02.** A fixed word about the host carries no market value. It is needed, because section 4.2's stop must be told from a clean end.
+
+### 17.3 Findings and the two choices
+
+| ID | Location | Leak class | Scenario with times | Severity | Fix |
+|---|---|---|---|---|---|
+| RA-01 | `data/derive.py` `_derive_from_candles`. `reports/report.py` `USABLE_DAY_STATUSES` | Sample selected by a data event | Invented numbers. 12 days, a fall of about 25 percent on the seventh. One candle missing at 13:05 that day sets `warn` with an exclusion, so that day leaves the benchmark and its one-day returns go with it. Through the production `compute_span_stats`: annualised volatility 144.5 percent becomes 28.9, and **Sharpe -4.13 becomes +5.48,** with total return and drawdown unchanged. An outage is likely to fall on a stressed day, and the benchmark sits beside `V0`. The same rule the project already holds: a silence alone never excludes a day (section 7.4) | `MEDIUM` | **Struck.** Ruling 7 asked for the minute flag and nothing more. No exclusion for a flagged minute. The day stays usable and states how many minutes it flagged. It is a hole only when the row giving its open or close is missing or failed. `warn` may stay as an alert, as long as it does not gate the statistics. No strategy reads this, as the engine audit confirms |
+| RA-02 | `data/coverage.py` `check_output`, `check_candle_output`. Plan section 2 | Free text past a schema. A run counted twice | `stopped` is checked as a string only, so any text passes the schema that is meant to hold what leaves. Separately, a refusal at the 40th file leaves every later quarter with `passes: false`. Read as the plan's one application, those quarters would fail for a reason that has nothing to do with coverage, and fewer than 4 test quarters would move first-span dates | `LOW` | `stopped` must be `none` or `fetch_refused`, by test. **A run with `stopped` other than `none` decides nothing:** it is not the plan's application, and it is rerun in a new root. The same for `candle_check.json` |
+
+**Monthly candles rather than daily: accepted.** A candle's knowable time comes from the grid and never from a file's date, so a month's file carries no timing that a day's would not. A day's bars are cut from the month's part by close time, and truncation at every cut shows no difference. Three conditions. (1) A failed checksum costs a month, so its quarter fails the coverage rule, which is what the plan says should happen. (2) The manifest pins each file's checksum and `Last-Modified`, because `data-steward` found 2022-05 republished. (3) The condition 2 test reads these same files, as the code does. Whether monthly and daily files hold the same rows stays unmeasured, and it does not matter while one is used throughout. Stage 2's trade files stay daily.
+
+**The flagged minute setting `warn` with an exclusion: struck,** as RA-01. It went beyond ruling 7, and the developer was right to name it.
+
+### 17.4 `D-34`: `coverage-check`
+
+**The approval can be given,** for the command and code at this commit, on these conditions.
+
+1. RA-02 is fixed first.
+2. **It runs on a runner's temporary disk, in a job with no cache, artifact or publish step,** as `data-steward` prefers. The raw closed-date files stay in the root after the run by design, so on a local machine they would sit beside agents that can read them. A local run needs that root removed in the same step.
+3. **The workflow file does not exist yet, so it comes to me before it runs,** with its step list and what it prints. A public log may hold the one output file, which holds counts.
+4. The output records the commit, and its result goes in the decision log. It decides coverage and storage only.
+5. It stays a count. This does not open any date, and `D-38` still holds for any read.
+
+### 17.5 Injected leaks on the data layer
+
+**43 new leaks on items 0 to 4 and section 15: 39 caught.** They ran `tests/bars`, the reader, date guard, candle path and source tests, the two leak files and the report tests, stopping at the first failure. These cover the guards, the check root, the converter, the schema and each step of section 15. The four that pass:
+
+| Injected | Is it a leak | Needed |
+|---|---|---|
+| `funding` reads to the decision, not the cut | **Yes, if it happened.** The engine's clock sets the decision 400 days on, and only its own range check would stop a read past the cut. The code is right, and no test holds it. My item 4 listed four reads and left this one out | A test with `t_cut` clearly earlier than `t_dec`, as for the others |
+| `as_of_bars` reads to the read, not to `t` | Only for a read a minute or more after `t` | One test at `t + 60 s` |
+| A cut at midnight opens the next day's part for bars | No. It is opened, and the close filter still holds | None |
+| The report's own marker check removed | No. `DataRoot` and the report's other check still refuse | None |
+
+**The earlier survivors, on this commit.** Of last round's direct leaks, `trades`, `live_trades` and `live_dataset` reading past the cut, `trades_for_run` cutting at `t_dec`, plain columns on higher `IDEAL` bars, a view returning plain flow, and deferral inside half the allowance are **all caught now.** So are the wrong side on settled buy, a dropped row at the cut and the report's as-of filter. Of the ten that did not run last time, three still apply and all three are caught. **Two still pass, neither on this run's path:** the poll's knowable time, which is stage 3 as section 10 says, and settled volume carried across midnight in `derive_day`, which is stage 2. Eight earlier patterns no longer apply because the code around them moved. New ones above cover the same ground for the report, and I did not re-express the rest.
+
+**A fault of mine, for the record.** A first pass of the data mutants ran on copies with no `.git`, which made one unrelated test fail on an unchanged control. I saw it in the control's result and reran those mutants on full copies, so no figure here rests on that test. **A leftover from this round:** I tried to clear temporary mutant copies from my own scratch folder, a safety check refused, and I did not work around it. Those copies stay there, outside the repository.
+
+## 18. The texts committed since `31d05d3`
+
+Read at `cf1880f`: the fold plan's amendment and its sections 8, 9 and 10, `D-32` to `D-41`, the charter, the index and S documents from their anchors, and `CHANGES_2026-11-04.md`. I did not open the demonstration's output, and I cannot.
+
+### 18.1 The items that came after sight of the demonstration
+
+Plan section 10's table, row by row. The test is the one it states: each changed rule or constant cites its reason, and none cites a result.
+
+| Change | Ruling | Why |
+|---|---|---|
+| `stop_slip` 5 bp | **Accepted, on C-3's second route, with the note on any locked read** | I checked its reach in code: it prices stop exits, and `R_min` reads `RT` only, so no setup, floor or trade list moves. `D-32`'s rule charged one flat `slip`, so that run holds no stop-fill measurement. Its writer is not blind, and the text says so |
+| Default line table, C18 | **Accepted** | I checked each at its anchor, before the cut. S01 15m and first touch, S02 1h and `acc` 3, S03 (5, 3) and `max_bos` 2, S04 `Q_min` 60 and touch 0, S05 `RW` 48, S06 15m and `N_r` 2, S09 1h and `SRV_min` 1.0, S10 4h, `PR_max` 0.10 and `B` 12 all stand there as defaults. The four read from a definition or example are S01's and S02's level sets, S06's pools and S09's `W` of 8, and each is what the anchor's own formulas use |
+| S09's window as 90 calendar days | **Accepted. Not a counted trial. It carries the note on a locked read** | It could change a trade list, so it is a real choice. But no S09 outcome existed, `D-32`'s rule has no seasonal profile, and its stated reason follows C12's quarterly refit. Causal in code: the fit runs at the first bar opening at or after the date, from bars already closed |
+| S09's strict rule on a missing hour | **Accepted. Not a counted trial. It carries the note** | It follows C2, and nothing about it can favour a side. It may cost whole quarters, so any softening after a first-span view is a counted trial. The code reads `bar.gap` where the text says "not complete". They agree on candles, and differ on bars from trades, where a pending tail is not a gap: settle that before stage 2 |
+| C15 calendar, candle text, read rule, C17 wording, S07 and S08 under `IDEAL` | **Accepted** | Each is one of my rulings, and I read them against those rulings |
+| Cost wording in section 13 of S01 to S10 | **Accepted** | Text only |
+| Limits in `D-28`, now `D-39` | **Accepted, with the note on every locked portfolio figure** | They reach the portfolio figure only. The owner set them after the demonstration, and the 2x equals its cap. Nobody can show that is chance, so the note stays. `configs/engine.toml` still says "placeholder" and "the owner decides", which must now say what `D-39` says |
+| Flow recipes, `3f0db56` | **Accepted for stage 1, which runs no flow.** Stays on the C-5 list | No writer saw the output, and file times put the commit before the first simulation output. The read may have begun earlier, and that cannot be closed |
+| Cost proposal, `7de8c5a` | **Accepted** | `RT` is C16's value at `38d5907`. Nothing there moved a number |
+| Fold plan | **Accepted** | Calendar only, and reviewed in section 13 |
+
+**One check that could still be run, and no more than a check.** `expert_review.md` is sealed, and I have not asked to see it. Its writer also made the rows above. A script holding it can print yes or no for a list of terms such as `stop`, `slippage`, `seasonal`, `window` and `default`, with nothing else leaving, which plan section 3 allows. A yes changes no ruling here, because each row already carries its note. It would only tell a later reader what the note rests on. This is optional.
+
+### 18.2 The confirmed readings of the `V0` engine
+
+**All accepted.** Each was fixed before any market run, and I checked each for causality.
+
+| Reading | Check |
+|---|---|
+| UTC roll, weekend rule, `ATRD` seed | The roll needs a completed period that can be read. The weekend is known from the next bar's open. **The `ATRD` cost is real:** one flagged minute costs S01, S06 and S09 14 days on that symbol. That is causal and fails closed. It is selection by a data event in the same family as RA-01, and here it follows C3, so it stands. Setups lost must be printed, and any loosening after a view is a counted trial |
+| S02 sequence, S03 and S04 "stays", S04 tie by `Q_k`, S05 `X` through the trigger, S05's three bars, S06 swing age and delay, S08 ties, S09's spent break | None reads past its close. `X` takes the trigger bar's high, which is known at that close |
+| `BE+` from the unrounded fill | The example moved to match C16, by one tick, and no result was involved |
+| `IDEAL-1M` updates act from the same 1m bar as a fill | This matches the code, and it is never earlier than `t + max(latency, A)` |
+| 64 lines | Stays 64, which is the conservative count |
+| C2, C3, C16, C17, C18 as changed | **Accepted.** C2's candle sentences are ruling 7's, with the third proof and the proof's own knowable time. C3's `ATRD` line is above. C16 states the declared costs and who set them. C17's `lateness` no longer reads `knowable_time`, which closes DC-07's text, and candle completeness follows condition 10. C18 takes the read rule, `reaches`, and never simulating a left-out setup |
+| C15: 200 draws, hashed seeds, signed distances by kind, same-block counts for S03 and S10 | No draw reads a later block. A block's counts are same-block information, as C15 discloses. So a placebo entry for S03 or S10 can rest on later bars in its own block, which is fine for a control and must be said on its table. The code came after the text, and section 18.5 says how far I read it |
+
+**Newer than my brief: `3b54087`, rulings on the code review's readings.** I read its change record and no more. None cites a result, and each reading it corrects moves in the safe direction: S03 makes no setup if the swing confirmed at that very close, and S05's retest opens on a later bar, because one bar does not show the order of its high and low. **But its author saw the demonstration, its record says each can change trades, and S01's role rule is the one most likely to.** So these join plan section 10's table as rows, and the next audit reads the code that follows them. They stand on the same footing as the readings above.
+
+### 18.3 The fold plan's amendment
+
+**It adopts FP-01 to FP-10 and section 14's conditions, and I find no date moved.** Section 3's read rule, the once-per-source coverage rule and `reaches` all match. **Three notes.** The `D-27` label in `fold_plan.py` and the reports should also carry `D-38`'s sentence on any test or locked read. **`read_days` is a free list in the configuration:** see EN-05. And section 7's states are behind the code, which `project-manager` should refresh when this lands.
+
+### 18.4 The decisions
+
+| Entry | Ruling |
+|---|---|
+| `D-32` | **Stands, as far as its text can be checked.** I read the rule as written and not the code. A 15m, 20-bar breakout, flat each day, with fixed stop and target. It is not S01 to S10: the nearest, S09 and S10, need a session profile or a compression filter it does not have. "One setting" rests on `D-27`, as it says |
+| `D-33` | **Stands.** Any `candle_allowance` up to `A` gives the same trade list, because the decision reads at `t + A` and every candle closing by `t` is then known |
+| `D-34` | **Stands.** Section 17.4 answers its approval. The 11:07 cut is the right conservative choice |
+| `D-35` | **Confirmed.** The default line selects nothing, and I checked the defaults at their anchors. Keeping S01's and S06's selected line out of the figure is the stricter course, and it is right: a line picked on a span and shown on that span is an in-sample best. In code `portfolio_line` equals the default for all eight, but only "on the grid" is enforced, so a test should hold that equality for a market run |
+| `D-36`, `D-40` | **FP-10 closes** on the owner's statement |
+| `D-38` | **Stands, and it goes further than I asked,** which is right: `BLOCKED` for any date after 2023-12-31 until the owner decides with the gap stated |
+| `D-39` | **Stands, with the note** in 18.1 |
+| `D-41` | **Stands.** When 2024-Q2 opens, 2024-06-01 is excluded on both symbols, since one market is behind both and the name search cannot say what was read |
+
+### 18.5 Placebos and `V0S`
+
+**`V0S` is not built. C15 placebos are not in `cf1880f`.** `developer` has them in the working tree, uncommitted and moving, so they are not audited here. I read `strategies/sources.py` and `strategies/placebo.py` as they stood, and not `engine/placebo.py`. On that reading the draw pool holds to earlier blocks by construction, through `count_before`, and S03 and S10 draw inside a block as C15 says. That is no verdict. **They come to me in a commit, with the injected run, before C-5.** Their code has to be frozen before the first `V0` outcome, or its readings could follow what it sees.
 
