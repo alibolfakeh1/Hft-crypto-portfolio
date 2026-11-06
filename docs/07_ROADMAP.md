@@ -6,7 +6,7 @@ yet, because the reference venue (`D-01`) and the live source (`D-24`) are still
 | Phase | Deliverable | Lead | Reviewers | Gate | Status |
 |---|---|---|---|---|---|
 | P0 Foundation | Charter, team, strategy and feature documents, leak audit of documents, output, data and app specifications | `project-manager` | `leak-auditor` | G0 | In progress |
-| P1 Data center | Zones and catalog on GitHub, historical ingest with catch-up, bars from trades, retention job, hourly live poll, health report, first end-to-end report. See `docs/08_DATA_CENTER.md` | `data-steward`, `developer` | `python-reviewer`, `leak-auditor` | G1 | In progress. Checks after the fetch fixed at `d888254`, code recheck `PASS`. The coverage check is built and not run |
+| P1 Data center | Zones and catalog on GitHub, historical ingest with catch-up, bars from trades, retention job, hourly live poll, health report, first end-to-end report. See `docs/08_DATA_CENTER.md` | `data-steward`, `developer` | `python-reviewer`, `leak-auditor` | G1 | In progress. Checks after the fetch fixed at `d888254`, code recheck `PASS`. The coverage check is built, approved for one local run (`D-44`), and not run |
 | P2 Engine | Event-driven simulator, timing contract enforced in code, costs, funding, dynamic stops, trial registry, leak test suite | `developer` | `python-reviewer`, `leak-auditor` | G6 (engine) | In progress. On generated data, reviewed through `d888254`. Both reviews let the first candle run start once the items left are done |
 | P3 Baselines | All strategies in `V0S` and `V0`, on `T0` and `T1` data | `developer` | `strategy-architect`, `leak-auditor` | G3 | In progress. `V0`, `V0S` and C15 placebos built on generated data and reviewed, with conditions. No market data yet |
 | P4 Portfolio report | Full tear sheets and portfolio report from real baseline results | `developer`, `ui-designer` | `python-reviewer` | G6 | In progress. Portfolio view built on generated data and reviewed. No real results |
@@ -34,7 +34,7 @@ yet, because the reference venue (`D-01`) and the live source (`D-24`) are still
 
 ## Current status
 
-Updated after `dfb9cf0`, 2026-11-06 04:45 UTC by its commit header. The research source is chosen (`D-29`) and research goes in two stages (`D-31`). The fold plan is frozen and reviewed, and
+Updated after `f68c95a`, 2026-11-06 10:21 UTC by its commit header. The research source is chosen (`D-29`) and research goes in two stages (`D-31`). The fold plan is frozen and reviewed, and
 **it is not clean on one point: about 137 MB of `D-18` cannot be dated (`D-38`, `D-41`).** No S01 to S10 strategy has seen market data, the source stays off, and
 **no gate is passed.**
 
@@ -45,10 +45,10 @@ Updated after `dfb9cf0`, 2026-11-06 04:45 UTC by its commit header. The research
 - `V0` of S01 to S06, S09 and S10 on official candles, and of S07 and S08 for bars from trades, which give no result on candles;
 - `V0S` as its own stream, never in the portfolio figure, and C15 placebos with 200 hashed draws;
 - the portfolio view on `D-35`'s line rule and `D-39`'s limits, and the trial registry, without whose declared costs a market run refuses to start;
-- the candle path of the data layer, the checks after the fetch (F1 to F5, K1 to K5), and the coverage check, built and not run.
+- the candle path of the data layer, the checks after the fetch (F1 to F5, K1 to K5), and the coverage check, built, approved for one local run (`D-44`) and not run.
 
 **RC2-01 to RC2-03 and RB-01 to RB-03 are fixed at `d888254`,** with a code recheck `PASS` (`e228cc4`) and a leak re-audit that lets the first run start once the
-items left are done (`8da9ebc`). Nothing left before the first run waits on the developer.
+items left are done (`8da9ebc`). The only code fix left before the first run is the 4 `mypy` errors in `tests/` (item 6 below).
 
 | Reviewed | Verdict | Commit | What it rests on |
 |---|---|---|---|
@@ -58,7 +58,9 @@ items left are done (`8da9ebc`). Nothing left before the first run waits on the 
 | Engine, leak audit | `FAIL`, narrowly | `cf1880f` | Fixed in `1c2dc23` |
 | Engine, placebos and `V0S`, code recheck | No single verdict: on correctness the first run may start, with conditions. C15 `PASS WITH CONDITIONS`, `V0S` `PASS` | `1c2dc23` | R-01 and R-02 fixed at `be20ee7`. R-03 is ruled in the plan's section 6 |
 | Engine, leak re-audit | No single verdict: the first run may start once its items are done. No leak found | `1c2dc23` | Its test of funding to net is in at `be20ee7` |
-| Coverage check's run plan | Either option may run once its items are done | `6a7dfc9` | Recheck section 17.6. Where it runs is the owner's choice |
+| Coverage check's run plan | Either option may run once its items are done | `6a7dfc9` | Recheck section 17.6. The owner chose Option B (`D-44`) |
+| Coverage check, Option B: the script's nine changes, the run commit and the main session as runner, leak review | `PASS WITH CONDITIONS` | `c40c91b`, run commit `99629db` on base `0b853bd` | Recheck section 17.7. Its conditions are the runner's steps in plan section 11.4 |
+| The same script and rule `check-root-after-run`, code review | `PASS WITH CONDITIONS` | `c40c91b`, `99629db` | `docs/reviews/code/coverage_run_script_2026-11-06.md`. Its conditions are in plan section 11.4. It saw 4 `mypy` errors in `tests/`, not on this path |
 | Fixes, dated tick and checks after the fetch, code recheck | `PASS WITH CONDITIONS` | `be20ee7` | RC2-01 to RC2-03, fixed at `d888254`. The dated tick `PASS` |
 | The same, leak re-audit | No single verdict: the first run may start once its items are done. C16 and C7, the dated tick in code, and the checks after the fetch `PASS WITH CONDITIONS`, the rest `PASS` | `be20ee7` | RB-01 to RB-03, fixed at `d888254` |
 | Venue check and dated-tick fixes, code recheck | `PASS` | `d888254` | `e228cc4`. Conditions 2 and 3 of the `be20ee7` recheck are met by the code. What is left is reading the flags after the fetch |
@@ -73,7 +75,7 @@ items left are done (`8da9ebc`). Nothing left before the first run waits on the 
 Reports: `docs/reviews/leak/data_center_recheck_2026-11-04.md`, `docs/reviews/leak/engine_2026-11-05.md`, `docs/reviews/code/engine_review_2026-11-05.md`,
 `docs/reviews/code/engine_recheck_2026-11-05.md`, `docs/reviews/code/fixes_recheck_2026-11-05.md`, `docs/reviews/code/data_center_recheck_2026-11-04.md`,
 `docs/reviews/data/venue_facts_2026-11-05.md`, `docs/reviews/data/coverage_check_plan_2026-11-05.md`, `docs/reviews/leak/features_recheck_2026-11-05.md`,
-`docs/reviews/leak/strategies_recheck_2026-11-04.md`.
+`docs/reviews/leak/strategies_recheck_2026-11-04.md`, `docs/reviews/code/coverage_run_script_2026-11-06.md`.
 
 - **Fold plan:** `docs/decisions/FOLD_PLAN_2026-11-05.md`. `T_start` 2020-01-01, which holds on file coverage, with the quarter check not yet run.
   First training span to 2023-12-31. Seven test quarters from 2024-01-01 to 2025-09-30. Locked block 2025-10-01 to 2026-09-30, read on 10 listed days (`D-27`).
@@ -81,8 +83,8 @@ Reports: `docs/reviews/leak/data_center_recheck_2026-11-04.md`, `docs/reviews/le
   so its placebo has the span before it (section 6, a rule for later).
 - **First run:** `V0` on official 1-minute candles and funding, on the first span only. S07 and S08 need trades, so **the owner's first view shows eight strategies, not ten.**
 - **Before the first run:** the 18 items in section 7 of the fold plan. **Done:** items 1 to 7, apart from freezing C15 and `V0S` in the C-5 commit, item 10, and items 11
-  to 16, the developer's batch and its reviews. H5 is closed. **Left:** the first-span fetch with its flags read (item 17). The coverage check, which waits on the owner
-  (item 8). The C-5 commit (item 9), **which now waits only on the coverage check's result, and so on the owner's choice of where it runs.** The full suite at the commit
+  to 16, the developer's batch and its reviews. H5 is closed. **Left:** the first-span fetch with its flags read (item 17). The coverage check (item 8), **approved for one local
+  run under `D-44` and not run.** The C-5 commit (item 9), **which now waits only on the coverage check's result.** The full suite at the commit
   that will run (item 18). It passed at `be20ee7`, 2004 passed and 2 skipped, and at `d888254`, 2032 passed and 2 skipped, as the coordinator reports.
 - **Tick table (`D-43`):** BTCUSDT 0.01 before 2022-02-15 03:30 UTC and 0.1 from then, ETHUSDT 0.01, dated only from the venue's published times. `UNVERIFIED` until K1 to K4
   pass on the fetched first-span files.
@@ -99,25 +101,22 @@ Reports: `docs/reviews/leak/data_center_recheck_2026-11-04.md`, `docs/reviews/le
 
 | # | What | Who |
 |---|---|---|
-| 1 | Where the coverage check runs: Option A, a one-off Actions job on a throwaway branch, or Option B, a local run | **Owner** |
-| 2 | The coverage check, once, both lists, logged. Before it: the approval recorded under `D-34` with the option and base commit, `leak-auditor`'s read of any diff beyond `be20ee7`, and for Option B the review of rule `check-root-after-run` | `data-steward`, `project-manager`, `leak-auditor`, `python-reviewer` for B |
+| 1 | Where the coverage check runs. **Answered:** Option B, the local run, chosen by the owner on 2026-11-06 (`D-44`) | Owner |
+| 2 | The coverage check, once, both lists, logged. **Approved, not run** (`D-44`): Option B, base `0b853bd`, run commit `99629db`, both reviews `PASS WITH CONDITIONS`. It runs under plan section 11.4, and the result entry follows the run | The main session runs it. `data-steward` writes the result entry |
 | 3 | The first-span fetch, with every F and K flag read before the run | `data-steward` |
 | 4 | The read rule adopted in `GATE_SPEC.md` 8.2, 8.3 and 8.6 and matrix 3.1. H5 is closed | `feature-integrator` |
 | 5 | The C-5 checklist, section 11 of the plan: the files, the commit and its push time, the published diff and its audit, costs in the registry, the count read as 122, the record. Push times for the anchors, the cut and `1fe6d89` are recorded, and part 5 is closed | `project-manager`, the coordinator, `leak-auditor`, `developer` |
-| 6 | The full suite at the commit that will run, with its output recorded. Passed at `be20ee7` and `d888254` | The coordinator |
-| 7 | The first run, on the first span. Then the owner's private view | `developer`, `project-manager` |
-| 8 | Due later, not before the first run: RD-01 and RD-02 before any later change to the fill path or catalog reads. Named tests for C7 and C17, and a check of one output row per S08 branch, before stage 2. The block-only `sharpe` for test-block runs, when the deflated Sharpe ratio is built | `developer` |
-| 9 | Condition F, the `CYCLE` fallback in the spread's benchmark, before the first `CYCLE` run of a candle line | `strategy-architect`, `feature-integrator` |
-| 10 | Stage 2: bars from trades, all ten strategies. Needs a reviewed rule for curated trades against the 4 GB cache | `developer`, `data-steward` |
+| 6 | The 4 `mypy` errors in `tests/`, seen in the coverage script's review at the base and not on the check's path: `test_dated_tick.py:458` and `:519`, `test_date_guard.py:760`, `test_recheck_fixes.py:178`. None in `src/`. Due before the full suite at the commit that will run | `developer` |
+| 7 | The full suite at the commit that will run, with its output recorded. Passed at `be20ee7` and `d888254` | The coordinator |
+| 8 | The first run, on the first span. Then the owner's private view | `developer`, `project-manager` |
+| 9 | Due later, not before the first run: RD-01 and RD-02 before any later change to the fill path or catalog reads. Named tests for C7 and C17, and a check of one output row per S08 branch, before stage 2. The block-only `sharpe` for test-block runs, when the deflated Sharpe ratio is built | `developer` |
+| 10 | Condition F, the `CYCLE` fallback in the spread's benchmark, before the first `CYCLE` run of a candle line | `strategy-architect`, `feature-integrator` |
+| 11 | Stage 2: bars from trades, all ten strategies. Needs a reviewed rule for curated trades against the 4 GB cache | `developer`, `data-steward` |
 
 **Merging this branch to `main` arms the schedule.** Before any merge, the source and the scheduled report must be confirmed off.
 
 **Waiting for the owner.**
 
-- **Where the coverage check runs.** Both options are allowed from the leak side (recheck 17.6). **Recommendation: Option A,** as `data-steward` also recommends. The
-  closed-date files never sit on a machine where agents work, and it needs no new deletion rule. What it costs: one push of a throwaway branch, a public log of counts and
-  fixed words only, and whether GitHub's runner regions are within Binance's terms is `UNVERIFIED`, which the owner confirms. Option B keeps everything local but needs
-  rule `check-root-after-run` reviewed, and its clean-up does not survive a hard kill, so a search after the run must confirm no root is left.
 - `D-37`, market data in the Actions cache, which does not block a local first run. Neither coverage option saves to the cache.
 
 ### Conditions from the data center leak audit

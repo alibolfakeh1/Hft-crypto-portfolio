@@ -4,7 +4,9 @@ Date: 2026-11-05. Owner: `data-steward`. For item 8 of the leak recheck's list
 (`docs/reviews/leak/data_center_recheck_2026-11-04.md`, section 17.4) and plan section 2
 (`docs/decisions/FOLD_PLAN_2026-11-05.md`). Code read at commit `1c2dc23`.
 
-**Status: for review by `leak-auditor` and `project-manager`. Nothing here has run.** No workflow file exists, and this plan
+**Status, 2026-11-06: Option B approved under `D-44`, with the script of section 11.3 and the runner's steps of 11.4. The
+result entry follows the run.** The original status line follows. **Status: for review by `leak-auditor` and
+`project-manager`. Nothing here has run.** No workflow file exists, and this plan
 does not create one. The workflow text is in section 5 for review only. No source was contacted to write this.
 
 ## 1. What runs, and what it decides
