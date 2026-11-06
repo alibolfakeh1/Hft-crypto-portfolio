@@ -6,6 +6,33 @@ Target: `GATE_SPEC.md`, `STRATEGY_FEATURE_MATRIX.md`, `FEATURE_TRIAGE.md` and `D
 
 **Scope.** The research source is open again, and the primary route in `D-22` no longer stands. Everything tied to the named source is marked `PENDING SOURCE`. It was not audited in depth, and section 7 says what must be rechecked. Text that still names the earlier source is a correction pending, not a leak.
 
+## Ruling on H5's pooled `N`, matrix section 7.6 at `80ec7b8`, 2026-11-06
+
+**`PASS WITH CONDITIONS`. Section 7.6 closes H5 condition 1, and with the conditions below it closes C-5 part 5.** I read `80ec7b8`'s diff of `STRATEGY_FEATURE_MATRIX.md` (section 7.6 and the four edits), section 3 of the matrix, sections 5, 6, 9, 10 and 11 of the fold plan, and index section 4. Nothing ran, and no market data was read. The sections below stand as written.
+
+| # | Question | Verdict | Why |
+|---|---|---|---|
+| 1 | Does the whole-project count close H5 condition 1? | `PASS` | I asked for the sum of pooled grids, or a reason not to use it. The reason holds: a pool's members can change with outcomes (a strategy kept in the pool after failing its C15 prerequisite, a strategy retired under C18), so a count tied to membership could be argued after a result, and the whole count cannot. It is never below my per-pool figures of 280 to 344. 498, or 482 if D14 fails, recompute, and the rise in `sqrt(2 ln N)` over those figures is 2.8% to 5.0%. Counting lines still due stops a line read early from getting a smaller `N`. D14 is a source-wide check made before any run, so the 16 lines it can drop cannot follow a result. No discount for overlap, which would be a fitted choice. Counting more than the independent trials errs high |
+| 2 | Does this text close C-5 part 5? | `PASS WITH CONDITIONS` | H5 condition 2 is closed by fold plan section 6. Condition 1 is closed by item 1 above. Part 5 closes once conditions A to D below are in the C-5 commit |
+| 3 | Do the 8 stage 1 C15 readings count as 16? | `PASS` | Matrix 3.2 makes each reading a counted trial, since it labels a strategy. Each pools both symbols, so the symbol rule gives two. A reading re-reads the default line's trades, so it is partly counted already, which errs high. They are not the readings of family K, which are new ones on bars from trades, so they are not counted twice. Condition D makes the printed count show both figures |
+| 4 | Is the argument for the missing `.R` twins sound? | `PASS WITH CONDITIONS` | Yes. `SUPPORTED` needs the 95% CI of the `.L` line's `D`, under its headline scenario `C-LATE` (gate specification P2), to exclude 0 in the expected direction, so R5's cross-kind clause binds only where `.L` under `C-LATE` is not positive, which is where `SUPPORTED` is already out of reach. The twin's absence cannot help a line to `SUPPORTED`. It can only spare a weak line the R5 label. **Condition:** a class verdict with no twin records R5's cross-kind clause as not evaluated, never as passed. A twin is registered before its `.L` line is read, as written |
+| 5 | Does "after C-5, `N` may only rise" sit inside the fold plan's rule for changes? | `PASS WITH CONDITIONS` | Yes. It is the same rule, a dated decision that states its reason and cites no result, with a direction added, as a stop may only tighten. **Conditions:** a change applies to the rule for every class line, never to one line or one verdict. A recorded verdict keeps its `N` and date. A line dropped after C-5 for any reason other than D14 stays in `N`, which "may only rise" already implies |
+| 6 | Must the C-5 diff audit, part 3, include this change? | `PASS` | Yes. The matrix is anchored at `747a37a`, and section 10's row for the four feature documents still reads "`3f0db56` 11:46, with more due". `80ec7b8` goes in that row, stating whether its writer saw `D-32`'s output. Either way I accept it: its reason is H5, it cites no result, and a rule that can only raise `N` cannot be used to favour one |
+
+**Conditions for C-5 part 5,** all in the C-5 commit, which comes before the first `V0` outcome.
+
+| | Condition | Owner |
+|---|---|---|
+| A | Section 10's anchor row for the feature documents names `80ec7b8`, and says whether its writer saw `D-32`'s output | `project-manager` |
+| B | The one-way rule also covers the single-strategy `N` at the top of matrix section 7: after C-5 it may only rise | `feature-integrator` |
+| C | The trial set for the cross-trial spread of Sharpe ratios, the deflated Sharpe ratio's other input that depends on choice, is fixed now: every trial counted in `N`, or another set stated now. The estimators may follow | `feature-integrator` |
+| D | Index section 4 still says "each symbol and each flow variant multiplies this count". It points to fold plan section 6, which replaced the second half, so two frozen texts do not disagree. The count printed beside a run (part 6) shows the 8 readings as 16 symbol runs | `strategy-architect`, `project-manager` |
+
+**Must the single-strategy formula or the other inputs be settled before the first `V0` run?**
+
+- **The single-strategy formula: no change is needed, only condition B.** It is already written, and it enters the C-5 commit. Stage 1 gives no flow result, so nothing reads it yet. One point for later, not now: it counts flow lines "run so far", so a row given its verdict before the rest of its family runs takes a smaller `N`. Section 7.6's own third reason applies to it. Under condition B the fix can only raise `N`, so it may wait until before the first flow verdict.
+- **The other inputs: their values no, but condition C yes.** Stage 1's lines are trials in `N`, so the first `V0` run shows Sharpe ratios that would enter the cross-trial spread. Choosing after that which trials enter, for example leaving out the candle lines, would be a choice made after seeing them. Skew, kurtosis and sample length come from the line's own returns and block, so they can be fixed before any flow outcome, as 7.6 says.
+
 ## 1. Verdict
 
 **Overall, for the source-independent parts only: `PASS WITH CONDITIONS`.** This covers the clock, windows, outcomes before freezing, block reuse, the trial count, gates and purge. It says nothing about any source-tied part, and it is not a verdict on the documents as a whole.
