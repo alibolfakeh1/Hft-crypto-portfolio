@@ -468,13 +468,24 @@ Every later line, reading, rerun or shadow adds its symbol runs.
 
 It does not change the rejection rules in section 3.
 
-**The spread of Sharpe ratios across trials.** Fixed now, before any `V0` run shows a Sharpe ratio. For a flow result, the spread is taken over the trials counted in that result's own `N`, by the formula at the top of this section or by `N_class`. Each symbol run gives one Sharpe ratio, as its own run recorded it by the verdict date, with no new read. Some trials in that `N` have no return stream of their own. They add to `N` and not to the spread: the `V0` against C15 readings, check D11, the screen and the quintile tables, which re-read a line's trades or read no strategy, and `D-32`, whose output stays sealed. A stream with an undefined Sharpe ratio, such as one with no trade, is left out of the spread in the same way, and the number left out is printed. Stage 1's candle lines are in the set wherever they are in `N`. **Reason:** the spread must describe the same search that `N` counts, and a trial with no stream of its own, or a sealed one, has no Sharpe ratio to give without a new read.
+**The spread of Sharpe ratios across trials.** Fixed now, before any `V0` run shows a Sharpe ratio. For a flow result, the spread is taken over the trials counted in that result's own `N`, by the formula at the top of this section or by `N_class`. Each symbol run gives the one Sharpe ratio named below, from what its run has already computed by the verdict date, with no new read. Some trials in that `N` have no return stream of their own. They add to `N` and not to the spread: the `V0` against C15 readings, check D11, the screen and the quintile tables, which re-read a line's trades or read no strategy, and `D-32`, whose output stays sealed. Lines still due count in `N` and are left out of the spread, as index section 4 says. A stream with an undefined Sharpe ratio, such as one with no trade, is left out of the spread in the same way, and the number left out is printed. Stage 1's candle lines are in the set wherever they are in `N`. **Reason:** the spread must describe the same search that `N` counts, and a trial with no stream of its own, or a sealed one, has no Sharpe ratio to give without a new read.
+
+**The one Sharpe ratio a symbol run gives.** The `sharpe` field of the line's strategy-asset row for that symbol, both sides together: net at 1x cost, from daily equity returns, annualised with 365 days, as the run computes it.
+
+- **S08.** Its unit of trial is the branch (index section 4), so each branch and symbol gives its own figure, from that branch's trades alone.
+- **Mode and scenario.** A `.L` line gives its figure under `CYCLE` and `C-LATE`, as the mean of its per-seed figures over the declared seeds (section 2.2, gate specification section 11). A `.R` line gives its figure under `IDEAL-1M` (gate specification section 10). A candle line in a flow result's `N` gives the figure index section 4 names for it.
+- **Range.** The dates the run judges. A test-block run gives its block alone, not the range from `T_start` that it reads for history (fold plan section 6, R-03). A first-span run gives the first span. A line judged on several ranges by the verdict date gives the one on the block being judged, if it has one, and otherwise the one whose range ends latest.
+- **Not used.** By side, both symbols together, other modes and scenarios, and 2x or 3x cost. These are reports.
+
+**Reason:** it is the line's headline mode, scenario, cost and range, so naming it leaves no choice among the figures a run prints.
+
+**Changes to the spread rule.** After the C-5 commit, a change computes the deflated Sharpe ratio's benchmark under both the old rule and the new one, and uses the higher, for every result at once. A recorded verdict keeps its own.
 
 The deflated Sharpe ratio's skew, kurtosis and sample length come from the result's own returns, and are fixed before any flow outcome. The deflated Sharpe ratio is not built yet ([engine review](../reviews/code/engine_review_2026-11-05.md)).
 
 ### 7.7 `N` for a candle-only `V0` result
 
-Stated here, because the symbol rule above is stated only here. **Fixed before any `V0` verdict, from the documents and no result.** [Index section 4](../01_strategies/00_INDEX.md#4-trial-budget) takes the spread of Sharpe ratios for a candle-only result over this `N`.
+Stated here, because the symbol rule above is stated only here. **Fixed before any `V0` figure is printed, from the documents and no result.** [Index section 4](../01_strategies/00_INDEX.md#4-trial-budget) takes the spread of Sharpe ratios for a candle-only result over this `N`.
 
 **The rule is 7.6's.** The deflated Sharpe ratio of a candle-only result uses the whole project's count, not only that strategy's grid:
 
@@ -486,10 +497,10 @@ N_V0 = symbol runs of every counted line and reading on market data, candle and 
 ```
 
 - **Whole, not one strategy's grid.** A candle result is read among all the strategies run beside it, and `D-32` already adds its never-selectable family to the stage's total, 106 and not 104. Stage 1's lines stay in `N` at stage 2 (fold plan sections 5 and 9). One strategy's grid would leave out the rest of that search.
-- **A stage's own lines count from its first verdict.** Stage 1 declares its 52 grid lines and 8 `V0` against C15 readings (fold plan section 5). Stage 2 declares family A in 7.1 and its `V0` against C15 readings in family K (fold plan section 9, item 3). A stage runs its whole declared grid, so reading one strategy early gains nothing.
+- **A stage's own lines count from its first printed figure.** Stage 1 gives no verdict in the gate sense, so on stage 1 "the verdict" in the formula means the printed figure. Stage 1 declares its 52 grid lines and 8 `V0` against C15 readings (fold plan section 5). Stage 2 declares family A in 7.1 and its `V0` against C15 readings in family K (fold plan section 9, item 3). A stage runs its whole declared grid, so reading one strategy early gains nothing.
 - **Units.** A line or reading that pools both symbols counts two (section 6 of the fold plan). Controls are not trials (7.4), and generated runs count none.
 
-**The figure at the first verdict on stage 1.** A count of declared lines, not a result:
+**`N_V0` at the first figure printed on stage 1, which is in-sample description, not a verdict (fold plan section 5).** A count of declared lines, not a result:
 
 | Item | Symbol runs |
 |---|---|

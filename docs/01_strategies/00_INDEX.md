@@ -111,18 +111,40 @@ is the fastest way to overfit an exit.
 **The spread of Sharpe ratios across trials, for a candle-only result.** Fixed on 2026-11-05, before any `V0` run shows a
 Sharpe ratio, from the documents and from no result. The deflated Sharpe ratio of a candle-only result takes the spread over
 the trials counted in that result's own `N`, as
-[section 7.7 of the matrix](../02_features/STRATEGY_FEATURE_MATRIX.md#77-n-for-a-candle-only-v0-result) states it. Each symbol run gives one Sharpe ratio, the one its own run recorded by the
-verdict date, with no new read. A trial with no return stream of its own adds to `N` and not to the spread: the `V0` against
+[section 7.7 of the matrix](../02_features/STRATEGY_FEATURE_MATRIX.md#77-n-for-a-candle-only-v0-result) states it. Each symbol run gives the one Sharpe ratio named below, from what its run has
+already computed by the verdict date, with no new read. A trial with no return stream of its own adds to `N` and not to the spread: the `V0` against
 C15 readings, which re-read a line's trades, and `D-32`, whose output stays sealed. A line in `N` that has not run by the
 verdict date, or whose Sharpe ratio is undefined, such as one with no trade, is left out of the spread, and the number left
 out is printed beside the result. Stage 1's lines are in the set wherever they are in `N`, at stage 2 as well. `V0S`, placebo
 draws and other controls are not trials
 ([matrix section 7.4](../02_features/STRATEGY_FEATURE_MATRIX.md#74-what-is-not-a-trial)), so they are in neither.
-After the C-5 commit, a change to this rule applies to every candle result at once, and a recorded verdict keeps its set and
-its `N`.
 **Reason:** the spread must describe the same search that `N` counts, as section 7.6 of the matrix rules for flow results, and
-a trial with no stream of its own, or a sealed one, has no Sharpe ratio to give without a new read. The deflated Sharpe ratio
-is not built yet ([engine review](../reviews/code/engine_review_2026-11-05.md)).
+a trial with no stream of its own, or a sealed one, has no Sharpe ratio to give without a new read.
+
+**The one Sharpe ratio a candle line gives, for each symbol.** Both sides together, net at 1x cost, from daily equity returns,
+annualised with 365 days, as the run computes the `sharpe` field of the line's strategy-asset row. It is the definition section
+7.6 of the matrix gives a flow line, with the mode set here.
+
+- **S08.** Its unit of trial is the branch (this section, above), so each branch and symbol gives its own figure, from that
+  branch's trades alone.
+- **Mode and scenario.** The mode C18 selects the configuration in: `CYCLE` under `C-LATE`, as the mean of its per-seed figures
+  over the declared seeds in C17, for a configuration that can run live, and `IDEAL-1M` for S01, S06 and a configuration that
+  cannot run live, such as S08 at 30m. A line with no `CYCLE` run by the verdict date, as on the candle stage, where none may
+  start, gives its `IDEAL-1M` figure, which every strategy has (section 5).
+- **Range.** The dates the run judges. A test-block run gives its block alone, not the range from `T_start` that it reads for
+  history (fold plan section 6, R-03). A first-span run gives the first span, which it describes and does not judge (fold plan
+  section 5). A line with figures on several ranges by the verdict date gives the one on the block being judged, if it has
+  one, and otherwise the one whose range ends latest.
+- **Not used.** By side, both symbols together, `IDEAL`, other scenarios, and 2x or 3x cost. These are reports.
+
+**Reason:** it is the line's selection mode and scenario under C18, at 1x cost, over the dates judged, so naming it leaves no
+choice among the figures a run prints.
+
+**Changes to the spread rule.** After the C-5 commit, a change to this rule, including the figure named above, applies to every
+candle result at once. It computes the deflated Sharpe ratio's benchmark under both the old rule and the new one, and uses the
+higher. A recorded verdict keeps its own set, `N` and benchmark.
+
+The deflated Sharpe ratio is not built yet ([engine review](../reviews/code/engine_review_2026-11-05.md)).
 
 The hourly-cycle requirement did not raise the 64-line `V0` grid. S08 and S09 now use 1h defaults, because a
 timeframe that can never run live is a poor use of trials. S08's 30m runs still count as trials, although
