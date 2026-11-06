@@ -732,6 +732,59 @@ Run from my own generator against the production check, over 15 generated days, 
 
 **Base commit.** `1c2dc23` is fine for the coverage code: I re-audited RA-02 there (section 17 and the engine report). The 429 change makes a new base. I review the run commit's diff against that base before it runs, which is the plan's own condition 3.
 
+### 17.7 Option B on the owner's machine: the script's changes and the run commit
+
+Read on 2026-11-06, by reading and with git only. No source was contacted, `coverage-check` did not run, and nothing was committed. **Commits read:** the plan's sections 6 and 11 at `c40c91b`; the run commit `99629db21a04e49e848455e4c4e1815c2f785055` on the local branch `check/coverage-check-run-1`; its parent `0b853bdf87e72591c24ee21d220719b668661f55`; `git diff be20ee7 0b853bd`, compared with `d888254`'s own diff; and the `coverage-check` path at `0b853bd`.
+
+**Verdict: `PASS WITH CONDITIONS`.** The base and the run commit are what the plan says. None of the nine changes lets anything leave but counts, hashes, times, fixed words and the run folder's path, which stays local. The two findings are about what happens around the script, not in it: how it is started, and what the search after it looks for. Both close in the runner's own steps, so the script and its pinned hash stay as reviewed.
+
+**The commits, and what reaches the check.**
+
+| Check | Result |
+|---|---|
+| The run commit | Its only parent is `0b853bd`, and it is the tip of `check/coverage-check-run-1`. `git diff 0b853bd 99629db` is one file and one line: under `[sources.binance]`, `enabled = false` becomes `enabled = true`. No remote-tracking branch in this clone contains it |
+| The base diff | `git diff be20ee7 0b853bd -- src configs tests` is byte for byte `d888254`'s own diff, which I re-audited at `8da9ebc`. The range holds no merge, and every other commit in it changes `docs/` only. `pyproject.toml`, `uv.lock` and `.gitignore` are unchanged |
+| The check's own code | `cli.py`, `data/coverage.py`, `data/fetch.py`, `data/zones.py`, `data/sources.py`, `data/parsers.py`, `data/atomic.py`, `bars/candle_check.py`, `bars/core.py`, `config.py`, `versioning.py` and `timeutil.py` are the same blobs at `0b853bd` as at `be20ee7`, the base I approved |
+| Whether the base diff is reached | **Loaded, not run.** `cli.py` imports `data/ingest.py` at load, and that imports `data/venue_checks.py`. What `d888254` adds to them at module level is constants (`HOST_REFUSALS`, `NO_STOP`, `SPAN_STOPS`, `SPAN_MONTHS`) and one exception class, with no read, write or request. `_cmd_coverage_check` calls neither module, and `coverage.py` imports neither. `configs/engine.toml` is read only through `_market_ticks`, which only `ingest` calls, and its change is four comment lines. `engine/simulator.py` is not imported on this path. **Nothing in the base diff changes what the check fetches, writes or prints** |
+| The pinned hash | The text of section 11.3 at `c40c91b`, with LF endings and a final newline, hashes to `48c6d571f6be748a3befd2ea64a69d68ea99b4c3e86dca1915ccab5019d990c0`, the value the plan pins |
+
+**Question 3: `0b853bd` as the base, with `99629db` as the run commit, is accepted.** Plan section 2 condition 3 is met.
+
+**Question 1: the nine changes, against 17.6 and RA-02.**
+
+| # | Change | Ruling |
+|---|---|---|
+| 1 | Hashes filled in, the repository as `$1` | **Accepted.** Under `set -u` a missing argument stops the script before it makes anything |
+| 2 | `run_folder: <path>` printed | **Accepted, on condition 3.** A local path is no market value, so RA-02 is untouched. It must reach neither the repository nor another agent |
+| 3 | `HEAD` checked against `RUN_SHA` | **Accepted.** It can only refuse |
+| 4 | Paths through `cygpath -m` | **Accepted.** The check gets the Windows form of a path, and `remove_root`, `find` and `du` the shell's form, and both name the same folder. A refusal from `init_check_root` ends the script |
+| 5 | Roots made as `"$out"/root.XXXXXX`, and `remove_root` refusing anything else | **Accepted.** It narrows what the rule can select and adds nothing it can. A refusal ends the script and leaves the root to the search after it, which is the safe direction |
+| 6 | `trap 'exit 130' INT TERM HUP` | **Accepted.** A signal now reaches the `EXIT` trap. Bash runs the trap when the command in hand returns, so the list in progress ends first and the root goes after it. It does nothing for a hard kill, which is 17.6 condition 2's case |
+| 7 | `stop_reason: <word>` printed | **Accepted.** The schema holds it to `none`, or to one of the eight words when `stopped` is `fetch_refused`, before anything is written. The command already prints it inside the document, so nothing new leaves |
+| 8 | `roots_left_in_run_folder: <count>` | **Accepted as a line, but it is not 17.6 condition 2.** It prints only when the script reaches its end, and it counts markers. RE-01 |
+| 9 | uv's own 3.12 | No leak question |
+
+**RA-02 holds.** Every line the script adds is a fixed word, a count, a hash, a time or the local run folder. The check's refusals name a key, and its read path quotes no row. Neither has changed since `be20ee7`.
+
+**Question 2: the main session as the runner, in a new temporary folder, is accepted on conditions 1 to 4.** In an agent's shell on that machine, `mktemp -d` names a folder directly in the user's temporary folder. That is beside the agents' own scratch folder, not inside it. I read this from the environment and created nothing. The main session's environment may differ, so the runner confirms it (condition 1).
+
+**Findings.**
+
+| ID | Location | Leak class | Scenario with times | Severity | Fix |
+|---|---|---|---|---|---|
+| RE-01 | The search after the run (11.2 row 8, 17.6 condition 2). `data/coverage.py`, `_fetch_one` and `run_coverage_check` | Closed-date files left where agents work, and not seen | **The marker can go while a data file stays, in two ways.** (a) The run starts at 10:00. At 10:03, while `closed-dates` fetches into `root.X`, the shell is ended hard, for instance by stopping the tool's task, and its `uv` and Python children go on running. Whether they do is `UNVERIFIED`. At 10:04 the runner searches, finds `root.X` with `ROOT_KIND`, and removes it under the rule. At 10:04:02 the orphan's next `_fetch_one` runs `raw.parent.mkdir(parents=True, exist_ok=True)` and writes `ETHUSDT-1m-2025-06.zip` and its sidecar into a new `root.X/raw/...`, and it goes on to the end of the list. The check reads `ROOT_KIND` only once, at its start. A later search for `ROOT_KIND` finds none, and the log would say no root is left. (b) `rm -rf` removes what it can and carries on past what it cannot. If one zip is held open, `ROOT_KIND` goes and the zip stays. `set -e` then ends the script before row 8's line, and the `EXIT` trap's `remove_root` refuses a root with no marker | `LOW`. Nothing is pointed at the folder, and both cases need an abnormal end | **In the runner's steps after the script, not in the script.** (1) First, confirm that no process of the run is alive: no `uv`, `python` or `hft-crypto` whose command line names the run folder. (2) Then print two counts, and only counts. The first is `root.*` entries inside any `tmp.*` folder directly in the user's temporary folder, which also covers an earlier attempt that was killed. The second is `*.zip` and `*.CHECKSUM` files under the run folder outside `repo/`. Both must be 0. The decision log entry states both counts, not a `ROOT_KIND` count alone. (3) A `root.*` folder found without its marker is not opened. It is removed the same day with the rule's two lines, and the entry says so. Whether rule `check-root-after-run` covers that case is `python-reviewer`'s ruling. From the leak side, its path check alone is enough there: inside a run folder this script printed, once no process of the run is alive |
+| RE-02 | How the script is started (11.2, "Who runs it") | A hard kill made certain | The pauses alone take 648 s: 324 requests, with 2 s after each. That is before any transfer and before `uv sync`. An agent's shell call held in the foreground ends at its time limit, 10 minutes at most. So a foreground run is ended inside `first-span` every time, which puts RE-01's case (a) in play on every run | `LOW` | Start it in the background with no time limit, or have the owner start it in a terminal. Never start it as a call with a limit shorter than the run. Stopping it by hand is the same hard kill, and RE-01's steps then apply |
+
+**Conditions.**
+
+1. **Before starting,** in the shell that will run it, the runner confirms three things. `mktemp -u -d` names a folder directly in the user's temporary folder, inside no agent's scratch or session folder. `DATA_ROOT`, if set on the machine, is neither that folder nor a folder above it: the script unsets `DATA_ROOT`, so `init_check_root`'s check against it does not run, whatever section 6's rule table says. The file to be run hashes to the pinned value.
+2. **RE-02:** in the background, or by the owner. Never as a call with a shorter limit.
+3. **The run folder's path stays in the local log,** the tool's own copy of the output included. No document, decision log entry, commit or post carries it, and no other agent is given it. The entry says "a new temporary folder". Until RE-01's two counts read 0, the main session lists, searches and reads nothing under the run folder except the two output files and those counts.
+4. **RE-01's steps, in that order,** with both counts in the decision log entry.
+5. **17.6 stands otherwise.** The first complete pair is the application: both documents with `stopped: none` and a `code_version` ending `+99629db21a04`, with no `-dirty`, however the script ended after them. A leftover root is RE-01's matter, not the counts'. No run follows a complete pair. After a stop, one rerun on a written note, in new roots, and a second refusal goes to the owner.
+
+**Not checked.** How the agent tool ends a process and its children on that machine, and so whether case (a) can happen. Whether `rm` there fails on a file another process holds open. The main session's own environment. The script file, which is not in the repository: only its hash ties it to section 11.3. Rule `check-root-after-run` as a deletion rule, which is `python-reviewer`'s.
+
 ## 18. The texts committed since `31d05d3`
 
 Read at `cf1880f`: the fold plan's amendment and its sections 8, 9 and 10, `D-32` to `D-41`, the charter, the index and S documents from their anchors, and `CHANGES_2026-11-04.md`. I did not open the demonstration's output, and I cannot.

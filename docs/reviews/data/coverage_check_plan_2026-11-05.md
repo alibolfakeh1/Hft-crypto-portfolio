@@ -256,7 +256,7 @@ done
 | Selects | Exactly the one root this script made with `mktemp -d`, which holds `ROOT_KIND`. Nothing else |
 | Class | `RE-DOWNLOADABLE`, from a public archive that still serves it |
 | Derived-data precondition | **Does not apply, by design.** The check keeps nothing derived. Its purpose is that these files are not kept |
-| Path check | Not a link. Holds `ROOT_KIND`. `init_check_root` has already refused a root inside a repository, or one holding or held by `DATA_ROOT`. This is a named exception to deletion rule 5, which checks against `DATA_ROOT` |
+| Path check | Not a link. Holds `ROOT_KIND`. `init_check_root` has already refused a root inside a repository. The script unsets `DATA_ROOT`, so the runner confirms before the run that `DATA_ROOT`, if set, is neither the temporary folder nor above it (leak recheck 17.7 condition 1). Corrected on 2026-11-06 under finding CR-04 of the script review. This is a named exception to deletion rule 5, which checks against `DATA_ROOT` |
 | Plan before delete | The `removal plan` line, printed in the same step before `rm` |
 | Log | The `removal plan` and `removed` lines, and the decision log entry says the roots were removed |
 | Published runs | None depend on these files |
@@ -497,3 +497,23 @@ echo "roots_left_in_run_folder: $(find "$out" -maxdepth 2 -name ROOT_KIND -type 
 
 The file that runs must have SHA-256 `48c6d571f6be748a3befd2ea64a69d68ea99b4c3e86dca1915ccab5019d990c0`, with LF line endings.
 The decision log entry records that hash.
+
+### 11.4 Reviews and the runner's steps
+
+`leak-auditor`: `PASS WITH CONDITIONS`, section 17.7 of the leak recheck. `python-reviewer`: `PASS WITH CONDITIONS`,
+`docs/reviews/code/coverage_run_script_2026-11-06.md`. The script runs as it is. The conditions are the runner's steps:
+
+1. **Before.** In the shell that runs it: `mktemp` names a folder directly in the system temporary folder and in no agent
+   folder, `DATA_ROOT` is unset, and the file has the hash above.
+2. **How.** Started in the background with no time limit.
+3. **Stopping.** Only `taskkill /F /T` on the run's `uv.exe`. Never a signal to bash, `kill -9`, or `taskkill /F` without `/T`.
+4. **The run folder's path** stays in the local log only. Until the after-run counts read 0, nothing under the run folder is
+   opened except the two output files.
+5. **After, in this order.** No `uv.exe`, `python.exe` or `hft-crypto.exe` of the run is alive. Then two counts, both 0:
+   `root.*` folders inside any `tmp.*` folder beside the run folder, and `*.zip` or `*.CHECKSUM` files under the run folder
+   outside `repo/`. Both counts go in the decision log entry. Commands: section 6 of the script review.
+6. **A leftover without its marker** is removed only by the one-off `check-root-leftover` selection in section 5.1 of the
+   script review, after step 5's process count reads 0. If that refuses, nothing works around it, and `data-steward` and
+   the owner decide.
+7. **The first complete pair is the application:** both documents with `stopped: none` and a `code_version` ending
+   `+99629db21a04` with no `-dirty`. No run follows a complete pair.
