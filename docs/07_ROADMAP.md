@@ -6,7 +6,7 @@ yet, because the reference venue (`D-01`) and the live source (`D-24`) are still
 | Phase | Deliverable | Lead | Reviewers | Gate | Status |
 |---|---|---|---|---|---|
 | P0 Foundation | Charter, team, strategy and feature documents, leak audit of documents, output, data and app specifications | `project-manager` | `leak-auditor` | G0 | In progress |
-| P1 Data center | Zones and catalog on GitHub, historical ingest with catch-up, bars from trades, retention job, hourly live poll, health report, first end-to-end report. See `docs/08_DATA_CENTER.md` | `data-steward`, `developer` | `python-reviewer`, `leak-auditor` | G1 | In progress. Checks after the fetch fixed at `d888254`, code recheck `PASS`. The coverage check is built, approved for one local run (`D-44`), and not run |
+| P1 Data center | Zones and catalog on GitHub, historical ingest with catch-up, bars from trades, retention job, hourly live poll, health report, first end-to-end report. See `docs/08_DATA_CENTER.md` | `data-steward`, `developer` | `python-reviewer`, `leak-auditor` | G1 | In progress. Checks after the fetch fixed at `d888254`, code recheck `PASS`. The coverage check ran once (`D-45`): every quarter passes on candles, and no date moves |
 | P2 Engine | Event-driven simulator, timing contract enforced in code, costs, funding, dynamic stops, trial registry, leak test suite | `developer` | `python-reviewer`, `leak-auditor` | G6 (engine) | In progress. On generated data, reviewed through `d888254`. Both reviews let the first candle run start once the items left are done |
 | P3 Baselines | All strategies in `V0S` and `V0`, on `T0` and `T1` data | `developer` | `strategy-architect`, `leak-auditor` | G3 | In progress. `V0`, `V0S` and C15 placebos built on generated data and reviewed, with conditions. No market data yet |
 | P4 Portfolio report | Full tear sheets and portfolio report from real baseline results | `developer`, `ui-designer` | `python-reviewer` | G6 | In progress. Portfolio view built on generated data and reviewed. No real results |
@@ -34,7 +34,7 @@ yet, because the reference venue (`D-01`) and the live source (`D-24`) are still
 
 ## Current status
 
-Updated after `f68c95a`, 2026-11-06 10:21 UTC by its commit header. The research source is chosen (`D-29`) and research goes in two stages (`D-31`). The fold plan is frozen and reviewed, and
+Updated after `2c2f3f4` and the coverage check's result (`D-45`), 2026-11-06. The research source is chosen (`D-29`) and research goes in two stages (`D-31`). The fold plan is frozen and reviewed, and
 **it is not clean on one point: about 137 MB of `D-18` cannot be dated (`D-38`, `D-41`).** No S01 to S10 strategy has seen market data, the source stays off, and
 **no gate is passed.**
 
@@ -45,7 +45,7 @@ Updated after `f68c95a`, 2026-11-06 10:21 UTC by its commit header. The research
 - `V0` of S01 to S06, S09 and S10 on official candles, and of S07 and S08 for bars from trades, which give no result on candles;
 - `V0S` as its own stream, never in the portfolio figure, and C15 placebos with 200 hashed draws;
 - the portfolio view on `D-35`'s line rule and `D-39`'s limits, and the trial registry, without whose declared costs a market run refuses to start;
-- the candle path of the data layer, the checks after the fetch (F1 to F5, K1 to K5), and the coverage check, built, approved for one local run (`D-44`) and not run.
+- the candle path of the data layer, the checks after the fetch (F1 to F5, K1 to K5), and the coverage check, which has since run once on the archive, counts only (`D-45`).
 
 **RC2-01 to RC2-03 and RB-01 to RB-03 are fixed at `d888254`,** with a code recheck `PASS` (`e228cc4`) and a leak re-audit that lets the first run start once the
 items left are done (`8da9ebc`). The only code fix left before the first run is the 4 `mypy` errors in `tests/` (item 6 below).
@@ -77,14 +77,14 @@ Reports: `docs/reviews/leak/data_center_recheck_2026-11-04.md`, `docs/reviews/le
 `docs/reviews/data/venue_facts_2026-11-05.md`, `docs/reviews/data/coverage_check_plan_2026-11-05.md`, `docs/reviews/leak/features_recheck_2026-11-05.md`,
 `docs/reviews/leak/strategies_recheck_2026-11-04.md`, `docs/reviews/code/coverage_run_script_2026-11-06.md`.
 
-- **Fold plan:** `docs/decisions/FOLD_PLAN_2026-11-05.md`. `T_start` 2020-01-01, which holds on file coverage, with the quarter check not yet run.
+- **Fold plan:** `docs/decisions/FOLD_PLAN_2026-11-05.md`. `T_start` 2020-01-01, which holds: every quarter passed the coverage check on candles, both symbols, and no date moved (`D-45`).
   First training span to 2023-12-31. Seven test quarters from 2024-01-01 to 2025-09-30. Locked block 2025-10-01 to 2026-09-30, read on 10 listed days (`D-27`).
   It stays the locked block, and a locked read rests on what can be shown to predate the demonstration. A run for a test block reads from `T_start` to that block's end,
   so its placebo has the span before it (section 6, a rule for later).
 - **First run:** `V0` on official 1-minute candles and funding, on the first span only. S07 and S08 need trades, so **the owner's first view shows eight strategies, not ten.**
-- **Before the first run:** the 18 items in section 7 of the fold plan. **Done:** items 1 to 7, apart from freezing C15 and `V0S` in the C-5 commit, item 10, and items 11
-  to 16, the developer's batch and its reviews. H5 is closed. **Left:** the first-span fetch with its flags read (item 17). The coverage check (item 8), **approved for one local
-  run under `D-44` and not run.** The C-5 commit (item 9), **which now waits only on the coverage check's result.** The full suite at the commit
+- **Before the first run:** the 18 items in section 7 of the fold plan. **Done:** items 1 to 7, apart from freezing C15 and `V0S` in the C-5 commit, item 8, the coverage
+  check run once with no date moved (`D-45`), item 10, and items 11 to 16, the developer's batch and its reviews. H5 is closed. **Left:** the C-5 commit (item 9), **which no
+  longer waits on the coverage check.** The first-span fetch with its flags read (item 17). The full suite at the commit
   that will run (item 18). It passed at `be20ee7`, 2004 passed and 2 skipped, and at `d888254`, 2032 passed and 2 skipped, as the coordinator reports.
 - **Tick table (`D-43`):** BTCUSDT 0.01 before 2022-02-15 03:30 UTC and 0.1 from then, ETHUSDT 0.01, dated only from the venue's published times. `UNVERIFIED` until K1 to K4
   pass on the fetched first-span files.
@@ -102,7 +102,7 @@ Reports: `docs/reviews/leak/data_center_recheck_2026-11-04.md`, `docs/reviews/le
 | # | What | Who |
 |---|---|---|
 | 1 | Where the coverage check runs. **Answered:** Option B, the local run, chosen by the owner on 2026-11-06 (`D-44`) | Owner |
-| 2 | The coverage check, once, both lists, logged. **Approved, not run** (`D-44`): Option B, base `0b853bd`, run commit `99629db`, both reviews `PASS WITH CONDITIONS`. It runs under plan section 11.4, and the result entry follows the run | The main session runs it. `data-steward` writes the result entry |
+| 2 | The coverage check, once, both lists, logged. **Done** (`D-45`): Option B under `D-44`, both lists `stopped: none`, every quarter passes on candles, and no date moves. No run follows | The main session ran it. `data-steward` wrote the result entry |
 | 3 | The first-span fetch, with every F and K flag read before the run | `data-steward` |
 | 4 | The read rule adopted in `GATE_SPEC.md` 8.2, 8.3 and 8.6 and matrix 3.1. H5 is closed | `feature-integrator` |
 | 5 | The C-5 checklist, section 11 of the plan: the files, the commit and its push time, the published diff and its audit, costs in the registry, the count read as 122, the record. Push times for the anchors, the cut and `1fe6d89` are recorded, and part 5 is closed | `project-manager`, the coordinator, `leak-auditor`, `developer` |
@@ -131,7 +131,7 @@ path was re-audited at `cf1880f` (recheck section 17), and for the first run the
 | Before a source is enabled | DC-06 and DC-08 | `developer` | DC-06 `PASS`. DC-08 `PASS WITH CONDITIONS` |
 | Before bars from trades, stage 2 | The row-shape check of ruling 2 on the source, and `continuity` declared | `data-steward` | Pending. Neither applies to stage 1. Its estimator is declared in section 8 of the fold plan |
 | Before bars from trades, stage 2 | The window `boundary_window_ms` frozen under C12 | `project-manager` | **Pending, and no value is chosen.** Its estimator is declared in section 8 of the fold plan, as one constant with the allowance. The value is computed on the first span. The value in `configs/pipeline.toml` is a placeholder and does not meet this condition |
-| Before the first `V0` run | C-5 extended to the declared values | `project-manager` | Pending. The checklist is section 11 of the fold plan. Part 5 is closed and part 2 is done for the anchors. C-5 now waits only on the coverage check's result |
+| Before the first `V0` run | C-5 extended to the declared values | `project-manager` | Pending. The checklist is section 11 of the fold plan. Part 5 is closed and part 2 is done for the anchors. The coverage check's result is in (`D-45`), so C-5 waits on nothing outside its checklist |
 | Before gate G1 on the chosen source | DC-09 and DC-13 | `developer`, `data-steward` | Both `PASS WITH CONDITIONS`. The DC-13 allowances are placeholders, `UNVERIFIED` until measured |
 | Before gate G1 on the chosen source | Empty minutes with and without proof reported per source | `developer`, `data-steward` | Required by the charter, section 5. The report is not built |
 | Before the first `CYCLE` run | DC-10, and minute 7 or 23 settled | `developer`, `strategy-architect` | DC-10 `PASS WITH CONDITIONS`. Minute 7 is settled in C17, and the recheck finds it in the code |

@@ -1,0 +1,2 @@
+# The coverage check outputs of D-45, kept byte for byte (CRLF as written), so each SHA-256 matches the decision log.
+docs/reviews/data/coverage_check_*_2026-11-06.json -text

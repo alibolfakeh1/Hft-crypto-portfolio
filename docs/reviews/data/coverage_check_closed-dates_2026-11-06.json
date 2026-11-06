@@ -1,0 +1,252 @@
+{
+  "check": "coverage-check-v1",
+  "code_version": "0.1.0+99629db21a04",
+  "file_list_sha256": "83071c99a04e96624c6b992b6644097f4905eae602af3af77ae0e1a9cdfcf23e",
+  "quarters": [
+    {
+      "empty_minutes_proved": 0,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2024-Q1",
+      "row_checks_pass": true,
+      "rows": 131040,
+      "symbol": "BTCUSDT"
+    },
+    {
+      "empty_minutes_proved": 0,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2024-Q1",
+      "row_checks_pass": true,
+      "rows": 131040,
+      "symbol": "ETHUSDT"
+    },
+    {
+      "empty_minutes_proved": 0,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2024-Q2",
+      "row_checks_pass": true,
+      "rows": 131040,
+      "symbol": "BTCUSDT"
+    },
+    {
+      "empty_minutes_proved": 0,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2024-Q2",
+      "row_checks_pass": true,
+      "rows": 131040,
+      "symbol": "ETHUSDT"
+    },
+    {
+      "empty_minutes_proved": 0,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2024-Q3",
+      "row_checks_pass": true,
+      "rows": 132480,
+      "symbol": "BTCUSDT"
+    },
+    {
+      "empty_minutes_proved": 0,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2024-Q3",
+      "row_checks_pass": true,
+      "rows": 132480,
+      "symbol": "ETHUSDT"
+    },
+    {
+      "empty_minutes_proved": 89,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2024-Q4",
+      "row_checks_pass": true,
+      "rows": 132480,
+      "symbol": "BTCUSDT"
+    },
+    {
+      "empty_minutes_proved": 89,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2024-Q4",
+      "row_checks_pass": true,
+      "rows": 132480,
+      "symbol": "ETHUSDT"
+    },
+    {
+      "empty_minutes_proved": 19,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2025-Q1",
+      "row_checks_pass": true,
+      "rows": 129600,
+      "symbol": "BTCUSDT"
+    },
+    {
+      "empty_minutes_proved": 20,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2025-Q1",
+      "row_checks_pass": true,
+      "rows": 129600,
+      "symbol": "ETHUSDT"
+    },
+    {
+      "empty_minutes_proved": 0,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2025-Q2",
+      "row_checks_pass": true,
+      "rows": 131040,
+      "symbol": "BTCUSDT"
+    },
+    {
+      "empty_minutes_proved": 0,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2025-Q2",
+      "row_checks_pass": true,
+      "rows": 131040,
+      "symbol": "ETHUSDT"
+    },
+    {
+      "empty_minutes_proved": 18,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2025-Q3",
+      "row_checks_pass": true,
+      "rows": 132480,
+      "symbol": "BTCUSDT"
+    },
+    {
+      "empty_minutes_proved": 18,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2025-Q3",
+      "row_checks_pass": true,
+      "rows": 132480,
+      "symbol": "ETHUSDT"
+    },
+    {
+      "empty_minutes_proved": 0,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2025-Q4",
+      "row_checks_pass": true,
+      "rows": 132480,
+      "symbol": "BTCUSDT"
+    },
+    {
+      "empty_minutes_proved": 0,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2025-Q4",
+      "row_checks_pass": true,
+      "rows": 132480,
+      "symbol": "ETHUSDT"
+    },
+    {
+      "empty_minutes_proved": 0,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2026-Q1",
+      "row_checks_pass": true,
+      "rows": 129600,
+      "symbol": "BTCUSDT"
+    },
+    {
+      "empty_minutes_proved": 0,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2026-Q1",
+      "row_checks_pass": true,
+      "rows": 129600,
+      "symbol": "ETHUSDT"
+    },
+    {
+      "empty_minutes_proved": 0,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2026-Q2",
+      "row_checks_pass": true,
+      "rows": 131040,
+      "symbol": "BTCUSDT"
+    },
+    {
+      "empty_minutes_proved": 0,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2026-Q2",
+      "row_checks_pass": true,
+      "rows": 131040,
+      "symbol": "ETHUSDT"
+    },
+    {
+      "empty_minutes_proved": 0,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2026-Q3",
+      "row_checks_pass": true,
+      "rows": 132480,
+      "symbol": "BTCUSDT"
+    },
+    {
+      "empty_minutes_proved": 0,
+      "empty_minutes_unproved": 0,
+      "files": 3,
+      "files_checksum_ok": 3,
+      "passes": true,
+      "quarter": "2026-Q3",
+      "row_checks_pass": true,
+      "rows": 132480,
+      "symbol": "ETHUSDT"
+    }
+  ],
+  "run_at": "2026-11-06T10:35:36.652291Z",
+  "stop_reason": "none",
+  "stopped": "none"
+}
