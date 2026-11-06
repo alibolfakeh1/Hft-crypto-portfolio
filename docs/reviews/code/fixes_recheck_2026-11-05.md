@@ -325,3 +325,55 @@ $ python -m pytest -q tests/data/test_date_guard.py -k "stop or 404 or published
 - **What the funding interval column means.** It stays `UNVERIFIED`, and no file in scope can show it.
 - **`CYCLE` mode's `t_cut` as the instant a price is set.** `CYCLE` is not built.
 - **The leak verdict on C16 at `ecc5e49`.** That belongs to `leak-auditor`.
+
+## Recheck at `d888254`
+
+Code at `d888254`, run from a frozen copy. Only the diff `be20ee7..d888254` was read: the developer's section "Fixes after the recheck at `be20ee7`" in the progress note, and the code and tests it names.
+
+**Verdict: `PASS`.** RC2-01, RC2-02 and RC2-03 are fixed, each against its own failure scenario from section 2, and so is the `move_tick` item. Nothing new was found. The RB-01 and RB-03 tests assert what they claim.
+
+**Conditions 2 and 3 for the first run are now met by the code.**
+
+- **Condition 2.** A span flag is now `true` only when all 48 months were checked and none fails. A stopped file's result is kept. So the flags can be read as they stand.
+- **Condition 3.** RC2-01 is fixed.
+- **What remains is reading the result, not working round it.** For each symbol:
+  - F1 to F5, K1, and K2 or K4 are each `true`, not `null`;
+  - `F4.missing` is 0, or each missing settlement is listed;
+  - K3's first and last minute are reviewed.
+
+  F3, F5, K2 and K4 do not stop a run when `false`, by design, so someone has to read them. Condition 1, the full suite, is yours at `d888254`.
+
+| Item | What I ran | Result |
+|---|---|---|
+| RC2-01 | My section 6 probe. The 2023-12 file holds 2024-01-01 00:00, stamped 10 ms early | `F4 {pass: true, duplicates: 0, outside_span: ["2024-01-01T00:00:00Z"]}`. The same row held by two months inside the span is still 1 duplicate, and `false`. Every boundary inside the span, stamped early, still gives 0 missing and 0 duplicates |
+| RC2-02 | My `run_ingest` reproduction, extended. BTCUSDT 2023-11 and 2023-12, with one December funding row at interval 4 | Run 1: stops on `F2_INTERVAL_NOT_8`. Run 2, a minute later inside the retry wait: stops on the kept result. Its run row is `failed`, with `stop_reason` `F2_INTERVAL_NOT_8`, F2 `false`, and every other flag `null` with 2 months checked. Run 3, three days later, after a good file is published: refetched, no stop, `stop_reason` `none`, F2 `null` with 2 months |
+| RC2-02, partial coverage | 10 of 48 candle months checked | K1 and K2 are `null`, with `months_checked` 10. With all 48 months, K2 is `true`, 26 of 26 at 0.01, and K1 is `true` |
+| The coordinator's ruling | `_venue_span`, `SPAN_STOPS` at `src/hft_crypto/data/ingest.py:112-117` and `:1018-1029`, and the run above | Only a flag `is False` for F1, F2, F4 or K1 stops a run, every run, until the month is refetched and passes. One candidate path per Binance monthly file, so the refetch replaces the kept entry. `null` stops nothing: run 3 ends `ok`. F3, F5, K2 and K4 `false`, and K3, do not stop |
+| RC2-03 | My section 2 scenario, through a real `HttpFetcher` with an offline opener, over 24 monthly tasks | A 429, 403 or 451: 1 request, no sleep, 1 failed task. `HostRefusalStop` is raised, the run row is `failed`, and its `stop_reason` is the word. A 503: 3 attempts on each of the 24 tasks, 48 sleeps, and the run ends `partial`, as before |
+| `move_tick` | `src/hft_crypto/engine/simulator.py:163-166`, and its test | A target move with no tick, or with 0, -0.1, NaN or infinity, raises `ValueError`. 0.1, and a stop update, pass. `0.0 < tick < inf` is false for NaN, so NaN is refused |
+| RB-01, cut test | Read, and a mutant | Two runs on the harness's own `_compare`: a table at 0.01 with 1.0 from the cut, against 0.01 throughout (the harness's default, `sim_params` `tick = 0.01`). The cuts sit where each kind of price-setting event becomes known, and a microsecond after. It also asserts that some cut changes something after it, so it cannot pass vacuously. My mutant "a stop update's tick read a day after its close" fails it on S01 on an assertion |
+| RB-01, dated tests | Read | The long and short update test checks the stop path (90.03 to 90.07), the target path (110.03 to 101.17), and the view's tick at every close. The tick read after 03:30 would give 90.0 and 101.1. The T2 test fills on 101.04 against 101.03, and a margin at the fill's tick would need 101.13 |
+| RB-03, static test | Read, and readers of the results searched | The scanner's own test holds it to ten ways in and three harmless lines. The scan covers every module, and asserts that stage one is found. The limit the developer states holds today: every other reader of `check_detail` reads curated entries (`reports/report.py:86`, `:283`; `data/derive.py:670`), and health reads the run rows, not `last_ingest.json` |
+| `config_hash` | Both `engine.toml` files, parsed by the same code | The bytes differ, and `config_hash` is `9cf8d998…d533` for both. The parsed tables are equal |
+
+**Information.** A run that a venue check or a refusal stops does not rewrite `last_ingest.json`, so that file can show the run before it. Health reads the catalog's run rows, which say `failed`. So nothing shown is stale. Accepted.
+
+**My mutants at `d888254`.** Each was run in its own copy, against the tests named. All 5 were killed on an assertion:
+
+- a stop update's tick read a day after its close (the RB-01 cut test, S01);
+- `null` stopping the run (`tests/data/test_venue_checks.py`, 3 failed);
+- a kept K1 failure stopping nothing;
+- RC2-01 reverted;
+- a refusal not ending the run (3 failed).
+
+```text
+$ ruff check src tests ; ruff format --check src tests
+All checks passed!
+119 files already formatted
+$ mypy src          (PYTHONPATH at the short junction)
+Success: no issues found in 72 source files
+$ python -m pytest -q tests/data/test_venue_checks.py tests/data/test_source_switches.py tests/engine/test_dated_tick.py tests/leak/test_venue_checks_reach_no_decision.py "tests/leak/test_whole_run_cuts.py::test_rb01_a_tick_that_changes_at_the_cut_leaves_everything_before_it_unchanged"
+235 passed in 331.00s (0:05:31)
+```
+
+**Not checked here.** The full suite, which the coordinator is running. The rest of `tests/leak`. The roadmap, fold plan and decision log changes in this range, which are not code.
