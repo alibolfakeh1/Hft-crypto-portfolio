@@ -854,6 +854,22 @@ The first span is open, so none of this is a closed-date question. The boundary 
 
 **Not checked.** The script and the suite, which my limits exclude. The run commit, which is not named yet. Other sync or backup clients on the machine, which is the owner's word under 11.1 row 4 and a licence question. Whether antivirus holds a file during a rename. Whether the archive still serves `D-45`'s bytes. The engine run's folder. P-1.
 
+**Addendum: P-1 at `7bd375f`, 2026-11-06.** Read with git only, and no test ran. `git diff 6b15ea7 7bd375f` touches `cli.py`, `data/fetch.py` and a new test file. `git diff 0b853bd 7bd375f -- src configs pyproject.toml uv.lock` is byte for byte the same two-file change, so nothing else has moved since the coverage check's base.
+
+**Ruling on P-1: `PASS`. Condition 1 is met** if the run commit is `7bd375f`, or a later commit whose `src/` and `configs/` equal `7bd375f`'s.
+
+| Point | Ruling |
+|---|---|
+| What it changes | Only when a request starts. `PacedFetcher` sleeps, then calls the client it wraps, which is the unchanged `HttpFetcher`. So `check_url`, the host list, the route, the ceiling, the retries and every error pass through as before, a refusal's fixed word included. It writes nothing and prints nothing. `poll`, `coverage-check` and `candle-check` keep their own clients |
+| Knowable times | **Untouched.** An archive row is knowable at its stamp or close plus the declared allowance, and nothing in `ingest` reads the moment a file arrived. A slower fetch moves no knowable time |
+| The constant | `MIN_REQUEST_GAP_S`, 2.0, in `data/coverage.py`, with no key in any configuration file, so a run's folder cannot reach it. It is courtesy to the host and decides nothing, so it is no leak control either way |
+| Redirects unpaced inside one request | Unchanged. RF-01's note on redirects to the other two hosts stands, and checks 2 and 4 still close it |
+| Zip before sidecar | No leak question. The zip still waits under its temporary name until the sidecar is compared |
+| No gap across processes | No leak question. A resume is a new process, started by hand on a written note |
+| Tests | Read, not run. They use a fake clock and fake or stubbed connections. The one that runs the command uses the repository's configuration, where the source is off, with `run_ingest` replaced, so none contacts a host. The pass counts and the caught breakages are the developer's figures |
+
+**Effect on the plan.** Section 9's paced figures now apply, and RE-02's start in the background with no time limit still covers the longer run. The rest of 17.8 stands.
+
 ## 18. The texts committed since `31d05d3`
 
 Read at `cf1880f`: the fold plan's amendment and its sections 8, 9 and 10, `D-32` to `D-41`, the charter, the index and S documents from their anchors, and `CHANGES_2026-11-04.md`. I did not open the demonstration's output, and I cannot.
