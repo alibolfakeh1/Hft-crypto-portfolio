@@ -6,6 +6,33 @@ Target: `GATE_SPEC.md`, `STRATEGY_FEATURE_MATRIX.md`, `FEATURE_TRIAGE.md` and `D
 
 **Scope.** The research source is open again, and the primary route in `D-22` no longer stands. Everything tied to the named source is marked `PENDING SOURCE`. It was not audited in depth, and section 7 says what must be rechecked. Text that still names the earlier source is a correction pending, not a leak.
 
+## Ruling on C1, C2 and E at `dc00ebc`, 2026-11-06
+
+**`PASS WITH CONDITIONS`. C-5 part 5 closes once `project-manager` records A and D's count.** A's anchor rows now name `80ec7b8`, `481f6a1` and `dc00ebc`, each saying whether its writer saw `D-32`'s output. The one condition left below is due before the first `CYCLE` run of a candle line, not before C-5. I read `dc00ebc`'s diffs of matrix 7.6 and 7.7, index section 4 and the change record. I also checked how the rows are built: the engine gives a strategy-asset row, with its `sharpe` field, for every stream, every line and every symbol. Nothing ran. The rulings below stand as written.
+
+| Item | Verdict | Why |
+|---|---|---|
+| C1, flow half (7.6) | `PASS` | One figure per symbol run: the strategy-asset row's `sharpe`, both sides together, net at 1x, daily, 365 days, over the range judged, and per branch for S08. `.L` lines use `CYCLE` under `C-LATE` as the mean over seeds, and `.R` lines `IDEAL-1M`. Each is the line's headline, and it leaves no choice among the figures a run prints |
+| C1, candle half (index section 4) | `PASS WITH CONDITIONS` | The same figure, in C18's selection mode. The fallback is condition F below |
+| C2, both halves | `PASS` | A later change uses the higher benchmark of the old and new rules, for every result at once, and a recorded verdict keeps its own |
+| Lines still due, in 7.6 | `PASS` | In `N`, and left out of the spread, as the index says |
+| E, in 7.7 | `PASS` | "In-sample description, not a verdict", with `N_V0` at 122 counted from the first printed figure |
+| The range tie-break | `PASS` | The block judged, or else the range ending latest, in both texts. A stage runs its whole grid on a block, so every line has that block's figure by its verdict |
+
+**F: the fallback, looked at closely. `LOW`, and not part of C-5 part 5.**
+
+- **On stage 1 it opens no choice.** No `CYCLE` run may start there, so every line gives its `IDEAL-1M` figure. The candle stage is uniform.
+- **The choice appears with the first `CYCLE` run.** Take a candle verdict on a later block. By then `CYCLE` is allowed, and the team has run `C-LATE` selection for strategies A to D but not yet for E to H. A to D enter the spread at `CYCLE`, and E to H at `IDEAL-1M`. Which strategies run first is a choice of schedule. It is made after each line's `IDEAL-1M` figure is already printed, and it moves the spread, so it is a choice made on outcomes. A date decides the mode, as the writer says, but the team sets that date.
+- **The fix.** When a result's `N` holds both `CYCLE` figures and fallbacks, compute the benchmark twice: with the figures as they stand, and with every line that can run live at its `IDEAL-1M` figure. Use the higher.
+- **When.** It only raises the bar, so C2 allows it after C-5. It is due before the first `CYCLE` run of a candle line, and the flow half inherits it through "the figure index section 4 names". Owner: `strategy-architect`, with `feature-integrator` for 7.6.
+
+**The two gaps named as not for now. I agree with both.**
+
+- **The engine's `sharpe` spans the whole run axis.** A first-span run judges the whole span, so the figure is exact on stage 1. A test-block run would give `T_start` to the block's end where the text names the block alone. It must match the text before any test-block figure enters a spread, which means when the deflated Sharpe ratio is built.
+- **Equity rows exist only for portfolio members.** This does not touch the named figure. Every line and symbol has its strategy-asset row with `sharpe`, built from its own equity curve. So the spread at stage 1 holds all 52 lines on both symbols, not only the default lines.
+
+**The first `V0` run: no change to my verdict at `d888254`.**
+
 ## Ruling on the H5 conditions at `481f6a1`, 2026-11-06
 
 **`PASS WITH CONDITIONS`.** I read `481f6a1`'s diffs of the matrix (7.6, the new 7.7, the symbol rule and the single-strategy formula), of index section 4, and of the change record. I checked each against the rows that a run's output already holds. Nothing ran. The H5 ruling below stands as written.
