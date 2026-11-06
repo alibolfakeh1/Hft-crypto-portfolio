@@ -34,7 +34,7 @@ yet, because the reference venue (`D-01`) and the live source (`D-24`) are still
 
 ## Current status
 
-Updated after `8da9ebc`, 2026-11-06 04:13 UTC by its commit header. The research source is chosen (`D-29`) and research goes in two stages (`D-31`). The fold plan is frozen and reviewed, and
+Updated after `dfb9cf0`, 2026-11-06 04:45 UTC by its commit header. The research source is chosen (`D-29`) and research goes in two stages (`D-31`). The fold plan is frozen and reviewed, and
 **it is not clean on one point: about 137 MB of `D-18` cannot be dated (`D-38`, `D-41`).** No S01 to S10 strategy has seen market data, the source stays off, and
 **no gate is passed.**
 
@@ -67,7 +67,8 @@ items left are done (`8da9ebc`). Nothing left before the first run waits on the 
 | Two-stage plan, `D-31` | `PASS WITH CONDITIONS` | | Reading only the first span is required, not merely convenient |
 | `D-32` to `D-41`, apart from `D-37` | Stand, with notes | | Recheck section 18.4. `D-37` waits for the owner |
 | Rulings after sight of the demonstration, through `ecc5e49` | Accepted, with notes. `ecc5e49`'s with conditions | | Recheck 18.1 and 18.2, and the re-audits at `1c2dc23` and `be20ee7`. All are rows in the plan's section 10 and go through the C-5 diff audit |
-| Feature documents | `PASS WITH CONDITIONS`, source-independent parts only | `3f0db56` | Unchanged since. Their adoption of the read rule is still due |
+| Feature documents | `PASS WITH CONDITIONS`, source-independent parts only | `3f0db56` | Their adoption of the read rule is still due |
+| H5 and the Sharpe spread: matrix 7.6 and 7.7, index section 4 | `PASS WITH CONDITIONS`, in three rulings | `80ec7b8`, `481f6a1`, `dc00ebc` | `docs/reviews/leak/features_recheck_2026-11-05.md`. C-5 part 5 is closed. `N_V0` is 122 at the first stage 1 figure. Condition F falls due before the first `CYCLE` run of a candle line |
 
 Reports: `docs/reviews/leak/data_center_recheck_2026-11-04.md`, `docs/reviews/leak/engine_2026-11-05.md`, `docs/reviews/code/engine_review_2026-11-05.md`,
 `docs/reviews/code/engine_recheck_2026-11-05.md`, `docs/reviews/code/fixes_recheck_2026-11-05.md`, `docs/reviews/code/data_center_recheck_2026-11-04.md`,
@@ -80,9 +81,9 @@ Reports: `docs/reviews/leak/data_center_recheck_2026-11-04.md`, `docs/reviews/le
   so its placebo has the span before it (section 6, a rule for later).
 - **First run:** `V0` on official 1-minute candles and funding, on the first span only. S07 and S08 need trades, so **the owner's first view shows eight strategies, not ten.**
 - **Before the first run:** the 18 items in section 7 of the fold plan. **Done:** items 1 to 7, apart from freezing C15 and `V0S` in the C-5 commit, item 10, and items 11
-  to 16, the developer's batch and its reviews. **Left:** the first-span fetch with its flags read (item 17). The coverage check, which waits on the owner (item 8). The C-5
-  commit (item 9), which also waits on H5. The full suite at the commit that runs (item 18): it passed at `be20ee7`, 2004 passed and 2 skipped, as the coordinator reports,
-  and is still running at `d888254`.
+  to 16, the developer's batch and its reviews. H5 is closed. **Left:** the first-span fetch with its flags read (item 17). The coverage check, which waits on the owner
+  (item 8). The C-5 commit (item 9), **which now waits only on the coverage check's result, and so on the owner's choice of where it runs.** The full suite at the commit
+  that will run (item 18). It passed at `be20ee7`, 2004 passed and 2 skipped, and at `d888254`, 2032 passed and 2 skipped, as the coordinator reports.
 - **Tick table (`D-43`):** BTCUSDT 0.01 before 2022-02-15 03:30 UTC and 0.1 from then, ETHUSDT 0.01, dated only from the venue's published times. `UNVERIFIED` until K1 to K4
   pass on the fetched first-span files.
 - **Sources:** Binance Vision is the research history (`D-29`, replacing `D-17`). Kraken is out (`D-23`), and the project pays for no
@@ -101,12 +102,13 @@ Reports: `docs/reviews/leak/data_center_recheck_2026-11-04.md`, `docs/reviews/le
 | 1 | Where the coverage check runs: Option A, a one-off Actions job on a throwaway branch, or Option B, a local run | **Owner** |
 | 2 | The coverage check, once, both lists, logged. Before it: the approval recorded under `D-34` with the option and base commit, `leak-auditor`'s read of any diff beyond `be20ee7`, and for Option B the review of rule `check-root-after-run` | `data-steward`, `project-manager`, `leak-auditor`, `python-reviewer` for B |
 | 3 | The first-span fetch, with every F and K flag read before the run | `data-steward` |
-| 4 | Pooled `N` (H5), being written, then ruled on. The read rule adopted in `GATE_SPEC.md` 8.2, 8.3 and 8.6 and matrix 3.1 | `feature-integrator`, then `leak-auditor` |
-| 5 | The C-5 checklist, section 11 of the plan: the files, the commit and its push time, the published diff and its audit, costs in the registry, the record. Push times for the anchors, the cut and `1fe6d89` are recorded | `project-manager`, the coordinator, `leak-auditor`, `developer` |
-| 6 | The full suite at the commit that runs, with its output recorded. Passed at `be20ee7`, running at `d888254` | The coordinator |
+| 4 | The read rule adopted in `GATE_SPEC.md` 8.2, 8.3 and 8.6 and matrix 3.1. H5 is closed | `feature-integrator` |
+| 5 | The C-5 checklist, section 11 of the plan: the files, the commit and its push time, the published diff and its audit, costs in the registry, the count read as 122, the record. Push times for the anchors, the cut and `1fe6d89` are recorded, and part 5 is closed | `project-manager`, the coordinator, `leak-auditor`, `developer` |
+| 6 | The full suite at the commit that will run, with its output recorded. Passed at `be20ee7` and `d888254` | The coordinator |
 | 7 | The first run, on the first span. Then the owner's private view | `developer`, `project-manager` |
-| 8 | RD-01 and RD-02 before any later change to the fill path or catalog reads. Named tests for C7 and C17 before stage 2 | `developer` |
-| 9 | Stage 2: bars from trades, all ten strategies. Needs a reviewed rule for curated trades against the 4 GB cache | `developer`, `data-steward` |
+| 8 | Due later, not before the first run: RD-01 and RD-02 before any later change to the fill path or catalog reads. Named tests for C7 and C17, and a check of one output row per S08 branch, before stage 2. The block-only `sharpe` for test-block runs, when the deflated Sharpe ratio is built | `developer` |
+| 9 | Condition F, the `CYCLE` fallback in the spread's benchmark, before the first `CYCLE` run of a candle line | `strategy-architect`, `feature-integrator` |
+| 10 | Stage 2: bars from trades, all ten strategies. Needs a reviewed rule for curated trades against the 4 GB cache | `developer`, `data-steward` |
 
 **Merging this branch to `main` arms the schedule.** Before any merge, the source and the scheduled report must be confirmed off.
 
@@ -130,7 +132,7 @@ path was re-audited at `cf1880f` (recheck section 17), and for the first run the
 | Before a source is enabled | DC-06 and DC-08 | `developer` | DC-06 `PASS`. DC-08 `PASS WITH CONDITIONS` |
 | Before bars from trades, stage 2 | The row-shape check of ruling 2 on the source, and `continuity` declared | `data-steward` | Pending. Neither applies to stage 1. Its estimator is declared in section 8 of the fold plan |
 | Before bars from trades, stage 2 | The window `boundary_window_ms` frozen under C12 | `project-manager` | **Pending, and no value is chosen.** Its estimator is declared in section 8 of the fold plan, as one constant with the allowance. The value is computed on the first span. The value in `configs/pipeline.toml` is a placeholder and does not meet this condition |
-| Before the first `V0` run | C-5 extended to the declared values | `project-manager` | Pending. The checklist is section 11 of the fold plan, and every part is open |
+| Before the first `V0` run | C-5 extended to the declared values | `project-manager` | Pending. The checklist is section 11 of the fold plan. Part 5 is closed and part 2 is done for the anchors. C-5 now waits only on the coverage check's result |
 | Before gate G1 on the chosen source | DC-09 and DC-13 | `developer`, `data-steward` | Both `PASS WITH CONDITIONS`. The DC-13 allowances are placeholders, `UNVERIFIED` until measured |
 | Before gate G1 on the chosen source | Empty minutes with and without proof reported per source | `developer`, `data-steward` | Required by the charter, section 5. The report is not built |
 | Before the first `CYCLE` run | DC-10, and minute 7 or 23 settled | `developer`, `strategy-architect` | DC-10 `PASS WITH CONDITIONS`. Minute 7 is settled in C17, and the recheck finds it in the code |
