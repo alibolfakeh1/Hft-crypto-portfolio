@@ -17,6 +17,7 @@ from hft_crypto.config import (
     ConfigError,
     PipelineConfig,
     RetentionPolicy,
+    find_config_dir,
     load_pipeline_config,
     load_retention_policy,
     quota_bytes,
@@ -200,6 +201,14 @@ def config_has_source(ctx: JobContext) -> bool:
     return bool(ctx.config.enabled_sources())
 
 
+def _market_ticks(args: argparse.Namespace) -> dict[str, Any] | None:
+    """C16's tick tables from configs/engine.toml, for the checks after the fetch. None if there is none."""
+    from hft_crypto.engine.config import load_engine_config
+
+    path = find_config_dir(args.config_dir) / "engine.toml"
+    return dict(load_engine_config(path).ticks) if path.is_file() else None
+
+
 def _cmd_ingest(args: argparse.Namespace, config: PipelineConfig, policy: RetentionPolicy) -> int:
     _refuse_fixed_clock(args)
     ctx = _context(args, config, policy)
@@ -212,6 +221,7 @@ def _cmd_ingest(args: argparse.Namespace, config: PipelineConfig, policy: Retent
         time_budget_s=parse_duration(args.time_budget) if args.time_budget else None,
         delete_raw=args.delete_raw_after_curated,
         include_book=args.include_book,
+        ticks=_market_ticks(args),
     )
     fetcher = HttpFetcher(config.fetch, allowed_hosts=config.enabled_hosts())
     summary = run_ingest(ctx, fetcher, options)

@@ -60,6 +60,7 @@ from hft_crypto.strategies.sources import (
     quarter_name,
     quarter_of,
     sample_without_replacement,
+    uniform_index,
 )
 
 METHOD_LEVELS = "RANDOM_LEVELS"
@@ -172,6 +173,8 @@ class DrawStat:
     counters: dict[str, int]
     failures: dict[str, int]
     missing: dict[str, int]
+    # R-02: entries an S03 or S10 draw could not place, by quarter and side. Empty when every count was met.
+    shortfall: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -382,18 +385,70 @@ def draw_entries(
     rng: random.Random, eligible: dict[int, dict[int, list[int]]], counts: dict[int, dict[int, int]]
 ) -> dict[int, int]:
     """C15: uniformly and without replacement over the eligible bars, as many longs and shorts per block as
-    the real setups. A bar is used once, so a side comes from the draw and owes nothing to what follows. The
-    side with fewer eligible bars draws first, so that using a bar once does not cost the other side its
-    count.
+    the real setups. A bar is used once, so a side comes from the draw and owes nothing to what follows.
+
+    The side with fewer eligible bars draws first. Code recheck R-02: it takes a bar both sides can use only
+    while the other side can still meet its count from the bars left, so the bars only one side can use
+    are spent before the shared bars the other side needs, and both counts are met whenever the bars allow.
+    With bars to spare that limit never binds, and the draw is the same uniform draw as before, number for
+    number. A count that cannot be met is recorded by `entry_shortfall`.
     """
     entries: dict[int, int] = {}
     for quarter in sorted(counts):
         found = eligible.get(quarter, {})
-        for side in sorted(SIDES, key=lambda value: (len(found.get(value, [])), -value)):
-            open_bars = [close for close in found.get(side, []) if close not in entries]
-            for close in sample_without_replacement(rng, open_bars, counts[quarter].get(side, 0)):
-                entries[close] = side
+        first, second = sorted(SIDES, key=lambda value: (len(found.get(value, [])), -value))
+        first_bars = [close for close in found.get(first, []) if close not in entries]
+        second_bars = [close for close in found.get(second, []) if close not in entries]
+        shared = frozenset(first_bars) & frozenset(second_bars)
+        want_first = counts[quarter].get(first, 0)
+        want_second = counts[quarter].get(second, 0)
+        # The shared bars the second side must keep to meet as much of its count as its bars allow.
+        needed = max(0, min(want_second, len(second_bars)) - (len(second_bars) - len(shared)))
+        for close in _sample_sparing(rng, first_bars, want_first, shared, len(shared) - needed):
+            entries[close] = first
+        open_bars = [close for close in second_bars if close not in entries]
+        for close in sample_without_replacement(rng, open_bars, want_second):
+            entries[close] = second
     return entries
+
+
+def _sample_sparing(
+    rng: random.Random, items: list[int], count: int, shared: frozenset[int], spare: int
+) -> list[int]:
+    """`sample_without_replacement`, which stops taking `shared` items once it has taken `spare` of them.
+
+    Until then it makes the same calls on `rng` and gives the same items, so with `spare` never reached it is
+    that function exactly.
+    """
+    pool = list(items)
+    chosen: list[int] = []
+    taken_shared = 0
+    while len(chosen) < count:
+        taken = len(chosen)
+        if taken_shared >= spare:
+            pool = pool[:taken] + [item for item in pool[taken:] if item not in shared]
+        if taken >= len(pool):
+            break
+        pick = taken + uniform_index(rng, len(pool) - taken)
+        pool[taken], pool[pick] = pool[pick], pool[taken]
+        chosen.append(pool[taken])
+        taken_shared += pool[taken] in shared
+    return chosen
+
+
+def entry_shortfall(
+    entries: dict[int, int], eligible: dict[int, dict[int, list[int]]], counts: dict[int, dict[int, int]]
+) -> dict[str, int]:
+    """By quarter and side, how many of the real setups' entries a draw could not place. Empty when none."""
+    short: dict[str, int] = {}
+    for quarter in sorted(counts):
+        found = eligible.get(quarter, {})
+        for side in sorted(SIDES, reverse=True):
+            drawn = sum(1 for close in found.get(side, []) if entries.get(close) == side)
+            missed = counts[quarter].get(side, 0) - drawn
+            if missed > 0:
+                short[f"{quarter_name(quarter)}:{'long' if side > 0 else 'short'}"] = missed
+    return short
 
 
 def draw_anchors(
@@ -435,8 +490,19 @@ def by_branch(trades: Sequence[TradeRecord], compared: frozenset[int]) -> dict[s
     return {tag: mean_result_b([trade for trade in trades if trade.tag == tag], compared) for tag in tags}
 
 
+def drawn_entries(plan: Plan, draw: int) -> dict[int, int]:
+    """The entries `draw_strategy` gives this draw: the first numbers of its own seed, as there."""
+    rng = random.Random(draw_seed(plan.strategy, plan.symbol, plan.line, draw))  # noqa: S311
+    return draw_entries(rng, plan.eligible, plan.counts)
+
+
 def run_draw(plan: Plan, draw: int, item: SymbolData) -> DrawStat:
     result, source = simulate_draw(plan, draw, item)
+    shortfall = (
+        entry_shortfall(drawn_entries(plan, draw), plan.eligible, plan.counts)
+        if plan.swap == METHOD_ENTRIES
+        else {}
+    )
     return DrawStat(
         draw=draw,
         seed=draw_seed(plan.strategy, plan.symbol, plan.line, draw),
@@ -446,6 +512,7 @@ def run_draw(plan: Plan, draw: int, item: SymbolData) -> DrawStat:
         counters=result.counters,
         failures={key: value for key, value in result.reasons.items() if key in _ENTRY_FAILURES},
         missing={} if source is None else dict(source.missing),
+        shortfall=shortfall,
     )
 
 

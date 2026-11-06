@@ -140,6 +140,7 @@ def _draw_row(stat: DrawStat) -> dict[str, Any]:
         "seed": f"{stat.seed:016x}",
         "setups": stat.setups,
         **_mean_row(stat.overall),
+        "entry_shortfall": dict(sorted(stat.shortfall.items())),
     }
 
 
@@ -182,6 +183,9 @@ def placebo_row(result: PlaceboResult, label: str) -> dict[str, Any]:
         "entries_failed_and_not_replaced": _sum([stat.failures for stat in result.draws]),
         "counters": _sum([stat.counters for stat in result.draws]),
         "levels_not_placed": _sum([stat.missing for stat in result.draws]),
+        # R-02: a quarter and side where a draw placed fewer entries than the real setups, summed over draws.
+        "entry_shortfall": _sum([stat.shortfall for stat in result.draws]),
+        "draws_with_an_entry_shortfall": sum(1 for stat in result.draws if stat.shortfall),
         "draw_rows": [_draw_row(stat) for stat in result.draws],
     }
     if result.real_by_branch or any(stat.by_branch for stat in result.draws):

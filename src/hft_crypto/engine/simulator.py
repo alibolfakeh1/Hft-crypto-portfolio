@@ -34,7 +34,7 @@ from hft_crypto.engine.accounting import (
     FundingGap,
     book_trade,
 )
-from hft_crypto.engine.config import CostConfig
+from hft_crypto.engine.config import CostConfig, TickTable
 from hft_crypto.engine.exits import ratchet
 from hft_crypto.engine.fills import (
     EntryPlan,
@@ -43,6 +43,8 @@ from hft_crypto.engine.fills import (
     exit_price,
     plan_entry,
     round_to_tick,
+    tick_at,
+    traded_through,
 )
 from hft_crypto.engine.market import MarketView
 from hft_crypto.engine.tape import Bar, MinuteTape, TradeTape, ceil_minute
@@ -76,7 +78,8 @@ class SimParams:
     risk_budget: float
     capital: float
     leverage_cap: float
-    tick: float
+    # C16: one tick, or a dated table. Each price is rounded with the tick in force when it is set.
+    tick: float | TickTable
     # The first unopened instant, and the days already read. A setup whose maximum hold reaches either is
     # left out.
     span_end_us: int | None = None
@@ -102,12 +105,23 @@ class FundingEvent:
 
 
 @dataclass(frozen=True)
+class FundingIntervalChange:
+    """Two neighbouring funding rows that state different intervals. No settlement is named between them."""
+
+    from_us: int
+    to_us: int
+    hours_before: int
+    hours_after: int
+
+
+@dataclass(frozen=True)
 class SymbolData:
     """Everything one run holds for one symbol."""
 
     tape: MinuteTape
     trades: TradeTape | None
     funding: tuple[FundingEvent, ...]
+    funding_interval_changes: tuple[FundingIntervalChange, ...] = ()
 
 
 def left_out_reason(
@@ -131,6 +145,8 @@ class _Leg:
     name: str
     price: float | None
     fraction: float | None
+    # C7: `tick_i`, the tick in force when this price was set under C16. Its trade-through margin uses it.
+    tick: float
     filled: bool = False
 
 
@@ -140,6 +156,8 @@ class _Scheduled:
     stop: float | None = None
     move: TargetMove | None = None
     stop_reason: str | None = None
+    # The tick in force when a target move was set, which becomes the leg's `tick_i`.
+    move_tick: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -184,6 +202,8 @@ class _Position:
     stop: float
     stop_planned: float
     legs: list[_Leg]
+    # C8's `BE+` before rounding. C16 sets it at its decision, so `be_plus` is rounded at each close.
+    be_plus_raw: float
     be_plus: float
     memo: Any
     qty: float
@@ -338,6 +358,10 @@ class Simulator:
     def _bars(self, minutes: int) -> list[Bar]:
         return self.tape.frame(minutes)
 
+    def _tick_at(self, moment_us: int) -> float:
+        """C16's `tick(t)`: the tick in force at the instant a price is set."""
+        return tick_at(self.params.tick, moment_us)
+
     # ---- the run ------------------------------------------------------------------------------------------
 
     def run(self) -> StreamResult:
@@ -448,7 +472,8 @@ class Simulator:
                 reason=out_because,
             )
             return
-        tick = self.params.tick
+        # C16: the setup's `S0` and targets are set at its decision, the close.
+        tick = self._tick_at(bar.close_us)
         side = proposal.side
         s0 = round_to_tick(proposal.s0, side, tick)
         targets = tuple(
@@ -516,6 +541,9 @@ class Simulator:
     def _manage(self, position: _Position, bar: Bar, market: MarketView, decided_as_of: int) -> None:
         if position.pending_exit_us is not None:
             return  # an exit is already on its way, and nothing below can act before it does
+        # C16: every price set at this close, `BE+` among them, uses the tick in force at this close.
+        tick = self._tick_at(bar.close_us)
+        position.be_plus = round_to_tick(position.be_plus_raw, position.side, tick)
         view = PositionView(position)
         decision: Management = self.strategy.manage(market, view)
         effective = ceil_minute(decided_as_of)
@@ -532,13 +560,15 @@ class Simulator:
                 n=position.n,
             )
             return
+        # C16 and rule 9: `ratchet` rounds with this close's tick before it compares with the stop planned,
+        # so a coarser tick that would loosen the stop leaves it where it is.
         result = ratchet(
             side=position.side,
             old_stop=position.stop_planned,
             candidates=decision.stops,
             close=bar.c,
             atr=bar.atr,
-            tick=self.params.tick,
+            tick=tick,
         )
         if result.reason is not None:
             old = position.stop_planned
@@ -559,12 +589,13 @@ class Simulator:
     def _schedule_target(
         self, position: _Position, move: TargetMove, computed_at: int, effective: int, knowable: int
     ) -> None:
-        price = None if move.price is None else round_to_tick(move.price, position.side, self.params.tick)
+        tick = self._tick_at(computed_at)
+        price = None if move.price is None else round_to_tick(move.price, position.side, tick)
         old = position.planned_target(move.name)
         if old == price and not move.set_fraction:
             return
         rounded = TargetMove(move.name, price, move.reason, move.set_fraction, move.fraction)
-        position.scheduled.append(_Scheduled(effective, move=rounded))
+        position.scheduled.append(_Scheduled(effective, move=rounded, move_tick=tick))
         row = {
             "computed_at_us": computed_at,
             "effective_from_us": effective,
@@ -661,12 +692,18 @@ class Simulator:
         fill = entry_fill_price(reference, plan.side, self.params.costs)
         r = abs(fill - plan.s0)
         rt = self.params.costs.rt
+        fill_us = self._open_us[row]
+        # C16: the setup's targets were set at its decision, so that tick is their `tick_i`. A price computed
+        # from the fill is set at the fill.
+        set_tick = self._tick_at(pending.signal_us)
+        fill_tick = self._tick_at(fill_us)
+        be_plus = fill * (1.0 + plan.side * rt)
         position = _Position(
             proposal=proposal,
             plan=plan,
             signal_us=pending.signal_us,
             side=plan.side,
-            fill_us=self._open_us[row],
+            fill_us=fill_us,
             fill_row=row,
             fill_reference=reference,
             fill=fill,
@@ -674,8 +711,10 @@ class Simulator:
             q0=plan.q0,
             stop=plan.s0,
             stop_planned=plan.s0,
-            legs=[_Leg(item.name, item.price, item.fraction) for item in proposal.targets],
-            be_plus=round_to_tick(fill * (1.0 + plan.side * rt), plan.side, self.params.tick),
+            legs=[_Leg(item.name, item.price, item.fraction, set_tick) for item in proposal.targets],
+            be_plus_raw=be_plus,
+            # Rounded again at each close that may use it. This value is only what the fill's own view shows.
+            be_plus=round_to_tick(be_plus, plan.side, fill_tick),
             memo=proposal.memo,
             qty=plan.q0,
             best=plan.side * reference,
@@ -696,9 +735,10 @@ class Simulator:
         )
         # C7 uses the setup's targets on the fill bar. A strategy that says otherwise is the named exception.
         for move in self.strategy.on_fill(PositionView(position)):
-            price = None if move.price is None else round_to_tick(move.price, plan.side, self.params.tick)
+            price = None if move.price is None else round_to_tick(move.price, plan.side, fill_tick)
             for leg in position.legs:
                 if leg.name == move.name:
+                    leg.tick = fill_tick
                     position.target_path.append(
                         {
                             "computed_at_us": position.fill_us,
@@ -760,7 +800,8 @@ class Simulator:
             key=lambda item: side * (item.price if item.price is not None else 0.0),
         ):
             price_level = leg.price
-            if price_level is None or high <= side * price_level:
+            # C7: a trade through the target by at least its own `tick_i`, and the fill is at the target.
+            if price_level is None or not traded_through(high, side * price_level, leg.tick):
                 continue
             self._fill_target(position, leg, close_us, price_level)
             if position.qty <= _QTY_EPSILON * position.q0:
@@ -779,6 +820,7 @@ class Simulator:
             for leg in position.legs:
                 if leg.name == move.name and not leg.filled:
                     leg.price = move.price
+                    leg.tick = item.move_tick
                     if move.set_fraction:
                         leg.fraction = move.fraction
 

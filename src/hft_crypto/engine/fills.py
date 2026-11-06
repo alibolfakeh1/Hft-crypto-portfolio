@@ -10,7 +10,16 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from hft_crypto.engine.config import CostConfig
+from hft_crypto.engine.config import CostConfig, TickTable
+
+# How far from a whole number of ticks a value may sit and still count as on it, in ticks. Binary arithmetic
+# leaves a value on a tick a hair off it, and this must never cost or give a whole tick.
+ON_TICK = 1e-7
+
+
+def tick_at(tick: float | TickTable, moment_us: int) -> float:
+    """C16's `tick(t)`. A plain number is one tick at every instant."""
+    return tick.at(moment_us) if isinstance(tick, TickTable) else tick
 
 
 def round_to_tick(price: float, side: int, tick: float) -> float:
@@ -19,10 +28,20 @@ def round_to_tick(price: float, side: int, tick: float) -> float:
     steps = price / tick
     # A value already on a tick can sit just under it in binary, and must not lose a whole tick.
     nearest = round(steps)
-    if abs(steps - nearest) < 1e-7:
+    if abs(steps - nearest) < ON_TICK:
         return round(nearest * tick, decimals)
     whole = math.floor(steps) if side > 0 else math.ceil(steps)
     return round(whole * tick, decimals)
+
+
+def traded_through(extreme: float, target: float, tick: float) -> bool:
+    """C7: a passive target fills on a trade through its price by at least one tick of its own, `tick_i`.
+
+    Both prices are in side space, so a long needs `H >= Ti + tick_i` and a short `L <= Ti - tick_i`. The test
+    is in ticks, with the same tolerance as `round_to_tick`, so a print exactly one tick through is never
+    missed through binary error, and half a tick through never fills.
+    """
+    return (extreme - target) / tick >= 1.0 - ON_TICK
 
 
 @dataclass(frozen=True)

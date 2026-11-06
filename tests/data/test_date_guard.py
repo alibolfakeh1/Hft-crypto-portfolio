@@ -611,11 +611,13 @@ def test_the_schema_check_refuses_anything_off_the_list() -> None:
         "run_at": "x",
         "file_list_sha256": "x",
         "stopped": "none",
+        "stop_reason": "none",
         "quarters": [good_row],
     }
     check_output(good)
     for bad in (
         {**good, "note": "x"},
+        {key: value for key, value in good.items() if key != "stop_reason"},
         {key: value for key, value in good.items() if key != "check"},
         {**good, "quarters": [{**good_row, "close": 100.0}]},
         {**good, "quarters": [{**good_row, "rows": 1.0}]},
@@ -693,23 +695,30 @@ def test_too_few_trades_an_hour_fail_and_the_count_does_not_leave(
     assert not [key for key in row if "hour" in key or "trade" in key]
 
 
-def test_a_month_that_is_not_published_fails_its_quarter(tmp_path: Path, one_quarter: PipelineConfig) -> None:
+def test_a_404_on_a_listed_file_stops_the_run_and_fails_no_quarter(
+    tmp_path: Path, one_quarter: PipelineConfig
+) -> None:
+    """Leak recheck 17.6. The listing showed every month, so a 404 now is an outage and not a coverage fact.
+    Failing the quarter would lose it for good, because the plan applies once."""
     from hft_crypto.data.sources import monthly_candle_file
 
     fetcher = _publish(one_quarter)
     target = monthly_candle_file(one_quarter, "binance", BTC, dt.date(2024, 2, 1))
     del fetcher.files[target.url]
-    row = _run(one_quarter, _check_root(tmp_path / "check"), fetcher)["quarters"][0]
-    assert row["files"] == 2
-    assert row["passes"] is False
+    document = _run(one_quarter, _check_root(tmp_path / "check"), fetcher)
+    assert (document["stopped"], document["stop_reason"]) == ("fetch_refused", "not_found")
+    assert document["quarters"] == []
+    march = monthly_candle_file(one_quarter, "binance", BTC, dt.date(2024, 3, 1))
+    assert march.url not in fetcher.requests
+    assert march.checksum_url not in fetcher.requests
 
 
-def test_a_quarter_with_no_file_says_no_row_check_passed(tmp_path: Path, one_quarter: PipelineConfig) -> None:
-    row = _run(one_quarter, _check_root(tmp_path / "check"), FakeFetcher())["quarters"][0]
-    assert row["files"] == 0
-    assert row["rows"] == 0
-    assert row["row_checks_pass"] is False
-    assert row["passes"] is False
+def test_nothing_published_stops_at_the_first_file(tmp_path: Path, one_quarter: PipelineConfig) -> None:
+    fetcher = FakeFetcher()
+    document = _run(one_quarter, _check_root(tmp_path / "check"), fetcher)
+    assert (document["stopped"], document["stop_reason"]) == ("fetch_refused", "not_found")
+    assert document["quarters"] == []
+    assert len(fetcher.requests) == 1
 
 
 def test_an_error_nobody_planned_for_quotes_no_row(
@@ -732,19 +741,35 @@ def test_an_error_nobody_planned_for_quotes_no_row(
     assert str(PRICE) not in captured.out + captured.err + written
 
 
-def test_a_checksum_mismatch_fails_its_quarter_and_is_never_parsed(
-    tmp_path: Path, one_quarter: PipelineConfig
+@pytest.mark.parametrize("sidecar", [False, True], ids=["zip altered", "sidecar unreadable"])
+def test_a_checksum_mismatch_stops_the_run_and_the_file_is_never_parsed(
+    tmp_path: Path, one_quarter: PipelineConfig, monkeypatch: pytest.MonkeyPatch, sidecar: bool
 ) -> None:
+    """Leak recheck 17.6: a transfer error is transient, so it is a stop and the rerun rule, not a failed
+    quarter."""
+    from hft_crypto.data import coverage
     from hft_crypto.data.sources import monthly_candle_file
 
     fetcher = _publish(one_quarter)
     target = monthly_candle_file(one_quarter, "binance", BTC, dt.date(2024, 2, 1))
-    fetcher.files[target.url] = fetcher.files[target.url] + b"x"
-    row = _run(one_quarter, _check_root(tmp_path / "check"), fetcher)["quarters"][0]
-    assert row["files"] == 3
-    assert row["files_checksum_ok"] == 2
-    assert row["rows"] == 62 * 1440
-    assert row["passes"] is False
+    if sidecar:
+        fetcher.files[target.checksum_url or ""] = b"\xff\xfe not a sidecar"
+    else:
+        fetcher.files[target.url] = fetcher.files[target.url] + b"x"
+    parsed: list[dt.date] = []
+    real = coverage.parse_klines
+
+    def counting(raw: Path, symbol: str, month: dt.date, *args: Any, **kwargs: Any) -> Any:
+        parsed.append(month)
+        return real(raw, symbol, month, *args, **kwargs)
+
+    monkeypatch.setattr(coverage, "parse_klines", counting)
+    document = _run(one_quarter, _check_root(tmp_path / "check"), fetcher)
+    assert (document["stopped"], document["stop_reason"]) == ("fetch_refused", "checksum_mismatch")
+    assert document["quarters"] == []
+    assert parsed == [dt.date(2024, 1, 1)]
+    march = monthly_candle_file(one_quarter, "binance", BTC, dt.date(2024, 3, 1))
+    assert march.checksum_url not in fetcher.requests
 
 
 def test_a_refusal_by_the_host_stops_the_job_with_a_fixed_code(
@@ -755,9 +780,10 @@ def test_a_refusal_by_the_host_stops_the_job_with_a_fixed_code(
 
     fetcher = _publish(one_quarter)
     target = monthly_candle_file(one_quarter, "binance", BTC, dt.date(2024, 2, 1))
-    fetcher.failures[target.url] = FetchError("403 and any words the host chose")
+    fetcher.failures[target.url] = FetchError("403 and any words the host chose", reason="http_403")
     document = _run(one_quarter, _check_root(tmp_path / "check"), fetcher)
     assert document["stopped"] == "fetch_refused"
+    assert document["stop_reason"] == "http_403"
     # RA-02: a stopped run decides nothing, so no quarter can be read as failing for a reason that is not
     # coverage. It is rerun in a new root.
     assert document["quarters"] == []
@@ -765,6 +791,51 @@ def test_a_refusal_by_the_host_stops_the_job_with_a_fixed_code(
     march = monthly_candle_file(one_quarter, "binance", BTC, dt.date(2024, 3, 1))
     assert march.url not in fetcher.requests
     assert "any words" not in json.dumps(document)
+
+
+@pytest.mark.parametrize(
+    "word", ["http_403", "http_451", "http_429", "timeout", "connection", "size_limit", "not_found"]
+)
+def test_each_word_a_fetch_can_stop_on_reaches_the_document_and_nothing_else(
+    tmp_path: Path, one_quarter: PipelineConfig, word: str
+) -> None:
+    from hft_crypto.data.fetch import FetchError
+    from hft_crypto.data.sources import monthly_candle_file
+
+    fetcher = _publish(one_quarter)
+    target = monthly_candle_file(one_quarter, "binance", BTC, dt.date(2024, 2, 1))
+    fetcher.failures[target.url] = FetchError(f"{PRICE} and any words the host chose", reason=word)
+    root = _check_root(tmp_path / "check")
+    document = _run(one_quarter, root, fetcher)
+    assert (document["stopped"], document["stop_reason"]) == ("fetch_refused", word)
+    assert document["quarters"] == []
+    written = (root / "coverage" / "coverage_check.json").read_text(encoding="utf-8")
+    assert json.loads(written) == document
+    assert "any words" not in written
+    assert str(PRICE) not in written
+
+
+def test_a_complete_run_says_no_stop_reason(tmp_path: Path, one_quarter: PipelineConfig) -> None:
+    document = _run(one_quarter, _check_root(tmp_path / "check"), _publish(one_quarter))
+    assert (document["stopped"], document["stop_reason"]) == ("none", "none")
+
+
+def test_the_document_names_its_commit_by_12_hex_characters(
+    tmp_path: Path, one_quarter: PipelineConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Coverage plan 7.2: `<package version>+<first 12 hex of the commit>`, which the job's step 4 reads."""
+    from hft_crypto import __version__
+    from hft_crypto.versioning import code_version
+
+    sha = "0123456789abcdef0123456789abcdef01234567"
+    monkeypatch.setenv("GITHUB_SHA", sha)
+    code_version.cache_clear()
+    try:
+        document = _run(one_quarter, _check_root(tmp_path / "check"), _publish(one_quarter))
+    finally:
+        code_version.cache_clear()
+    assert document["code_version"] == f"{__version__}+0123456789ab"
+    assert document["code_version"].endswith("+" + sha[:12])
 
 
 def test_the_check_paces_itself_as_the_terms_ask(tmp_path: Path, one_quarter: PipelineConfig) -> None:
@@ -1139,13 +1210,16 @@ def test_the_check_sets_nothing_so_ideal_stays_off_until_someone_with_the_eviden
 from hft_crypto.data.parsers import ValidationError  # noqa: E402
 
 
-def _coverage_document(stopped: str, quarters: list[dict[str, object]]) -> dict[str, object]:
+def _coverage_document(
+    stopped: str, quarters: list[dict[str, object]], reason: str | None = None
+) -> dict[str, object]:
     return {
         "check": "x",
         "code_version": "x",
         "run_at": "x",
         "file_list_sha256": "x",
         "stopped": stopped,
+        "stop_reason": reason if reason is not None else ("none" if stopped == "none" else "http_403"),
         "quarters": quarters,
     }
 
@@ -1195,3 +1269,49 @@ def test_ra02_a_stopped_run_holds_no_result_to_read() -> None:
         check_output(_coverage_document("fetch_refused", [_QUARTER]))
     with pytest.raises(ValidationError, match="decides nothing"):
         check_candle_output(_candle_document("fetch_refused", [_DAY]))
+    for word in ("not_found", "checksum_mismatch", "http_429"):
+        with pytest.raises(ValidationError, match="decides nothing"):
+            check_output(_coverage_document("fetch_refused", [_QUARTER], word))
+
+
+REASON_WORDS = (
+    "http_403",
+    "http_451",
+    "http_429",
+    "timeout",
+    "connection",
+    "size_limit",
+    "not_found",
+    "checksum_mismatch",
+)
+
+
+def test_17_6_a_stop_reason_is_one_word_of_a_fixed_list() -> None:
+    """Leak recheck 17.6. The list is held here, so a new word needs a change the auditor can see."""
+    from hft_crypto.data.coverage import STOP_REASONS, check_output
+
+    assert frozenset(REASON_WORDS) == STOP_REASONS
+    for word in REASON_WORDS:
+        check_output(_coverage_document("fetch_refused", [], word))
+    check_output(_coverage_document("none", [_QUARTER], "none"))
+
+
+@pytest.mark.parametrize(
+    ("stopped", "reason"),
+    [
+        ("fetch_refused", "none"),
+        ("fetch_refused", "HTTP 403 Forbidden"),
+        ("fetch_refused", "http_500"),
+        ("fetch_refused", ""),
+        ("none", "http_403"),
+        ("none", ""),
+    ],
+)
+def test_17_6_a_stop_reason_off_the_list_or_on_a_run_that_did_not_stop_is_refused(
+    stopped: str, reason: str
+) -> None:
+    from hft_crypto.data.coverage import check_output
+
+    quarters = [_QUARTER] if stopped == "none" else []
+    with pytest.raises(ValidationError, match="stop_reason holds a word off the list"):
+        check_output(_coverage_document(stopped, quarters, reason))

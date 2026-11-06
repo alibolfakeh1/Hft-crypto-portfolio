@@ -6,17 +6,16 @@ microsecond before it, and at random closes, and each cut is both truncated and 
 
 - **Markets.** Two seeds or more, for every strategy that runs: candle-shaped rows from the real converter,
   with runs of missing rows and rows that fail a check, for S01 to S06, S09 and S10. Bars from trades with
-  holes in the ids, for all ten. S05 is rare, so it has three seeds picked to reach it, for coverage only.
-  S09's holes come after its first profile fit, or it would never trade.
+  holes in the ids, for all ten. S05 is rare, so it has three seeds picked to reach it, for coverage only,
+  and one long driftless market of candles on which a line reaches its third setup and more. S09's holes
+  come after its first profile fit, or it would never trade.
 - **Lines.** The default line and one other.
 - **What is compared.** Every decision knowable by the cut, and the registers at the last decided close.
   Every bar of every timeframe, on its own.
 - **The back door stays open on purpose.** A simulator that keeps a setup from the third on only if the
   next bar moves its way is run through the same harness, for every strategy, and the harness must see it.
-  No generated S05 run reaches a second setup on a line, so a filter from the third cannot act on it, and
-  a dropped setup that is a run's only one leaves no event for a cut to land on. For S05 the back door
-  reads the next bar into the stop instead, from the first setup on. A filter from the third is not shown
-  for S05.
+  For S05 it acts on the long market, since S05's short markets give one setup a line at most. The older
+  S05 back door, the next bar read into the stop from the first setup on, is kept as its own test.
 
 All data is generated, and all prices are invented.
 """
@@ -47,7 +46,7 @@ from engine_helpers import (
     trades_through,
     utc,
 )
-from hft_crypto.bars.core import bars_from_official
+from hft_crypto.bars.core import UTC_TIME, bars_from_official
 from hft_crypto.engine.market import MarketView
 from hft_crypto.engine.simulator import SimParams, Simulator, StreamResult
 from hft_crypto.engine.tape import Bar, MinuteTape, TradeTape
@@ -63,6 +62,12 @@ ALL = (*ON_CANDLES, "S07", "S08")
 # seeds 1 to 30 over 230 days with these holes, none gave more than one setup on a line, and its second line
 # gave none. These three give one each on the default line, on candles and on trades.
 SEEDS = {"S05": ((3, 230), (5, 230), (6, 230))}
+# Code recheck at 1c2dc23, section 8: one long driftless market for S05, so a filter from its third setup can
+# act. Seed 10 over 600 days gives 4 setups on the default line and none on the other. Of seeds 1 to 10 at
+# 600 days, 9 gave a setup and 7 a third on a line, and the back door below showed on seeds 1, 4 and 10: it
+# needs a third setup the filter keeps, and a cut whose noise then turns that setup's next bar. Seed 10 was
+# picked for that alone, and showed at two cuts.
+LONG_SEED = {"S05": (10, 600)}
 DEFAULT_SEEDS = ((7, DAYS), (11, DAYS))
 # S09 fits its profile once a quarter and fails closed on any flagged hour in the window (as
 # test_s09_a_flagged_hour_never_enters_the_profile_so_the_fit_fails_closed holds), so with the early holes it
@@ -121,6 +126,39 @@ def _candles(seed: int, days: int, layout: str) -> pl.DataFrame:
     )
 
 
+@lru_cache(maxsize=1)
+def _driftless_candles(seed: int, days: int) -> pl.DataFrame:
+    """Candle-shaped rows on a path with no drift, built a whole minute at a time so a long market is quick.
+
+    Volatility changes by the day, so quiet stretches and active ones both appear. A minute's volume grows
+    with the square of its move, as on a venue, so a strong bar can carry the volume S05's break asks for.
+    Every minute trades, and none is missing or fails a check.
+    """
+    rng = np.random.default_rng(seed)
+    minutes = days * 1440
+    step = 0.03 / np.sqrt(1440.0)
+    scale = np.repeat(np.exp(rng.normal(0.0, 0.45, days)), 1440) * step
+    moves = rng.normal(0.0, 1.0, minutes) * scale
+    close = np.round(1000.0 * np.exp(np.cumsum(moves)), 2)
+    opening = np.concatenate(([1000.0], close[:-1]))
+    wick = np.abs(rng.normal(0.0, 1.0, minutes)) * scale * 0.5
+    size = moves / step
+    volume = np.round(rng.uniform(0.5, 1.5, minutes) * (0.3 + size * size), 3) + 0.001
+    return pl.DataFrame(
+        {
+            "open_time": pl.Series(START + np.arange(minutes, dtype=np.int64) * MINUTE).cast(UTC_TIME),
+            "open": opening,
+            "high": np.round(np.maximum(opening, close) * (1.0 + wick), 2),
+            "low": np.round(np.minimum(opening, close) * (1.0 - wick), 2),
+            "close": close,
+            "volume": volume,
+            "quote_volume": volume * close,
+            "trade_count": pl.Series(rng.poisson(3.0, minutes) + 1, dtype=pl.Int64),
+            "taker_buy_volume": volume / 2.0,
+        }
+    )
+
+
 def _candle_tape(candles: pl.DataFrame, through_us: int) -> MinuteTape:
     last_close = (through_us - CANDLE_ALLOWANCE_US) // MINUTE * MINUTE
     held = candles.filter(pl.col("open_time").dt.timestamp("us") + MINUTE <= last_close)
@@ -169,6 +207,8 @@ class Market:
         return _trade_tape(self.data() if data is None else data, through_us)
 
     def data(self) -> pl.DataFrame:
+        if self.kind == "candles" and self.layout == "driftless":
+            return _driftless_candles(self.seed, self.days)
         if self.kind == "candles":
             return _candles(self.seed, self.days, self.layout)
         return _holed_trades(self.seed, self.days, self.layout)
@@ -214,10 +254,12 @@ def _scramble_candles_after(candles: pl.DataFrame, cut_us: int, seed: int) -> pl
 
 
 def _markets(strategy: str) -> list[Market]:
+    """A long market comes first, so the back door below finds a third setup before the short markets."""
     seeds = SEEDS.get(strategy, DEFAULT_SEEDS)
     kinds = ("candles", "trades") if strategy in ON_CANDLES else ("trades",)
     layout = LAYOUT.get(strategy, "early")
-    return [Market(kind, seed, days, layout) for kind in kinds for seed, days in seeds]
+    long = [Market("candles", *LONG_SEED[strategy], "driftless")] if strategy in LONG_SEED else []
+    return [*long, *(Market(kind, seed, days, layout) for kind in kinds for seed, days in seeds)]
 
 
 def _lines(strategy: str) -> list[tuple[str, dict[str, Any]]]:
@@ -246,11 +288,16 @@ def _run(
     trades: TradeTape | None,
     market: Market,
     simulator: type[Simulator] = Simulator,
+    keep: frozenset[int] | None = None,
 ) -> Run:
+    """Every close is a key of `snapshots`. Its registers are written at the closes in `keep`, or at every
+    close if `keep` is None, and are an empty text elsewhere. Writing them is a pure read of the strategy."""
     snapshots: dict[int, str] = {}
 
     def probe(held: Strategy, view: MarketView) -> None:
-        snapshots[view.now_us] = json.dumps(held.snapshot(), sort_keys=True, default=str)
+        now = view.now_us
+        wanted = keep is None or now in keep
+        snapshots[now] = json.dumps(held.snapshot(), sort_keys=True, default=str) if wanted else ""
 
     built = build_strategy(strategy, {**params, "tier": "T0" if trades is None else "T1"})
     stream = simulator(built, tape, _params(market), trades=trades, probe=probe).run()
@@ -281,31 +328,44 @@ def _cuts(run: Run, name: str) -> tuple[list[int], list[int]]:
     return truncation, decided
 
 
+def _last_decided(run: Run, cut_us: int) -> int | None:
+    """The close whose registers a cut compares: the last one decided by the cut."""
+    decided = [close for close in run.snapshots if close + DELAY_US <= cut_us]
+    return max(decided) if decided else None
+
+
 def _compare(full: Run, other: Run, cut_us: int, allowance: int, label: str) -> None:
     assert _known_by(full.events, cut_us, allowance) == _known_by(other.events, cut_us, allowance), label
-    decided = [close for close in full.snapshots if close + DELAY_US <= cut_us]
-    if decided:
-        close = max(decided)
+    close = _last_decided(full, cut_us)
+    if close is not None:
         assert full.snapshots[close] == other.snapshots[close], f"{label}: registers at {close}"
 
 
 def _check_line(
     strategy: str, params: dict[str, Any], market: Market, simulator: type[Simulator] = Simulator
 ) -> tuple[int, list[str]]:
-    """Every cut for one line on one market. Returns the setups seen and every difference found."""
+    """Every cut for one line on one market. Returns the setups seen and every difference found.
+
+    A first run finds the cuts, and the registers are then written only at the closes those cuts compare.
+    The comparisons are the ones a probe at every close would make, at a fraction of the cost.
+    """
     tape, trades = market.tape(market.end)
-    full = _run(strategy, params, tape, trades, market, simulator)
     name = f"{strategy}|{market}|{sorted(params.items())}"
-    truncation, perturbation = _cuts(full, name)
+    first = _run(strategy, params, tape, trades, market, simulator, frozenset())
+    truncation, perturbation = _cuts(first, name)
+    keep = frozenset(
+        close for cut in (*truncation, *perturbation) if (close := _last_decided(first, cut)) is not None
+    )
+    full = _run(strategy, params, tape, trades, market, simulator, keep)
     differences: list[str] = []
     for cut in truncation:
-        other = _run(strategy, params, *market.truncated(cut), market, simulator)
+        other = _run(strategy, params, *market.truncated(cut), market, simulator, keep)
         try:
             _compare(full, other, cut, market.allowance, f"{name} cut at {cut}")
         except AssertionError as failure:
             differences.append(str(failure)[:200])
     for index, cut in enumerate(perturbation):
-        other = _run(strategy, params, *market.perturbed(cut, 101 + index), market, simulator)
+        other = _run(strategy, params, *market.perturbed(cut, 101 + index), market, simulator, keep)
         try:
             _compare(full, other, cut, market.allowance, f"{name} perturbed at {cut}")
         except AssertionError as failure:
@@ -353,9 +413,6 @@ class _NextBarPeek(Simulator):
         super()._take(proposal, bar, strategy, decided_as_of)
 
 
-FILTERS: dict[str, type[Simulator]] = {"S05": _NextBarPeek}
-
-
 @pytest.mark.parametrize("strategy", ALL)
 def test_the_harness_catches_a_next_bar_filter_from_the_third_setup_on(strategy: str) -> None:
     """If this did not fail on a real leak, the test above would be worth nothing. The filter only acts on a
@@ -364,10 +421,33 @@ def test_the_harness_catches_a_next_bar_filter_from_the_third_setup_on(strategy:
     found: list[str] = []
     for market in _markets(strategy):
         for _, params in _lines(strategy):
-            found += _check_line(strategy, params, market, FILTERS.get(strategy, _NextBarFilter))[1]
+            found += _check_line(strategy, params, market, _NextBarFilter)[1]
         if found:
             break
     assert found, f"{strategy}: a next-bar filter from the third setup on went unseen on every market"
+
+
+def test_s05_s_long_market_takes_a_line_to_a_third_setup() -> None:
+    """Without it the filter above could not act on S05, and its test would pass on the old markets alone."""
+    market = _markets("S05")[0]
+    tape, trades = market.tape(market.end)
+    counts = [
+        _run("S05", params, tape, trades, market, keep=frozenset()).stream.setups
+        for _, params in _lines("S05")
+    ]
+    assert market.layout == "driftless"
+    assert max(counts) >= 3, counts
+
+
+def test_the_harness_catches_a_next_bar_read_into_s05_s_stop_from_its_first_setup() -> None:
+    """The older S05 back door, kept on S05's short markets, where a line gives one setup at most."""
+    found: list[str] = []
+    for market in _markets("S05")[1:]:
+        for _, params in _lines("S05"):
+            found += _check_line("S05", params, market, _NextBarPeek)[1]
+        if found:
+            break
+    assert found, "S05: the next bar read into the stop went unseen on every short market"
 
 
 # ---- every bar of every timeframe --------------------------------------------------------------------------

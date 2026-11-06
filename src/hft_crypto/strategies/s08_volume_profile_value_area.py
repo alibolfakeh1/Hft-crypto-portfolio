@@ -172,8 +172,9 @@ class S08VolumeProfileValueArea(Strategy):
         days = [end_us - back * MICROS_PER_DAY for back in range(self.profile_days)]
         if not all(day in self._complete for day in days):
             return None
+        # C16: the bin floor uses the tick in force at the profile's end.
         area = value_area(
-            market.trades_between(end_us - self.profile_days * MICROS_PER_DAY, end_us), market.tick
+            market.trades_between(end_us - self.profile_days * MICROS_PER_DAY, end_us), market.tick_at(end_us)
         )
         if area is not None:
             area = self._placed(area, market.bar)

@@ -13,6 +13,7 @@ import numpy as np
 import numpy.typing as npt
 
 from hft_crypto.bars.core import TimingContractError
+from hft_crypto.engine.config import TickTable
 from hft_crypto.engine.tape import Bar, TradeTape
 
 _FloatArray = npt.NDArray[np.float64]
@@ -53,14 +54,14 @@ class MarketView:
         self,
         *,
         symbol: str,
-        tick: float,
+        tick: float | TickTable,
         rt: float,
         minutes: int,
         higher: tuple[int, ...],
         trades: TradeTape | None,
     ) -> None:
         self.symbol = symbol
-        self.tick = tick
+        self._tick = tick
         self.rt = rt
         self.now_us = 0
         self._primary = FrameView(minutes)
@@ -70,6 +71,17 @@ class MarketView:
     @property
     def tier(self) -> str:
         return "T0" if self._trades is None else "T1"
+
+    @property
+    def tick(self) -> float:
+        """C16: the tick in force at this close."""
+        return self.tick_at(self.now_us)
+
+    def tick_at(self, moment_us: int) -> float:
+        """The tick in force at an instant up to this close. A later instant is refused, as for trades."""
+        if moment_us > self.now_us:
+            raise TimingContractError("a strategy asked for the tick after its own close")
+        return self._tick.at(moment_us) if isinstance(self._tick, TickTable) else self._tick
 
     @property
     def bars(self) -> list[Bar]:

@@ -687,39 +687,50 @@ def test_a_successful_read_and_a_successful_download(tmp_path: Path) -> None:
 
 def test_a_404_is_not_published_and_is_not_retried() -> None:
     fetcher, network = client({})
-    with pytest.raises(NotPublishedError):
+    with pytest.raises(NotPublishedError) as caught:
         fetcher.get_bytes(GOOD, 100)
     assert network.seen == [GOOD]
+    assert caught.value.reason == "not_found"
 
 
-@pytest.mark.parametrize("code", [403, 451])
+@pytest.mark.parametrize("code", [403, 451, 429])
 def test_a_refusal_by_the_host_is_not_retried(code: int) -> None:
+    """Coverage record 4.2 and the coverage plan's condition 2: a 429 stops at once, as a 403 and a 451 do."""
     error = urllib.error.HTTPError(GOOD, code, "no", http.client.HTTPMessage(), None)
     fetcher, network = client({GOOD: error})
-    with pytest.raises(FetchError, match=str(code)):
+    with pytest.raises(FetchError, match=str(code)) as caught:
         fetcher.get_bytes(GOOD, 100)
     assert network.seen == [GOOD]
+    assert caught.value.reason == f"http_{code}"
 
 
 @pytest.mark.parametrize(
-    "error",
+    ("error", "reason"),
     [
-        http.client.IncompleteRead(b"partial"),
-        http.client.BadStatusLine("garbage"),
-        urllib.error.URLError("no route"),
-        TimeoutError("slow"),
-        ConnectionResetError("reset"),
-        OSError("disk or socket"),
-        ValueError("not a number"),
+        (http.client.IncompleteRead(b"partial"), "connection"),
+        (http.client.BadStatusLine("garbage"), "connection"),
+        (urllib.error.URLError("no route"), "connection"),
+        (urllib.error.URLError(TimeoutError("connect timed out")), "timeout"),
+        (TimeoutError("slow"), "timeout"),
+        (ConnectionResetError("reset"), "connection"),
+        (OSError("disk or socket"), "connection"),
+        (ValueError("not a number"), "connection"),
+        (urllib.error.HTTPError(GOOD, 500, "no", http.client.HTTPMessage(), None), "connection"),
+        (urllib.error.HTTPError(GOOD, 503, "no", http.client.HTTPMessage(), None), "connection"),
     ],
-    ids=lambda e: type(e).__name__,
+    ids=lambda e: type(e).__name__ if isinstance(e, Exception) else e,
 )
-def test_every_kind_of_broken_response_is_retried_and_then_a_fetch_error(error: Exception) -> None:
-    """F-05. IncompleteRead, BadStatusLine and a non-numeric length used to escape and kill the run."""
+def test_every_kind_of_broken_response_is_retried_and_then_a_fetch_error(
+    error: Exception, reason: str
+) -> None:
+    """F-05. IncompleteRead, BadStatusLine and a non-numeric length used to escape and kill the run. Each ends
+    with one fixed word for the coverage check: `timeout` for a timed-out connect or read, `connection` for
+    the rest."""
     fetcher, network = client({GOOD: error}, attempts=3)
-    with pytest.raises(FetchError):
+    with pytest.raises(FetchError) as caught:
         fetcher.get_bytes(GOOD, 100)
     assert len(network.seen) == 3
+    assert caught.value.reason == reason
 
 
 @pytest.mark.parametrize(
@@ -756,11 +767,12 @@ def test_a_retry_succeeds_when_the_host_recovers() -> None:
 
 def test_the_size_cap_holds_on_both_paths_and_is_not_retried(tmp_path: Path) -> None:
     fetcher, network = client({GOOD: _Response(b"x" * 50, url=GOOD)})
-    with pytest.raises(FetchError, match="exceeds"):
+    with pytest.raises(FetchError, match="exceeds") as small:
         fetcher.get_bytes(GOOD, 10)
-    with pytest.raises(FetchError, match="exceeds"):
+    with pytest.raises(FetchError, match="exceeds") as large:
         fetcher.download(GOOD, tmp_path / "out", 10)
     assert len(network.seen) == 2
+    assert small.value.reason == large.value.reason == "size_limit"
 
 
 @pytest.mark.parametrize("declared", ["5", "not a number"])

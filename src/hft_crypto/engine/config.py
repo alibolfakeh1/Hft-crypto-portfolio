@@ -16,8 +16,11 @@ from pathlib import Path
 from typing import Any
 
 from hft_crypto.config import ConfigError
-from hft_crypto.timeutil import day_start_us
+from hft_crypto.ticks import TickTable
+from hft_crypto.timeutil import day_start_us, parse_iso, to_us
 from hft_crypto.versioning import stable_hash
+
+__all__ = ["TickTable"]
 
 DATA_KINDS = frozenset({"SYNTHETIC", "MARKET"})
 TIERS = frozenset({"T0", "T1"})
@@ -83,6 +86,32 @@ def _text(raw: dict[str, Any], key: str, where: str, allowed: frozenset[str] | N
     if allowed is not None and value not in allowed:
         raise ConfigError(f"{where}: {key} must be one of {sorted(allowed)}, not {value!r}")
     return value
+
+
+def _tick_table(raw: Any, symbol: str) -> TickTable:
+    """`SYMBOL = 0.01`, or `SYMBOL = [{ from = "<UTC instant>", tick = 0.01 }, ...]` in time order."""
+    where = f"ticks.{symbol}"
+    if not isinstance(raw, list):
+        return TickTable.single(_number({symbol: raw}, symbol, "ticks", positive=True))
+    if not raw:
+        raise ConfigError(f"{where}: a dated table needs at least one row")
+    starts: list[int] = []
+    ticks: list[float] = []
+    for row in raw:
+        if not isinstance(row, dict):
+            raise ConfigError(f"{where}: each row is a table of from and tick")
+        _keys(row, frozenset({"from", "tick"}), where)
+        text = _text(row, "from", where)
+        if not text.endswith("Z"):
+            raise ConfigError(f"{where}: from must be a UTC instant ending in Z, not {text!r}")
+        try:
+            starts.append(to_us(parse_iso(text)))
+        except ValueError as exc:
+            raise ConfigError(f"{where}: from is not an instant: {text!r}") from exc
+        ticks.append(_number(row, "tick", where, positive=True))
+    if any(later <= earlier for earlier, later in itertools.pairwise(starts)):
+        raise ConfigError(f"{where}: rows must be in time order, with no instant twice")
+    return TickTable(tuple(starts), tuple(ticks))
 
 
 @dataclass(frozen=True)
@@ -222,7 +251,7 @@ class EngineConfig:
     latency_us: int
     costs: CostConfig
     risk: RiskConfig
-    ticks: dict[str, float]
+    ticks: dict[str, TickTable]
     strategies: dict[str, StrategyGrid]
     opened_blocks: tuple[str, ...]
     read_days: tuple[dt.date, ...]
@@ -230,11 +259,17 @@ class EngineConfig:
     placebo_draws: int = DECLARED_PLACEBO_DRAWS
     config_hash: str = field(default="")
 
-    def tick(self, symbol: str) -> float:
+    def tick(self, symbol: str) -> TickTable:
         try:
             return self.ticks[symbol]
         except KeyError as exc:
             raise ConfigError(f"no tick is stated for {symbol}") from exc
+
+    def check_ticks_cover(self, date_range: DateRange) -> None:
+        """C16: a run may not start before the first row of any symbol's tick table."""
+        early = [symbol for symbol in self.symbols if date_range.first_open_us < self.tick(symbol).first_us]
+        if early:
+            raise ConfigError(f"the range starts before the first row of the tick table for {early}")
 
     def lines(self, strategy: str) -> list[GridLine]:
         try:
@@ -350,7 +385,7 @@ def parse_engine_config(raw: dict[str, Any]) -> EngineConfig:
     )
 
     ticks_raw = _table(raw, "ticks", "engine config")
-    ticks = {symbol: _number(ticks_raw, symbol, "ticks", positive=True) for symbol in symbols}
+    ticks = {symbol: _tick_table(ticks_raw.get(symbol), symbol) for symbol in symbols}
     strategies_raw = _table(raw, "strategies", "engine config")
     missing = sorted(set(STRATEGY_IDS) - set(strategies_raw))
     if missing:

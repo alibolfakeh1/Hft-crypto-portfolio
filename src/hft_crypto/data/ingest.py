@@ -66,9 +66,24 @@ from hft_crypto.data.sources import (
     expected_partitions,
     partition_last_day,
 )
+from hft_crypto.data.venue_checks import (
+    CANDLE_KIND,
+    FUNDING_KIND,
+    STOP_F4_DUPLICATE,
+    VenueCheckStop,
+    candle_span,
+    file_facts,
+    file_stops,
+    funding_span,
+    in_first_span,
+)
 from hft_crypto.data.zones import ZONE_DIRS, measure_zones, part_period, persisted_bytes
+from hft_crypto.ticks import TickTable
 from hft_crypto.timeutil import MICROS_PER_SECOND, date_range, iso, iso_us, month_key, next_month, to_us
 from hft_crypto.versioning import code_version
+
+# The venue whose first-span files section 3 of the venue facts checks after the fetch.
+VENUE_CHECKED = "binance"
 
 STATE_OVERDUE = "overdue"
 RAW_RULE = "raw-archive-after-curated"
@@ -115,6 +130,8 @@ class IngestOptions:
     time_budget_s: float | None = None
     delete_raw: bool = False
     include_book: bool = False
+    # C16's tick tables by symbol, from configs/engine.toml, for checks K2 to K4. None leaves those untested.
+    ticks: dict[str, TickTable] | None = None
 
 
 @dataclass
@@ -147,6 +164,8 @@ class IngestSummary:
     downloaded_bytes: int = 0
     seconds: float = 0.0
     errors: list[str] = field(default_factory=list)
+    # Venue facts section 3, by symbol: pass or fail, counts, the largest offset and times, and nothing else.
+    venue_checks: dict[str, Any] = field(default_factory=dict)
 
 
 class SourceDisabledError(ConfigError):
@@ -428,7 +447,49 @@ def _book_result(raw: Path, task: Task) -> CuratedResult:
     return CuratedResult(frame, detail)
 
 
-def run_archive_task(ctx: JobContext, fetcher: Fetcher, task: Task, summary: IngestSummary) -> str:
+def _venue_checked(task: Task) -> bool:
+    spec = task.spec
+    return (
+        spec.venue == VENUE_CHECKED
+        and spec.kind in (FUNDING_KIND, CANDLE_KIND)
+        and spec.granularity == "month"
+        and in_first_span(task.partition)
+    )
+
+
+def _check_after_fetch(
+    ctx: JobContext,
+    task: Task,
+    raw: Path,
+    source_url: str,
+    raw_checks: dict[str, Any],
+    ticks: dict[str, TickTable] | None,
+) -> None:
+    """Venue facts section 3, on one file after its checksum and before anything parses it. Its result joins
+    the file's manifest entry. A stop quarantines the file and ends the run, and is never retried around."""
+    if raw_checks.get("reused") or not _venue_checked(task):
+        return
+    table = None if ticks is None else ticks.get(task.symbol)
+    facts = file_facts(task.spec.kind, raw, task.partition, ctx.config.fetch.max_uncompressed_bytes, table)
+    stops = file_stops(task.spec.kind, facts)
+    if stops:
+        code = ",".join(stops)
+        _quarantine_file(
+            ctx, raw, ctx.relative(raw), task=task, reason=f"venue check: {code}", source_url=source_url
+        )
+        _set_failed(ctx, task, f"venue check: {code}")
+        raise VenueCheckStop(code, task.key)
+    raw_checks["venue_checks"] = facts
+
+
+def run_archive_task(
+    ctx: JobContext,
+    fetcher: Fetcher,
+    task: Task,
+    summary: IngestSummary,
+    *,
+    ticks: dict[str, TickTable] | None = None,
+) -> str:
     """Process one partition from download to curated. Return the state it ended in."""
     now_iso = ctx.now_iso()
     spec = task.spec
@@ -436,6 +497,9 @@ def run_archive_task(ctx: JobContext, fetcher: Fetcher, task: Task, summary: Ing
     refetch = before is not None and before.state == STATE_FAILED
     try:
         raw, source, raw_checks = _fetch_raw(ctx, fetcher, task, summary, refetch=refetch)
+        _check_after_fetch(ctx, task, raw, source.url, raw_checks, ticks)
+    except VenueCheckStop:
+        raise
     except NotPublishedError:
         overdue_at = task.partition_end() + dt.timedelta(hours=spec.overdue_hours)
         state = STATE_OVERDUE if ctx.now() > overdue_at else STATE_PENDING
@@ -827,7 +891,11 @@ def _run_tasks(
                 summary.alerts.append(alert)
             continue
         try:
-            state = run_archive_task(ctx, fetcher, task, summary)
+            state = run_archive_task(ctx, fetcher, task, summary, ticks=options.ticks)
+        except VenueCheckStop:
+            # Venue facts section 3: F1, F2, F4's duplicates and K1 stop the run, and nothing goes round them.
+            summary.failed += 1
+            raise
         except Exception as exc:
             # One bad partition can never stop the others. Work is newest first, so an escape here would hit
             # the same file again on every later run, and catch-up would never get past it.
@@ -862,9 +930,39 @@ def _run_tasks(
         else:
             summary.failed += 1
     _note_unstarted(ctx, summary)
+    _venue_span(ctx, options, summary)
     _sweep_open_bars(ctx, options, summary, deadline=deadline, clock=clock)
     if options.delete_raw:
         _delete_settled_raw(ctx, summary)
+
+
+def _venue_span(ctx: JobContext, options: IngestOptions, summary: IngestSummary) -> None:
+    """Venue facts section 3 over the first span, from each file's own result in the manifest. Only files that
+    were checked count, and a month with none counts as missing. A settlement held by two files stops the run.
+    """
+    found: dict[str, Any] = {}
+    for kind in (FUNDING_KIND, CANDLE_KIND):
+        for symbol in ctx.config.symbols:
+            prefix = f"raw/archive/{VENUE_CHECKED}/{kind}/{symbol}/"
+            facts = {
+                dt.date.fromisoformat(record.date_start): record.check_detail["venue_checks"]
+                for record in ctx.catalog.files(status=None, prefix=prefix)
+                if record.check_detail is not None
+                and "venue_checks" in record.check_detail
+                and record.date_start is not None
+            }
+            if not facts:
+                continue
+            table = None if options.ticks is None else options.ticks.get(symbol)
+            result = funding_span(facts) if kind == FUNDING_KIND else candle_span(facts, table)
+            found.setdefault(symbol, {}).update(result)
+    if not found:
+        return
+    summary.venue_checks = found
+    ctx.catalog.set_meta("venue_checks", json.dumps(found, sort_keys=True))
+    held_twice = [symbol for symbol, result in found.items() if "F4" in result and not result["F4"]["pass"]]
+    if held_twice:
+        raise VenueCheckStop(STOP_F4_DUPLICATE, ",".join(held_twice))
 
 
 def run_ingest(

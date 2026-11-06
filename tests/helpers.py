@@ -136,14 +136,14 @@ class FakeFetcher:
     def download(self, url: str, dest: Path, max_bytes: int) -> int:
         body = self._body(url)
         if len(body) > max_bytes:
-            raise FetchError("too large")
+            raise FetchError("too large", reason="size_limit")
         dest.write_bytes(body)
         return len(body)
 
     def get_bytes(self, url: str, max_bytes: int) -> bytes:
         body = self._body(url)
         if len(body) > max_bytes:
-            raise FetchError("too large")
+            raise FetchError("too large", reason="size_limit")
         return body
 
     def publish(self, url: str, body: bytes, *, name: str, sidecar: bool = True) -> None:

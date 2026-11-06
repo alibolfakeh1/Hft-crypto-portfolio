@@ -469,7 +469,8 @@ def _falling_month(*, drop: tuple[int, ...] = (), empty: tuple[int, ...] = ()) -
         price = 100.0 if day < 6 else 75.0
         if day == 6:
             price = 100.0 - 25.0 * (minute % 1440) / 1439.0
-        price = round(price, 4)
+        # On the 0.01 grid: check K1 after the fetch stops stage one on a first-span price off it.
+        price = round(price, 2)
         stamp = start_ms + minute * 60_000
         count = 0 if minute in empty else 3
         volume = 0.0 if minute in empty else 2.0

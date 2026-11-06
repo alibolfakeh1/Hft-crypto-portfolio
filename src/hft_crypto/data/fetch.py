@@ -31,13 +31,35 @@ ALLOWED_HOSTS = frozenset(
 _USER_AGENT = f"hft-crypto/{__version__} (public research data pipeline)"
 _CHUNK = 1024 * 1024
 
+# What kind of failure a FetchError is, as one fixed word. It never holds text from the host or a file, so
+# the coverage check may print it (leak recheck, section 17.6).
+REASON_HTTP_403 = "http_403"
+REASON_HTTP_451 = "http_451"
+REASON_HTTP_429 = "http_429"
+REASON_TIMEOUT = "timeout"
+# Every other failure of the transfer, after its attempts: a refused or reset connection, a failed lookup, a
+# short or broken response, or an HTTP status not named here.
+REASON_CONNECTION = "connection"
+REASON_SIZE_LIMIT = "size_limit"
+REASON_NOT_FOUND = "not_found"
+# The host's own answers that stop at once and are never retried. Coverage record, section 4.2: stop on a 403
+# or a 429 rather than retry around it. A 451 is the host's refusal too.
+_STOP_AT_ONCE = {403: REASON_HTTP_403, 429: REASON_HTTP_429, 451: REASON_HTTP_451}
+
 
 class FetchError(Exception):
-    """A transient failure. The task stays open and a later run tries again."""
+    """A transient failure. The task stays open and a later run tries again. `reason` is one fixed word."""
+
+    def __init__(self, message: str = "", *, reason: str = REASON_CONNECTION) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class NotPublishedError(FetchError):
     """The host says this file does not exist yet. That is pending, not an error, until it is overdue."""
+
+    def __init__(self, message: str = "", *, reason: str = REASON_NOT_FOUND) -> None:
+        super().__init__(message, reason=reason)
 
 
 class ForbiddenHostError(Exception):
@@ -129,14 +151,16 @@ class HttpFetcher:
             except urllib.error.HTTPError as exc:
                 if exc.code == 404:
                     raise NotPublishedError(url) from exc
-                if exc.code in (403, 451):
-                    raise FetchError(f"HTTP {exc.code} from {_host(url)}") from exc
+                if exc.code in _STOP_AT_ONCE:
+                    raise FetchError(
+                        f"HTTP {exc.code} from {_host(url)}", reason=_STOP_AT_ONCE[exc.code]
+                    ) from exc
                 last_error = exc
             except (OSError, EOFError, ValueError, HTTPException) as exc:
                 # A broken response, in each of the families it can come from. Anything else is a bug in our
                 # own code, and must not read as a host failing.
                 last_error = exc
-        raise FetchError(f"{_host(url)}: {last_error}") from last_error
+        raise FetchError(f"{_host(url)}: {last_error}", reason=_reason_of(last_error)) from last_error
 
     def download(self, url: str, dest: Path, max_bytes: int) -> int:
         def action() -> int:
@@ -146,7 +170,9 @@ class HttpFetcher:
                 while chunk := response.read(_CHUNK):
                     total += len(chunk)
                     if total > max_bytes:
-                        raise FetchError(f"{_host(url)}: response exceeds {max_bytes} bytes")
+                        raise FetchError(
+                            f"{_host(url)}: response exceeds {max_bytes} bytes", reason=REASON_SIZE_LIMIT
+                        )
                     output.write(chunk)
             if declared is not None and int(declared) != total:
                 raise OSError(f"got {total} of {declared} bytes")
@@ -160,7 +186,9 @@ class HttpFetcher:
                 declared = response.headers.get("Content-Length")
                 body: bytes = response.read(max_bytes + 1)
             if len(body) > max_bytes:
-                raise FetchError(f"{_host(url)}: response exceeds {max_bytes} bytes")
+                raise FetchError(
+                    f"{_host(url)}: response exceeds {max_bytes} bytes", reason=REASON_SIZE_LIMIT
+                )
             if declared is not None and int(declared) != len(body):
                 raise OSError(f"got {len(body)} of {declared} bytes")
             return body
@@ -170,3 +198,12 @@ class HttpFetcher:
 
 def _host(url: str) -> str:
     return urllib.parse.urlsplit(url).hostname or "unknown host"
+
+
+def _reason_of(error: Exception | None) -> str:
+    """`timeout` for a timed-out connect or read, and `connection` for every other failed transfer."""
+    if isinstance(error, TimeoutError):
+        return REASON_TIMEOUT
+    if isinstance(error, urllib.error.URLError) and isinstance(error.reason, TimeoutError):
+        return REASON_TIMEOUT
+    return REASON_CONNECTION

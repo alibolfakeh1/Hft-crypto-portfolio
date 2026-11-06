@@ -29,13 +29,20 @@ from hft_crypto.data.reader import MarketReader, RunClock
 from hft_crypto.data.zones import DataRoot, DataRootError, resolve_data_root
 from hft_crypto.engine.config import DateRange, EngineConfig, load_engine_config
 from hft_crypto.engine.fold_plan import COUNTED_OUTSIDE_REGISTRY, check_range, span_labels
-from hft_crypto.engine.funding import FundingRow, funding_schedule, missing_settlements
+from hft_crypto.engine.funding import (
+    FUNDING_INTERVAL_CHANGED,
+    FundingRow,
+    funding_schedule,
+    interval_changes,
+    missing_settlements,
+)
 from hft_crypto.engine.placebo import ControlLog, DrawStat, Plan, run_placebos
 from hft_crypto.engine.registry import TrialRegistry, trial_row
 from hft_crypto.engine.simulator import (
     MODE,
     VARIANT,
     FundingEvent,
+    FundingIntervalChange,
     SimParams,
     Simulator,
     StreamResult,
@@ -170,26 +177,27 @@ def read_symbol(
         _inside_range(frame, date_range, "ts", "a trade")
         trades = TradeTape.from_frame(frame)
     funding: tuple[FundingEvent, ...] = ()
+    changes: tuple[FundingIntervalChange, ...] = ()
     if engine.funding == "required":
         rows = reader.funding(engine.venue, symbol, clock, since=since)
         if rows.is_empty():
             raise ConfigError(f"funding is required, and none was read for {symbol}")
         _inside_range(rows, date_range, "settle_time", "a funding row")
         ordered = rows.sort("settle_time")
+        funding_rows = [
+            FundingRow(int(when), float(rate), int(hours))
+            for when, rate, hours in zip(
+                ordered["settle_time"].dt.timestamp("us").to_list(),
+                ordered["funding_rate"].to_list(),
+                ordered["funding_interval_hours"].to_list(),
+                strict=True,
+            )
+        ]
         funding = funding_schedule(
-            [
-                FundingRow(int(when), float(rate), int(hours))
-                for when, rate, hours in zip(
-                    ordered["settle_time"].dt.timestamp("us").to_list(),
-                    ordered["funding_rate"].to_list(),
-                    ordered["funding_interval_hours"].to_list(),
-                    strict=True,
-                )
-            ],
-            first_open_us=date_range.first_open_us,
-            end_us=date_range.end_us,
+            funding_rows, first_open_us=date_range.first_open_us, end_us=date_range.end_us
         )
-    return SymbolData(tape, trades, funding)
+        changes = interval_changes(funding_rows)
+    return SymbolData(tape, trades, funding, changes)
 
 
 def _first_last(moments: tuple[int, ...]) -> list[str]:
@@ -215,6 +223,17 @@ def build_manifest(
             "funding_rows": sum(1 for event in item.funding if event.rate is not None),
             "funding_settlements_with_no_rate": len(missing_settlements(item.funding)),
             "funding_settlements_with_no_rate_first_last": _first_last(missing_settlements(item.funding)),
+            # R-01: a stretch whose two rows state different intervals names no settlement, so it is listed.
+            "funding_interval_changes": [
+                {
+                    "event": FUNDING_INTERVAL_CHANGED,
+                    "from": iso_us(change.from_us),
+                    "to": iso_us(change.to_us),
+                    "interval_hours_before": change.hours_before,
+                    "interval_hours_after": change.hours_after,
+                }
+                for change in item.funding_interval_changes
+            ],
         }
     return {
         "venue": engine.venue,
@@ -339,15 +358,28 @@ def _modes(engine: EngineConfig) -> dict[str, str]:
     }
 
 
-def _funding_note(engine: EngineConfig, missing: dict[str, int]) -> str:
+def _funding_note(
+    engine: EngineConfig, missing: dict[str, int], changes: dict[str, int] | None = None
+) -> str:
     if engine.funding == "absent":
         return "Funding is absent from this run: no funding was charged, so net figures leave it out"
+    changed = ""
+    if changes is not None and any(changes.values()):
+        # R-01. Which period a row's interval describes is UNVERIFIED, so such a stretch names no settlement.
+        changed = (
+            f". At {sum(changes.values())} stretches the funding rows on either side state different "
+            "intervals. No settlement is named missing inside one, because which period a row's interval "
+            "describes is UNVERIFIED, so a position open across one may owe a settlement that is not "
+            f"counted. Each is listed as {FUNDING_INTERVAL_CHANGED} in the manifest"
+        )
     if any(missing.values()):
         return (
             "Funding is charged at actual settlement times, under C10. Some settlements have no rate, and "
             "none is assumed under C17. A position open across one logs DATA_GAP and carries it as "
-            "unresolved, and net figures leave it out"
+            f"unresolved, and net figures leave it out{changed}"
         )
+    if changed:
+        return f"Funding is charged at actual settlement times, under C10{changed}"
     return (
         "Funding is charged at actual settlement times, under C10. Every settlement in the range has a rate"
     )
@@ -562,6 +594,7 @@ def run_engine(
     pipeline = load_pipeline_config(pipeline_config_dir)
     source_config = resolve_source(root, pipeline, engine)
     blocks = check_range(date_range, engine.opened_blocks, engine.data_kind, engine.read_days)
+    engine.check_ticks_cover(date_range)
     registry = TrialRegistry(root)
     moment = iso(logged_at if logged_at is not None else utcnow())
     # C12: market runs need the declared costs in the registry, and the same values here. Generated runs do
@@ -624,6 +657,7 @@ def run_engine(
 
     labels = span_labels(blocks)
     funding_missing = {symbol: len(missing_settlements(item.funding)) for symbol, item in data.items()}
+    funding_changes = {symbol: len(item.funding_interval_changes) for symbol, item in data.items()}
     rows = build_rows(streams, config=engine, labels=labels, axis=axis, marks=marks, mark_at=mark_at)
     if placebo:
         placebo_results = run_placebos(
@@ -656,7 +690,7 @@ def run_engine(
         date_range=date_range.as_output(),
         code_version=version,
         manifest_hash=manifest_hash,
-        funding_note=_funding_note(engine, funding_missing),
+        funding_note=_funding_note(engine, funding_missing, funding_changes),
         modes=_modes(engine),
         registry_distinct_trials=registry.distinct_trials(),
         counted_outside_registry=COUNTED_OUTSIDE_REGISTRY,

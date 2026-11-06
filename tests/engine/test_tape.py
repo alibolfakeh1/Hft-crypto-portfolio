@@ -201,4 +201,6 @@ def test_a_strategy_is_handed_no_frame_and_no_tape() -> None:
         "higher",
         "r_min",
         "trades_between",
+        # C16: the tick in force at an instant up to this close, refused after it as a trade read is.
+        "tick_at",
     }

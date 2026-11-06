@@ -49,7 +49,18 @@ from hft_crypto.bars.candle_check import (
 from hft_crypto.bars.core import candle_row_faults
 from hft_crypto.config import ConfigError, PipelineConfig
 from hft_crypto.data.atomic import sha256_file
-from hft_crypto.data.fetch import Fetcher, FetchError, NotPublishedError
+from hft_crypto.data.fetch import (
+    REASON_CONNECTION,
+    REASON_HTTP_403,
+    REASON_HTTP_429,
+    REASON_HTTP_451,
+    REASON_NOT_FOUND,
+    REASON_SIZE_LIMIT,
+    REASON_TIMEOUT,
+    Fetcher,
+    FetchError,
+    NotPublishedError,
+)
 from hft_crypto.data.parsers import (
     ValidationError,
     parse_agg_trades,
@@ -90,6 +101,7 @@ TOP_LEVEL_TYPES: dict[str, type] = {
     "run_at": str,
     "file_list_sha256": str,
     "stopped": str,
+    "stop_reason": str,
     "quarters": list,
 }
 QUARTER_TYPES: dict[str, type] = {
@@ -132,6 +144,21 @@ STOP_FETCH_REFUSED = "fetch_refused"
 # application, its output holds no quarter, day or symbol to be read as a result, and it is rerun in a new
 # root.
 STOP_WORDS = frozenset({STOP_NONE, STOP_FETCH_REFUSED})
+# Leak recheck 17.6: a `fetch_refused` stop says why in one of these words, so a block can be told from an
+# outage. Each is about the host or the transfer and none about the market. A run that did not stop says none.
+REASON_CHECKSUM_MISMATCH = "checksum_mismatch"
+STOP_REASONS = frozenset(
+    {
+        REASON_HTTP_403,
+        REASON_HTTP_451,
+        REASON_HTTP_429,
+        REASON_TIMEOUT,
+        REASON_CONNECTION,
+        REASON_SIZE_LIMIT,
+        REASON_NOT_FOUND,
+        REASON_CHECKSUM_MISMATCH,
+    }
+)
 
 
 def _check_stopped(document: dict[str, Any], what: str, results: tuple[str, ...]) -> None:
@@ -139,6 +166,15 @@ def _check_stopped(document: dict[str, Any], what: str, results: tuple[str, ...]
         raise ValidationError(f"{what}: stopped holds a word off the list")
     if document["stopped"] != STOP_NONE and any(document[key] for key in results):
         raise ValidationError(f"{what}: a stopped run decides nothing, so it holds no result")
+
+
+def _check_stop_reason(document: dict[str, Any], what: str) -> None:
+    """`none` exactly when the run did not stop, and one word of `STOP_REASONS` when it did."""
+    if document["stopped"] == STOP_NONE:
+        if document["stop_reason"] != STOP_NONE:
+            raise ValidationError(f"{what}: stop_reason holds a word off the list")
+    elif document["stop_reason"] not in STOP_REASONS:
+        raise ValidationError(f"{what}: stop_reason holds a word off the list")
 
 
 def init_check_root(path: str | Path, *, data_root: str | None = None) -> Path:
@@ -165,6 +201,7 @@ def check_output(document: dict[str, Any]) -> None:
         if type(document[key]) is not kind:
             raise ValidationError(f"coverage output: {key} has the wrong type")
     _check_stopped(document, "coverage output", ("quarters",))
+    _check_stop_reason(document, "coverage output")
     for row in document["quarters"]:
         if set(row) != set(QUARTER_TYPES):
             raise ValidationError("coverage output: a quarter has the wrong keys")
@@ -350,20 +387,26 @@ def run_coverage_check(
         (_quarter_of(month), symbol): _Quarter() for month, symbol, _ in files
     }
     stopped = STOP_NONE
+    stop_reason = STOP_NONE
     for month, symbol, target in files:
         quarter = quarters[(_quarter_of(month), symbol)]
         raw = check_root / "raw" / "archive" / venue / "klines" / symbol / f"date={month}" / target.filename
         try:
             matches = _fetch_one(fetcher, target, raw, max_bytes, sleep)
-        except NotPublishedError:
-            continue
-        except FetchError:
-            # Section 4.2: stop on a refusal, and do not retry around it.
-            stopped = STOP_FETCH_REFUSED
+        except FetchError as error:
+            # Section 4.2: stop on a refusal, and do not retry around it. Leak recheck 17.6: a 404 stops
+            # too, since every file of a frozen list was in the coverage record's listing, so a 404 now is an
+            # outage and not a gap in the archive. Failing its quarter instead would lose it for good,
+            # because the plan applies once. `NotPublishedError` is a `FetchError` whose word is `not_found`.
+            stopped, stop_reason = STOP_FETCH_REFUSED, error.reason
+            break
+        if not matches:
+            # Leak recheck 17.6: a transfer error is transient, so a mismatch stops the run, and the rerun
+            # rule applies. A sidecar that cannot be read is the same. A mismatch that repeats is then a
+            # coverage fact.
+            stopped, stop_reason = STOP_FETCH_REFUSED, REASON_CHECKSUM_MISMATCH
             break
         quarter.files += 1
-        if not matches:
-            continue
         quarter.checksums_ok += 1
         try:
             quarter.add(_count_candles(raw, symbol, month, limit, venue))
@@ -378,6 +421,7 @@ def run_coverage_check(
         "run_at": iso(now()),
         "file_list_sha256": file_list_sha256(files),
         "stopped": stopped,
+        "stop_reason": stop_reason,
         "quarters": [
             {
                 "quarter": name,

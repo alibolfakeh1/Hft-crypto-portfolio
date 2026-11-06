@@ -59,9 +59,16 @@ S10 = { BTCUSDT = 0.25, ETHUSDT = 0.25 }
 draws = 200
 
 [ticks]
-# C16's examples. UNVERIFIED on this venue, and to be read from it before the first run.
-BTCUSDT = 0.1
-ETHUSDT = 0.01
+# C16's dated table: each price is rounded with the tick in force when it is set. A run may not start before a
+# symbol's first row. From public Binance pages, in section 2 of docs/reviews/data/venue_facts_2026-11-05.md.
+# UNVERIFIED, both symbols, until checks K1 to K4 in section 3.2 of that record pass on the fetched files.
+# BTCUSDT moved from 0.01 to 0.1 at 2022-02-15 03:30 UTC (Binance notice of 2021-12-31). That 0.01 held from
+# 2020-01-01 is not stated there. ETHUSDT: no page read states its tick, and no change was found.
+BTCUSDT = [
+    { from = "2020-01-01T00:00:00Z", tick = 0.01 },
+    { from = "2022-02-15T03:30:00Z", tick = 0.1 },
+]
+ETHUSDT = [{ from = "2020-01-01T00:00:00Z", tick = 0.01 }]
 
 # Grids are section 8 of each document. Default lines are the table in C18: a display order, not a selection.
 # portfolio_line is FP-05's input, and D-35 declares it: the C18 default line for all eight strategies, S01 and S06
