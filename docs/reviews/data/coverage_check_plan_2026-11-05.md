@@ -387,3 +387,113 @@ refusal stated.
 | `code_version` holds 12 hex characters, not the full hash | Enough, with the full hash in the log line. The decision log entry records both | `leak-auditor` |
 | Counts describe the files as served on the run day. First-span files have been republished before (2022-05), and the output cannot hold per-file checksums | The `files_digest` line lets stage one confirm the same bytes. If it differs, stage one's files are counted again before use | `data-steward` |
 | Whether the runner's region is within Binance's terms of use | Unchecked. A refusal is a stop | Owner |
+
+## 11. Option B on the owner's machine, 2026-11-06
+
+**The owner chose Option B, the local run, on 2026-11-06.** The machine runs Windows, so the section 6 script runs under Git
+Bash with the changes below. **Nothing has run.** This text goes to `python-reviewer` for rule `check-root-after-run` and to
+`leak-auditor` for the changes and the run commit's diff, under section 2 conditions 3 and 4.
+
+### 11.1 Base and run commit
+
+| Item | Value |
+|---|---|
+| Base | `0b853bdf87e72591c24ee21d220719b668661f55`. Its diff beyond `be20ee7` touches `data/ingest.py`, `data/venue_checks.py`, `engine/simulator.py`, `configs/engine.toml` and tests, all from `d888254`, which `leak-auditor` re-audited at `8da9ebc`. Commits after `d888254` change documents only |
+| Run commit | `99629db21a04e49e848455e4c4e1815c2f785055`, on local branch `check/coverage-check-run-1`. One line: `enabled = false` becomes `enabled = true` under `[sources.binance]`. Made without touching the working tree. Never pushed, never merged |
+
+### 11.2 Changes from the section 6 script
+
+| # | Change | Why |
+|---|---|---|
+| 1 | `BASE_SHA` and `RUN_SHA` filled in. `SOURCE_REPO` is the script's first argument | No local path is written into a committed text |
+| 2 | `run_folder: <path>` is printed | So the two output files can be found. The log stays local, and the path is never copied into the repository |
+| 3 | `test "$(git rev-parse HEAD)" = "$RUN_SHA"` added | The checkout is checked too, not only its parent |
+| 4 | Paths given to `uv` and Python go through `cygpath -m` | Native Windows programs get a Windows path, with no reliance on Git Bash's automatic conversion |
+| 5 | Each root is made inside the run folder as `root.XXXXXX`. `remove_root` refuses any path that is not `"$out"/root.*` | It narrows what the rule can select to a root this script made |
+| 6 | `trap 'exit 130' INT TERM HUP` before the loop | A signal becomes an exit, so the `EXIT` trap still removes the root |
+| 7 | `stop_reason: <word>` is printed after `stopped:` | A fixed word from the list, held by the schema test of RA-02. It tells a block from an outage |
+| 8 | Last line `roots_left_in_run_folder: <count>` | Condition 2 of 17.6, inside the script. The same search runs again after the script ends, in case it was killed |
+| 9 | `uv sync --python 3.12` uses the 3.12 interpreter uv already holds on the machine | Nothing extra is downloaded for the interpreter |
+
+**Who runs it.** The main session, whose brief excludes the root: it reads only the script's printed lines and the two output
+files, which hold counts. The run folder is new, under the system temporary folder, and no agent session uses it.
+
+**Afterwards.** The clone, its `.venv` and the two output files stay in the run folder until the decision log entry is
+written, then go. They hold no market data.
+
+### 11.3 The script, as it will run
+
+```bash
+#!/usr/bin/env bash
+# Coverage check, local route (Option B), on Windows under Git Bash. Both lists, and each root removed before the
+# script ends. Text reviewed in section 11 of docs/reviews/data/coverage_check_plan_2026-11-05.md.
+# Usage: bash run_coverage_check.sh <path of this repository>
+set -euo pipefail
+BASE_SHA="0b853bdf87e72591c24ee21d220719b668661f55"   # the approved base
+RUN_SHA="99629db21a04e49e848455e4c4e1815c2f785055"    # the reviewed run commit, local branch check/coverage-check-run-1
+SOURCE_REPO="$1"                                      # passed in, so no local path is written into this text
+
+out="$(mktemp -d)"                                    # a new folder under the system temporary folder, in no repository
+echo "run_folder: $out"
+git clone --quiet --no-local "$SOURCE_REPO" "$out/repo"
+cd "$out/repo"
+git checkout --quiet --detach "$RUN_SHA"
+unset GITHUB_SHA DATA_ROOT HFT_CONFIG_DIR CHECK_ROOT
+uv sync --frozen --no-dev --python 3.12
+# The reviewed change and nothing else. Under this option the run commit carries no workflow file.
+test "$(git rev-parse HEAD)" = "$RUN_SHA"
+test "$(git rev-parse HEAD^)" = "$BASE_SHA"
+test "$(git diff --name-only HEAD^ HEAD)" = "configs/pipeline.toml"
+git show HEAD^:configs/pipeline.toml > "$out/base_pipeline.toml"
+uv run --frozen --no-dev python - "$(cygpath -m "$out/base_pipeline.toml")" configs/pipeline.toml <<'EOF'
+import sys, tomllib
+with open(sys.argv[1], "rb") as a, open(sys.argv[2], "rb") as b:
+    base, run = tomllib.load(a), tomllib.load(b)
+assert base["sources"]["binance"]["enabled"] is False
+assert run["sources"]["binance"]["enabled"] is True
+base["sources"]["binance"]["enabled"] = True
+assert base == run, "pipeline.toml differs beyond the one switch"
+EOF
+test -z "$(git status --porcelain)"                   # a clean tree, so the output names the commit
+echo "commit $RUN_SHA on base $BASE_SHA: only the reviewed change"
+
+remove_root() {   # rule check-root-after-run
+  local root="$1"
+  [ -n "$root" ] && [ -e "$root" ] || return 0
+  case "$root" in "$out"/root.*) ;; *) echo "removal refused: not a root this script made"; return 1 ;; esac
+  if [ -L "$root" ] || [ ! -f "$root/ROOT_KIND" ]; then echo "removal refused: not a check root"; return 1; fi
+  echo "removal plan: rule=check-root-after-run class=RE-DOWNLOADABLE files=$(find "$root" -type f | wc -l) bytes=$(du -sb "$root" | cut -f1)"
+  rm -rf -- "$root"
+  echo "removed: rule=check-root-after-run at=$(date -u +%FT%TZ)"
+}
+
+trap 'exit 130' INT TERM HUP                          # a signal becomes an exit, so the EXIT trap below still runs
+for list in closed-dates first-span; do
+  root="$(mktemp -d -p "$out" root.XXXXXX)"
+  trap 'remove_root "$root"' EXIT                     # a stop, a crash or Ctrl-C still removes the root
+  echo "list: $list"
+  uv run --frozen --no-dev hft-crypto coverage-check --list "$list" --check-root "$(cygpath -m "$root")"
+  echo
+  uv run --frozen --no-dev python - "$(cygpath -m "$root/coverage/coverage_check.json")" "$RUN_SHA" <<'EOF'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    document = json.load(handle)
+print("stopped:", document["stopped"])
+print("stop_reason:", document["stop_reason"])
+if not document["code_version"].endswith("+" + sys.argv[2][:12]):
+    sys.exit("code_version does not name this commit, or the tree was not clean")
+sys.exit(0 if document["stopped"] == "none" else 1)
+EOF
+  echo "output_sha256: $(sha256sum "$root/coverage/coverage_check.json" | cut -d' ' -f1)"
+  echo "files_digest: $(find "$root/raw" -type f -name '*.zip' -exec sha256sum {} + \
+    | awk '{n = split($2, p, "/"); print $1 "  " p[n]}' | sort -k2 | sha256sum | cut -d' ' -f1)"
+  echo "bytes_in_root: $(du -sb "$root" | cut -f1)"
+  cp "$root/coverage/coverage_check.json" "$out/$list.json"   # counts only
+  remove_root "$root"
+  trap - EXIT
+done
+echo "roots_left_in_run_folder: $(find "$out" -maxdepth 2 -name ROOT_KIND -type f | wc -l)"
+```
+
+The file that runs must have SHA-256 `48c6d571f6be748a3befd2ea64a69d68ea99b4c3e86dca1915ccab5019d990c0`, with LF line endings.
+The decision log entry records that hash.
