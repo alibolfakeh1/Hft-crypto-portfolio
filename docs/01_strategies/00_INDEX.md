@@ -336,7 +336,12 @@ for each bar b from the fill bar onward, while quantity > 0:
   walking the same loop. If one 1m bar contains both, the stop is first. Where 1m data is missing, the stop is first
   and the bar is counted in a report. Updates still take effect only from the next `T_d` bar.
 - **Targets are passive fills.** A target needs a trade through its price by at least one tick, and fills at its price
-  with no positive slippage. A gap beyond a target fills at the target, not at the better open. The fee on target
+  with no positive slippage. The tick is `tick_i`, the one in force when that target was set under
+  [C16](#c16-rounding-and-arithmetic-in-examples), so a long target `Ti` needs a high of at least `Ti + tick_i` and a short
+  one a low of at most `Ti - tick_i`, and that is what `H > Ti` means in the loop above and in step 2 of C17. The reason:
+  the margin stands for the queue at the target's own price, and that price sits on the grid in force when it was set, which
+  the venue kept honouring for older orders after a change, so a later change of tick neither widens nor narrows it. A gap
+  beyond a target fills at the target, not at the better open. The fee on target
   exits is a declared configuration value, and the base case uses the taker rate.
 - **G5 stress for targets.** Report two cases: a required trade-through of 2 bp, and a target that exits at the next 1m
   open after the touch, less `slip`.
@@ -514,10 +519,39 @@ this section leaves to the code are ruled in [the change record](CHANGES_2026-11
 
 ### C16. Rounding and arithmetic in examples
 
-Stops and targets round to the instrument tick: a long stop or target rounds down, a short stop or target
-rounds up. Worked examples use BTC tick 0.1 and ETH tick 0.01, `fee_taker = 5 bp` and `slip = 1 bp`, so
-`RT = 12 bp`. These are **assumptions**, not venue facts. Binance's fee page refers to
-a separate schedule that I could not open.
+Stops and targets round to the tick in force when the price is set: a long stop or target rounds down, a short stop or target
+rounds up. The tick comes from a dated table read from the venue. Each row gives a symbol, a tick and the instant it takes effect, and
+the tick in force at `t`, `tick(t)`, is that of the latest row taking effect at or before `t`. A price is set when it is first
+computed. A target computed from the fill, such as a `V0S` target or a `fill + x * R` term, is set at the fill. Every other price, which
+is the setup's `S0` and targets, each stop and target update, and `BE+`, is set at its decision: the close `t_k` or `t_b` in `IDEAL` and
+`IDEAL-1M`, and the run's `t_cut` in `CYCLE`. Rounding is to multiples of the tick, counted from zero.
+
+- **A price set before a change keeps its value** until an update replaces it, and is not rounded again. The venue kept matching
+  orders placed before the change at the old tick.
+- **A coarser tick never loosens a stop.** An update is rounded before C8 compares it with the stop in force. If rounding would
+  loosen the stop, it stays where it is, under rule 9 of `CLAUDE.md`. With one tick throughout, this equals rounding after C8.
+
+```text
+long:  S_new = max(S_old, round_down(min(S_cand, C_b - 0.10 * ATR_b), tick(t)))
+short: S_new = min(S_old, round_up(max(S_cand, C_b + 0.10 * ATR_b), tick(t)))
+```
+
+Here `t` is the instant the update is set. Under `CYCLE`, the inner `min` or `max` also holds the `P_dec` clamp of [C17](#c17-hourly-live-cycle).
+
+**The table for the first span, 2020-01-01 to 2023-12-31.** From public Binance pages read on 2026-11-05, in section 2 of the
+[venue facts](../reviews/data/venue_facts_2026-11-05.md). Every value stays `UNVERIFIED` until checks K1 to K4 in section 3.2 of that
+document pass on the fetched files. The venue's grid starts at `minPrice`, which was not read, so counting from zero waits for those
+checks too. A later block needs the same checks before it is used.
+
+| Symbol | In force | Tick | Basis |
+|---|---|---|---|
+| BTCUSDT | Before 2022-02-15 03:30 UTC | 0.01 | The value before the change, in Binance's tick notice published 2021-12-31 (source S9 of the venue facts). That it held from 2020-01-01 is not stated |
+| BTCUSDT | From 2022-02-15 03:30 UTC | 0.1 | The same notice. Orders placed before the change kept matching at 0.01 |
+| ETHUSDT | The whole span | 0.01 | No page read states it, and no change was found in the notices read |
+
+Worked examples use BTC tick 0.1 and ETH tick 0.01, `fee_taker = 5 bp` and `slip = 1 bp`, so
+`RT = 12 bp`. These are **assumptions**, not venue facts. The examples keep 0.1 and 0.01 as assumed values and do not read the
+dated table. Binance's fee page refers to a separate schedule that I could not open.
 
 **Declared cost constants, under `D-29` and C12.** The same `fee_taker`, `slip` and `RT` are the declared base case. Their basis is band A of the
 [cost proposal](COST_AND_INSTRUMENT_2026-11-05.md), and the fee has not been read from this venue's schedule, so it stays `UNVERIFIED`. `stop_slip = 5 bp` per stop exit, on both
@@ -582,7 +616,7 @@ committed state from the previous run. It sees no book, so no book feature can g
 | Fetch offset | 0 s for the symbol's trade feed, until C-10 declares it. Other sources are declared in `GATE_SPEC.md` | In backtests, `t_poll[source] = run_start + its offset` |
 | Fill wait | 2 minutes | Longest wait in step 5 |
 | Hole deadline | 24 hours after the run that logged `GAP_CLOSE` | See "Gaps in 1m bars" below |
-| Trade feed values | **`PLACEHOLDER`, re-audit condition C-10.** Page size, rate limit, retention and fetch offset for the trade feed of the chosen source, and `D_run` for tier `T0` re-based on that same fetch. They wait for the source decision under `D-01` and `D-17`. `data-steward` supplies them and `strategy-architect` records them here | **No `CYCLE` run may start until these are filled**, for any strategy, including selection under `C-LATE`, the S01 and S06 control runs, and `CYCLE` placebos. `IDEAL` and `IDEAL-1M` read the archive and do not need them |
+| Trade feed values | **`PLACEHOLDER`, re-audit condition C-10.** Page size, rate limit, retention and fetch offset for the trade feed of the chosen source, and `D_run` for tier `T0` re-based on that same fetch. They wait for the live source, open under `D-01` and `D-24`, since `D-29` chose only the research history. `data-steward` supplies them and `strategy-architect` records them here | **No `CYCLE` run may start until these are filled**, for any strategy, including selection under `C-LATE`, the S01 and S06 control runs, and `CYCLE` placebos. `IDEAL` and `IDEAL-1M` read the archive and do not need them |
 
 **Order of work in one run**, for each symbol and strategy. A run has a `fetch` stage, and then two separate parts:
 
@@ -932,7 +966,12 @@ listing page, and any claim from that source is limited accordingly.
    and it should be fixed before the first `V0` run. S09's calendar in [C12](#c12-indicators-and-frozen-values) does not depend on it.
 5. **Proof of freezing.** The auditor notes that nothing shows the frozen constants were set without sight of outcomes. A hash of these documents committed before
    the first run would make that checkable. `project-manager` to decide.
-6. **Venue.** Under `D-01` and `D-17`, the research source and venue are undecided. Funding schedules, bar labels and tick sizes must be read from the chosen source.
+6. **Venue.** **Settled:** the research history is Binance Vision USDⓈ-M perpetual data for BTCUSDT and ETHUSDT, under `D-29`, which replaced `D-17`. Ticks
+   come from the dated table in [C16](#c16-rounding-and-arithmetic-in-examples), and bar labels on official candles follow [C2](#c2-bars-and-calendar). **Read from
+   public Binance pages, waiting for the file checks:** funding every 8 hours at 00:00, 08:00 and 16:00 UTC on both symbols from 2020 to 2023, and C16's tick values.
+   Each stays `UNVERIFIED` until checks F1 to F5 and K1 to K4 in section 3 of the [venue facts](../reviews/data/venue_facts_2026-11-05.md) pass on the fetched
+   files. **Open:** the live venue and live source (`D-01`, `D-24`), what the archive's `funding_interval_hours` column describes, and any change of funding
+   interval or tick after 2023. From 2025-05-02 an interval can change with no announcement, so each later block needs the same checks before it is used.
 7. **Trade feed values.** A marked placeholder in [C17](#c17-hourly-live-cycle), re-audit condition C-10 as restated. It waits for the source decision, and no `CYCLE` run of any
    strategy may start until it is filled.
 
