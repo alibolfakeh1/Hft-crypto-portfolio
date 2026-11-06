@@ -870,6 +870,32 @@ The first span is open, so none of this is a closed-date question. The boundary 
 
 **Effect on the plan.** Section 9's paced figures now apply, and RE-02's start in the background with no time limit still covers the longer run. The rest of 17.8 stands.
 
+**Recheck at `a2a819f`, 2026-11-06.** Read with git only, and no test or script ran. `a2a819f` is `7bd375f` plus two documents: the plan, and this file with the P-1 addendum as I wrote it. The script block, taken out with LF endings and a final newline, is 366 lines of ASCII and hashes to `2028e146bd388391c1bbacf699fb1195b6a3e88df019019144b0503ebb66eb0e`, the value the plan gives.
+
+**Verdict: `PASS WITH CONDITIONS`.** Conditions 2 to 8 and RF-01 are met in the text. RF-03 and the pin, below, remain.
+
+| Condition | Where | Ruling |
+|---|---|---|
+| 2 | The `hashes` check after `ingest`, and `override_unchanged`. `versions_match` and `ingest_rows_version` over every `ingest` row and every manifest row, refusing `+unknown` and `-dirty`. The judgement takes the expected `config_hash` from the folder after the run, while each run row holds what `ingest` loaded, so a `pipeline.toml` changed between the check and the load fails one of the two | **Met,** subject to RF-03 |
+| 3 | `item_17_counts`, and 11.3: K1 `minutes` 0, BTCUSDT K2 `months_at_0_01` 26 and ETHUSDT K4 48, besides each flag over 48 months. A tick table of another shape renames K2 or K4, and that fails too | **Met** |
+| 4 | Section 10, with FS-08 for `uv`'s lines | **Met** |
+| 5 | `clean` and `tidy`: exact top-level keys, check names and fields from the code's own lists, no float by name, strings only times or the one note, read back from disk, and equal to the run row's flags. Committed only on `yes`, and only for the fetch of record | **Met.** The check bounds the form. `venue_checks.py` bounds the content, since it writes counts and times only, so no integer there is a price |
+| 6 | Section 7's rules (a) to (d). The judgement reads tasks, raw files, quarantine records and versions from the whole root, so a resume is judged on the root | **Met** |
+| 7 | Section 8's row, 11.2 steps 1 and 2, and the yes-or-no check by name and run id before every later command | **Met.** The check prints no path |
+| 8 | Section 3, for the engine run | **Met.** That run still comes back to me |
+| RF-01 | Sections 1 and 3, and the layer table | **Met** |
+| FS-05 not blocking | Section 2 | **Agreed from the leak side.** It moves no value, date or flag. The judgement accepts a stray row only when that day's bars read `done`, and a day that fails again stops the run again |
+
+**Also checked.** Every new line prints a count, a yes or no, the names of checks or items, a run id or a hash. Section 7's new redirect row is right: with check 4 in force, a redirect to another host is refused before a byte is read. A redirect inside the route is followed. The sidecar must still name the file asked for, though, and both parsers refuse rows far outside the month. So a later month served under an earlier name ends in quarantine unparsed, with at most its hash, its size and its check counts and times printed. That needs the host to do it, and no value is read.
+
+**RF-03, `LOW`. The run id.** `_run_id` in `cli.py` takes `GITHUB_RUN_ID` when it is set, and `start_run` writes with `INSERT OR REPLACE`. Scenario: the runner's shell carries a stale `GITHUB_RUN_ID`. The first run at 12:00 stops on a 429, and the resume at 13:00 gets the same id, so its row replaces the first. The root then shows one `ingest` row, and condition 2's check over every row no longer sees the first attempt's `config_hash`. Nothing past the ceiling is reached, and each invocation builds its folder the same way, so this costs evidence only. **Fix:** add `GITHUB_RUN_ID` and `GITHUB_RUN_ATTEMPT` to the script's `unset` line, or have 11.2 step 1 confirm both are unset, printing yes or no.
+
+**The pin.** Before `RUN_SHA` is filled in, `git diff --quiet 7bd375f <C-5 commit> -- src configs pyproject.toml uv.lock` must pass, and the approval entry says so. `pyproject.toml` and `uv.lock` join condition 1's two folders, because the locked packages decide how a file is parsed. A difference comes back to me with its diff before the hash is pinned. The block may differ from the text hashed here only in the `RUN_SHA` line, and in the `unset` line if RF-03 is fixed there. A changed `unset` line comes back to me with the new hash.
+
+**Text only.** Line 18 and section 12 of the plan still call the P-1 addendum uncommitted. It is in `a2a819f`.
+
+**Not checked.** The script as a whole and the suite. `python-reviewer`'s recheck and its review of P-1, which are its own. The C-5 commit, which does not exist yet.
+
 ## 18. The texts committed since `31d05d3`
 
 Read at `cf1880f`: the fold plan's amendment and its sections 8, 9 and 10, `D-32` to `D-41`, the charter, the index and S documents from their anchors, and `CHANGES_2026-11-04.md`. I did not open the demonstration's output, and I cannot.
