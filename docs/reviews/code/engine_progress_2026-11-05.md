@@ -312,3 +312,87 @@ pytest tests/leak                    217 passed in 1294.18s. S06's cut test took
 ```
 
 The full suite was not run.
+
+## Fixes after the recheck at `be20ee7`
+
+Author: `developer`. From the code recheck at `be20ee7` (`docs/reviews/code/fixes_recheck_2026-11-05.md`, RC2-01 to RC2-03 and the
+`move_tick` item) and the leak re-audit at `be20ee7` (the top section of `docs/reviews/leak/engine_2026-11-05.md`, RB-01 to RB-03).
+RC2-04 and the S01 weekend note stay as the reviewer ruled. Working tree only, not committed. Generated data only, and no test touches a
+network. No verdict is claimed. The `span_flag` change is new since the leak re-audit, so its verdict does not cover it.
+
+| # | Item | What changed | Files | Tests | What each test kills |
+|---|---|---|---|---|---|
+| 1 | RC2-02 | A span flag is `false` when any checked file fails it, `true` only when all 48 months have a checked file, and `null` otherwise. Each flag carries `months_checked`. F1 counts every checked month, F2 to F5 only those with F1's header. K2 to K4 count only months checked with a tick table: a month checked without one was not tested against the ticks, and before this it would have raised a `KeyError`. **A stopped file's result is kept:** before it is quarantined, the raw file is entered in the manifest with `check_status` `fail`, its facts and `venue_stop`, and then marked `quarantined`. `_venue_span` reads every status, so the span fails on it until a later fetch of that month passes and replaces the entry at the same path. The end-of-run stop acts on `false` only, not on `null` (see the ruling below) | `data/venue_checks.py`, `data/ingest.py` | In `tests/data/test_venue_checks.py`: `test_rc2_02_a_kept_failure_stops_every_run_until_its_month_passes`, the reviewer's case through `run_ingest`, and the same for K1: the stop, a run a minute later that stops on the kept result with every other flag `null`, and a run after the wait with a good file. `test_rc2_02_a_funding_flag_passes_only_when_every_month_was_checked` and `test_rc2_02_k1_and_k2_pass_only_when_every_month_was_checked`, 48 months against 10. `test_rc2_02_a_month_checked_without_a_tick_table_is_not_checked_for_k2`. The stage-one test now expects `null` with 2 of 48 months, and the F3, F4, F5, K2 and K4 tests carry `months_checked` | A flag passing on part of the span. A stopped result not kept. F4 stopping on `null`. K2 counting a month checked without a table |
+| 2 | RC2-01 | A settlement outside the span is listed in F4's `outside_span` and decides nothing. A slot inside the span is matched as before: it fills its month's gap, or it is a duplicate | `data/venue_checks.py` | `test_rc2_01_a_settlement_after_the_span_is_listed_and_decides_nothing`, the reviewer's case. `test_rc2_01_an_early_stamp_at_every_boundary_inside_the_span_stays_correct`: every boundary inside the span stamped 10 ms early gives 0 missing and 0 duplicates, and the same rows held by both months give 47 duplicates | An outside slot counted as a duplicate again |
+| 3 | RC2-03 | In stage one, a `FetchError` whose reason is `http_403`, `http_429` or `http_451` records its task as failed and raises `HostRefusalStop`, which `_run_tasks` lets through as it does `VenueCheckStop`. The run ends `failed` before another file is asked for. `IngestSummary.stop_reason` says why a run ended early: the host's word, or the venue check's code. It is `none` otherwise. It reaches the catalog's run row | `data/ingest.py` | In `tests/data/test_source_switches.py`, `test_rc2_03_a_refusal_ends_stage_one_at_its_first_request`: 24 monthly tasks through a real `HttpFetcher` on an offline opener. A 429, 403 or 451 makes one request with no wait, one failed task, and `stop_reason` set. A 503 takes 3 attempts on each of the 24 tasks and ends `partial`. The venue-stop test now also checks `stop_reason` | The run going on after a refusal. The reason not recorded |
+| 4 | `_Scheduled.move_tick` | A target move whose `move_tick` is not a positive finite number is refused with a `ValueError`. A stop update needs no tick, so the field keeps its default and is checked when a move is present | `engine/simulator.py` | In `tests/engine/test_dated_tick.py`, `test_a_target_move_without_the_tick_it_was_set_at_is_refused`: none, 0, -0.1, NaN and infinity are refused, and 0.1 and a stop update are not | The check removed |
+| 5 | RB-01 | Tests only | `tests/engine/test_dated_tick.py` (`_Script` records the view's tick at each close), `tests/leak/test_whole_run_cuts.py` (`_run` takes a tick table) | `test_rb01_an_update_before_the_change_takes_the_tick_at_its_own_close`, long and short: a trail at 02:00 and a target move at 02:30 on 2022-02-15, each on the 0.01 grid, and the view's tick 0.01 before 03:30 and 0.1 from it. `test_rb01_t2_a_setup_target_filled_after_a_change_keeps_its_decision_s_tick_as_its_margin`, long and short, on the made-up change 30 s after the 03:30 close. `test_rb01_a_tick_that_changes_at_the_cut_leaves_everything_before_it_unchanged`, for all ten strategies (see below) | T5, T6, T9 and T2, below |
+| 6 | RB-03 | Tests only | new `tests/leak/test_venue_checks_reach_no_decision.py` | `test_no_module_but_stage_one_imports_the_checks_or_reads_their_results` scans every module in the package. Only `data/venue_checks.py` and `data/ingest.py` may import the checks, or name `venue_checks` as an attribute, a name, or in a string, which covers the meta key, the manifest key and a dynamic import. `test_the_scanner_finds_each_way_in` holds the scanner to ten ways in | VC1, the engine reading the meta. VC2, a strategy importing the checks |
+| 7 | RB-02 | A comment on `[ticks]`: each row's `from` is the venue's published effective time only, never a check's output such as K3's last minute. K1 to K4 confirm or refute a row and never move it | `configs/engine.toml`. The engine's `config_hash` is a hash of the parsed table, so it is unchanged: `9cf8d998…d533` before and after | none | none |
+
+**RB-01's cut test, as built.** For each strategy, its first market that is not the long one, and its default line. The cuts come from a run
+at 0.01 throughout. For each kind of event that sets a price (`SETUP_CREATED`, `ENTRY`, `STOP_UPDATE`, `TARGET_UPDATE`), there is a cut at
+the instant one became known, a third and two thirds through the run, and one a microsecond later. A fill counts as known once its minute
+can be read. Two random decided closes are added. At each cut, a run whose table is 0.01 before the cut and 1.0 from it is compared with the
+run at 0.01 throughout, using the harness's own `_compare`: every decision known by the cut, and the registers at the last close decided by
+it. **154 cuts, and 143 change something after the cut.** 58 cuts have a stop update known in the day before them, and 48 a target update,
+so a read a day late has room to show. It takes about 47 s for all ten. The auditor compared two dated tables, at 0.1 and at 1.0 from the
+cut. The run at 0.01 throughout agrees with both before the cut, so the comparison is the same with half the runs.
+
+**Did differently, and why.**
+
+- **Section 4.2 is in the coverage record.** It is `docs/reviews/data/binance_vision_coverage_2026-11-05.md`, which section 2 condition 2 of
+  the coverage plan cites. The plan itself has no section 4.2. The code comment cites the record.
+- **RC2-03 acts on every archive source**, Bybit's public host included, since the rule is about the host's refusal. Like `VenueCheckStop`,
+  `HostRefusalStop` ends the run `failed` and goes on up, so the command exits with a traceback and `last_ingest.json` is not rewritten.
+  The run's summary is in the catalog's run row, with `stop_reason`. `stop_reason` also names a venue check's code, because a key reading
+  `none` on a run that a venue check stopped would mislead.
+- **Where a stopped result is kept.** On its manifest entry, marked `quarantined`, and not on the quarantine log. `_venue_span` already reads
+  the manifest at every status, and a later fetch of the month replaces the entry at the same path, which is what "until that month passes"
+  needs. Every other reader of raw entries reads `present` only, as the parse-failure path already relies on.
+- **`move_tick` is refused, not made required.** It follows two fields with defaults, and a stop update has no tick to give.
+- **RB-03 scans the whole package,** with a list of who may touch the checks, as the reader's import rule does, so a new module cannot
+  escape it. Its limit: a module that reads `last_ingest.json` or a run's summary whole and passes it on, without naming `venue_checks`,
+  would not be seen. None does today. The report reads only the pipeline log's line.
+
+**The coordinator's ruling, as built.** F1, F2, F4 or K1 `false` over the span ends every run `failed`, with `stop_reason` the check's code, until the month is fetched again and passes, so a run inside the retry wait no longer ends `ok`. `null` stops nothing and K3 only reports (`SPAN_STOPS` in `data/ingest.py`; `test_rc2_02_a_kept_failure_stops_every_run_until_its_month_passes`, F2 and K1, each with a refetch that clears it; mutants "F4 only" and "`null` stops" killed on an assertion, and `tests/data` rerun after it).
+
+**Mutation checks.** Each mutant ran in its own copy of `src`, `tests` and `configs` outside the repository, against the tests named. A
+plugin recorded each failure's exception type, and a kill counts only on an `AssertionError`. A control with no change passed all 82 tests
+it ran. **14 of 14 killed on an assertion.**
+
+| Mutant | Killed by, on an assertion |
+|---|---|
+| A span flag passes on part of the span | 8 tests, the four new RC2-02 tests among them |
+| A stopped file's result not kept | The reproduction test. The first pass failed on a `ValueError` from unpacking an empty list, so the test now asserts the entry's status first, and the second pass kills it on an assertion |
+| The end-of-run F4 stop acting on `null` | Before the ruling, the reproduction test. After it, the stage-one test, which now asserts that a run with every flag `null` does not stop |
+| K2 counting a month checked without a table | `test_rc2_02_a_month_checked_without_a_tick_table_is_not_checked_for_k2` |
+| An outside slot counted as a duplicate (RC2-01) | Both RC2-01 tests |
+| A refusal not ending the run (RC2-03) | The 429, 403 and 451 cases |
+| `stop_reason` not recorded | The 429, 403 and 451 cases |
+| A target move with no tick accepted | `test_a_target_move_without_the_tick_it_was_set_at_is_refused` |
+| T5: a stop update's tick read a day after its close | The new dated test, long and short, and the RB-01 cut test on 9 of 10 strategies. S09 makes no stop update on its market |
+| T6: a target move's tick read a day after its close | The new dated test, long and short, and the RB-01 cut test on 7 of 10. S04, S05 and S06 make no target update on theirs |
+| T9: the view's tick read a day after its close | The new dated test, long and short, and the RB-01 cut test on S08 |
+| T2: a setup target's margin at the fill's tick | The new T2 test, long and short. Not the cut test, as expected: the fill's tick is known at the fill |
+| VC1: the engine reads the `venue_checks` meta | The RB-03 scan |
+| VC2: a strategy imports the checks | The RB-03 scan |
+
+**Commands, on the working tree.**
+
+```text
+ruff check src tests                 All checks passed!
+ruff format --check src tests        119 files already formatted
+mypy src  (PYTHONPATH at the short junction)
+                                     Success: no issues found in 72 source files
+pytest tests/data tests/engine/test_recheck_fixes.py tests/engine/test_dated_tick.py
+       tests/leak/test_venue_checks_reach_no_decision.py
+                                     879 passed, 1 skipped in 410.06s. The skip is the Windows symlink privilege
+pytest tests/engine                  525 passed in 239.62s
+pytest tests/leak/test_whole_run_cuts.py
+                                     37 passed in 857.68s, sharing the machine with the runs above
+pytest tests/data/test_venue_checks.py tests/leak/test_venue_checks_reach_no_decision.py, after the last test change
+                                     26 passed in 48.56s
+```
+
+The full suite was not run, and neither were the other five files in `tests/leak`.

@@ -26,7 +26,7 @@ from hft_crypto.engine.config import DateRange, TickTable, load_engine_config, p
 from hft_crypto.engine.exits import ratchet
 from hft_crypto.engine.fills import round_to_tick, tick_at, traded_through
 from hft_crypto.engine.market import MarketView, TradeSlice
-from hft_crypto.engine.simulator import Simulator, StreamResult
+from hft_crypto.engine.simulator import Simulator, StreamResult, _Scheduled
 from hft_crypto.engine.tape import Bar, MinuteTape
 from hft_crypto.strategies.base import (
     REST,
@@ -176,7 +176,7 @@ def test_rule_9_an_update_rounded_at_the_coarser_tick_never_loosens_the_stop() -
 
 class _Script(Strategy):
     """30m bars. Proposes once at `enter_at`, asks for stops and target moves at named closes, and writes down
-    the `BE+` it is shown at each close."""
+    the `BE+` and the view's tick it is shown at each close."""
 
     id = "TEST"
     h_max_hours: ClassVar[dict[int, float]] = {30: 1000.0}
@@ -201,8 +201,10 @@ class _Script(Strategy):
         self.moves = moves or {}
         self.from_fill = from_fill
         self.seen_be_plus: dict[int, float] = {}
+        self.seen_tick: dict[int, float] = {}
 
     def on_close(self, market: MarketView) -> list[Proposal]:
+        self.seen_tick[market.now_us] = market.tick
         if market.now_us != self.enter_at:
             return []
         plans = tuple(TargetPlan(f"T{index + 1}", price, REST) for index, price in enumerate(self.targets))
@@ -313,6 +315,47 @@ def test_rule_9_across_the_change_in_the_simulator() -> None:
     assert stops == sorted(stops)
 
 
+@pytest.mark.parametrize(
+    ("side", "s0", "target", "trail", "moved", "expected"),
+    [
+        (1, 90.037, 110.037, 90.07, 101.17, (90.03, 90.07, 110.03, 101.17)),
+        (-1, 110.031, 89.961, 109.93, 98.83, (110.04, 109.93, 89.97, 98.83)),
+    ],
+    ids=["long", "short"],
+)
+def test_rb01_an_update_before_the_change_takes_the_tick_at_its_own_close(
+    side: int, s0: float, target: float, trail: float, moved: float, expected: tuple[float, ...]
+) -> None:
+    """Leak re-audit at be20ee7, RB-01. Decided at 01:00. A trail at the 02:00 close and a move of T1 at
+    02:30, both before 03:30, so both are at 0.01. Long: the stop goes from 90.03 to 90.07 and T1 from 110.03
+    to 101.17. With a tick from after 03:30 the trail would round to 90.0, below the stop, and T1 to 101.1.
+    The short mirrors it: 109.93 would round up to 110.0, and 98.83 to 98.9. The view shows 0.01 at each
+    close before 03:30, and 0.1 from it."""
+    trail_at, move_at = utc(2022, 2, 15, 2, 0), utc(2022, 2, 15, 2, 30)
+    strategy = _Script(
+        utc(2022, 2, 15, 1, 0),
+        side=side,
+        s0=s0,
+        targets=(target,),
+        stops={trail_at: trail},
+        moves={move_at: moved},
+    )
+    trade = _run(strategy, _tape(8)).trades[0]
+    first_s0, new_stop, first_t1, new_t1 = expected
+    assert [(row["computed_at_us"], row["old"], row["new"]) for row in trade.stop_path] == [
+        (trail_at, first_s0, new_stop)
+    ]
+    assert [(row["computed_at_us"], row["old"], row["new"]) for row in trade.target_path] == [
+        (move_at, first_t1, new_t1)
+    ]
+    assert trade.status == "open"
+    closes = sorted(strategy.seen_tick)
+    assert [strategy.seen_tick[close] for close in closes] == [
+        0.01 if close < CHANGE else 0.1 for close in closes
+    ]
+    assert closes[0] < CHANGE <= closes[-1]
+
+
 def test_be_plus_is_rounded_at_each_decision_with_that_close_s_tick() -> None:
     """RT 12 bp and slip 1 bp: the fill is 100 * 1.0001 = 100.01, and `BE+` is 100.01 * 1.0012 = 100.130012. A
     long rounds it down: 100.13 at 0.01 before 03:30 and 100.1 from then on."""
@@ -374,6 +417,47 @@ def test_a_target_fills_one_tick_through_and_not_half_a_tick(side: int, extreme:
         )
     else:
         assert trade.status == "open"
+
+
+@pytest.mark.parametrize(
+    ("side", "s0", "target", "row", "filled_at"),
+    [
+        (1, 90.0, 101.037, (100.0, 101.04, 99.5, 100.0), 101.03),
+        (-1, 110.0, 98.963, (100.0, 100.5, 98.96, 100.0), 98.97),
+    ],
+    ids=["long", "short"],
+)
+def test_rb01_t2_a_setup_target_filled_after_a_change_keeps_its_decision_s_tick_as_its_margin(
+    side: int, s0: float, target: float, row: tuple[float, float, float, float], filled_at: float
+) -> None:
+    """Leak re-audit at be20ee7, T2. The made-up change 30 s after the 03:30 close, as above: the decision
+    at 03:30 is at 0.01 and the fill at 03:31 at 0.1. T1 is set at the decision, long 101.037 down to 101.03,
+    short 98.963 up to 98.97, so its `tick_i` is 0.01. A print one of those ticks through at 05:00 fills it.
+    With the fill's tick as its margin it would need 101.13, or 98.87."""
+    straddle = TickTable((utc(2020, 1, 1), CHANGE + 30_000_000), (0.01, 0.1))
+    tape = _tape(8, {_minute(5): row})
+    trade = _run(_Script(CHANGE, side=side, s0=s0, targets=(target,)), tape, tick=straddle).trades[0]
+    assert trade.fill_us == CHANGE + MINUTE
+    assert (trade.exit_reason, trade.legs[-1].reference) == ("TARGET_T1", filled_at)
+
+
+def _refused(**fields: Any) -> bool:
+    try:
+        _Scheduled(0, **fields)
+    except ValueError:
+        return True
+    return False
+
+
+def test_a_target_move_without_the_tick_it_was_set_at_is_refused() -> None:
+    """Code recheck at be20ee7, information item. `traded_through` divides by a leg's `tick_i`, which a target
+    move carries. A move built without one, or with a tick that is not a positive number, never reaches a leg.
+    A stop update carries no tick."""
+    move = TargetMove("T1", 101.1, "TEST_MOVE")
+    bad = [{"move": move}, *({"move": move, "move_tick": tick} for tick in (0.0, -0.1, np.nan, np.inf))]
+    assert [_refused(**fields) for fields in bad] == [True] * 5
+    assert not _refused(move=move, move_tick=0.1)
+    assert not _refused(stop=90.0, stop_reason="TEST_TRAIL")
 
 
 def test_a_target_set_at_0_01_before_the_change_keeps_its_own_tick_after_it() -> None:

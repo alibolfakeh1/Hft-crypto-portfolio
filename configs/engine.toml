@@ -64,6 +64,10 @@ draws = 200
 # UNVERIFIED, both symbols, until checks K1 to K4 in section 3.2 of that record pass on the fetched files.
 # BTCUSDT moved from 0.01 to 0.1 at 2022-02-15 03:30 UTC (Binance notice of 2021-12-31). That 0.01 held from
 # 2020-01-01 is not stated there. ETHUSDT: no page read states its tick, and no change was found.
+# RB-02 of the leak re-audit at be20ee7: each row's `from` is the venue's published effective time of a change,
+# and only that. Never date a row from a check's output, such as K3's last minute off the 0.1 grid: that would
+# carry a fact about the whole span back to earlier prices. K1 to K4 confirm or refute a row and never move it.
+# A row changed after a failed check cites a venue document and needs its own row in plan section 10.
 BTCUSDT = [
     { from = "2020-01-01T00:00:00Z", tick = 0.01 },
     { from = "2022-02-15T03:30:00Z", tick = 0.1 },

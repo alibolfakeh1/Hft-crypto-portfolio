@@ -16,6 +16,8 @@ microsecond before it, and at random closes, and each cut is both truncated and 
   next bar moves its way is run through the same harness, for every strategy, and the harness must see it.
   For S05 it acts on the long market, since S05's short markets give one setup a line at most. The older
   S05 back door, the next bar read into the stop from the first setup on, is kept as its own test.
+- **A tick from after the cut (RB-01).** Each strategy is also cut where prices are set, with a tick table
+  whose rows change at the cut, and compared with a run on one tick.
 
 All data is generated, and all prices are invented.
 """
@@ -52,6 +54,7 @@ from hft_crypto.engine.simulator import SimParams, Simulator, StreamResult
 from hft_crypto.engine.tape import Bar, MinuteTape, TradeTape
 from hft_crypto.strategies import build_strategy
 from hft_crypto.strategies.base import Proposal, Strategy
+from hft_crypto.ticks import TickTable
 
 START = utc(2000, 1, 1)
 DAYS = 150
@@ -289,9 +292,11 @@ def _run(
     market: Market,
     simulator: type[Simulator] = Simulator,
     keep: frozenset[int] | None = None,
+    tick: TickTable | None = None,
 ) -> Run:
     """Every close is a key of `snapshots`. Its registers are written at the closes in `keep`, or at every
-    close if `keep` is None, and are an empty text elsewhere. Writing them is a pure read of the strategy."""
+    close if `keep` is None, and are an empty text elsewhere. Writing them is a pure read of the strategy.
+    With no `tick`, the tick is 0.01 throughout."""
     snapshots: dict[int, str] = {}
 
     def probe(held: Strategy, view: MarketView) -> None:
@@ -300,7 +305,8 @@ def _run(
         snapshots[now] = json.dumps(held.snapshot(), sort_keys=True, default=str) if wanted else ""
 
     built = build_strategy(strategy, {**params, "tier": "T0" if trades is None else "T1"})
-    stream = simulator(built, tape, _params(market), trades=trades, probe=probe).run()
+    sim = _params(market) if tick is None else dataclasses.replace(_params(market), tick=tick)
+    stream = simulator(built, tape, sim, trades=trades, probe=probe).run()
     return Run(stream.events, snapshots, stream)
 
 
@@ -448,6 +454,60 @@ def test_the_harness_catches_a_next_bar_read_into_s05_s_stop_from_its_first_setu
         if found:
             break
     assert found, "S05: the next bar read into the stop went unseen on every short market"
+
+
+# ---- RB-01: a tick table whose rows change at the cut ------------------------------------------------------
+
+FINE_TICK = 0.01
+# At prices near 1000, nearly every price set from the cut on rounds to another value on this grid.
+COARSE_TICK = 1.0
+PRICE_SETTERS = ("SETUP_CREATED", "ENTRY", "STOP_UPDATE", "TARGET_UPDATE")
+
+
+def _tick_cuts(run: Run, name: str, allowance: int) -> list[int]:
+    """For each kind of event that sets a price, the instant one became known, a third and two thirds
+    through the run, and a microsecond later. A fill is known once its minute can be read. Two random
+    decided closes."""
+    cuts: set[int] = set()
+    for kind in PRICE_SETTERS:
+        extra = allowance if kind in WALK else 0
+        known = sorted({event["knowable_us"] + extra for event in run.events if event["type"] == kind})
+        for index in {len(known) // 3, 2 * len(known) // 3}:
+            if index < len(known):
+                cuts |= {known[index], known[index] + 1}
+    rng = random.Random(name)
+    closes = sorted(run.snapshots)
+    cuts |= {closes[rng.randrange(len(closes))] + DELAY_US for _ in range(2)}
+    return sorted(cuts)
+
+
+@pytest.mark.parametrize("strategy", ALL)
+def test_rb01_a_tick_that_changes_at_the_cut_leaves_everything_before_it_unchanged(strategy: str) -> None:
+    """Leak re-audit at be20ee7, RB-01. At each cut, a run whose tick is 0.01 before the cut and 1.0 from it
+    is compared with a run at 0.01 throughout, on every decision known by the cut and the registers at the
+    last close decided by it. A price set before the cut with a tick read from after its own instant, such as
+    a stop update, a target move, a target from the fill or the view's tick, would differ. Some cut must
+    change what comes after it, or this would prove nothing."""
+    market = next(item for item in _markets(strategy) if item.layout != "driftless")
+    _, params = _lines(strategy)[0]
+    tape, trades = market.tape(market.end)
+    name = f"{strategy}|{market}|ticks"
+    first = _run(strategy, params, tape, trades, market, keep=frozenset())
+    cuts = _tick_cuts(first, name, market.allowance)
+    keep = frozenset(close for cut in cuts if (close := _last_decided(first, cut)) is not None)
+    fine = _run(strategy, params, tape, trades, market, keep=keep)
+    differences: list[str] = []
+    changed_after = 0
+    for cut in cuts:
+        table = TickTable((START, cut), (FINE_TICK, COARSE_TICK))
+        dated = _run(strategy, params, tape, trades, market, keep=keep, tick=table)
+        try:
+            _compare(fine, dated, cut, market.allowance, f"{name} tick changed at {cut}")
+        except AssertionError as failure:
+            differences.append(str(failure)[:200])
+        changed_after += fine.events != dated.events
+    assert differences == []
+    assert changed_after > 0, f"{strategy}: no cut changed anything after it"
 
 
 # ---- every bar of every timeframe --------------------------------------------------------------------------

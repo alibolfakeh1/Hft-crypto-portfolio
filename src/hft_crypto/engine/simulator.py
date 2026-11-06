@@ -18,6 +18,7 @@ after the walk is the report of a gap under C2, which only labels a finished tra
 from __future__ import annotations
 
 import bisect
+import math
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -158,6 +159,11 @@ class _Scheduled:
     stop_reason: str | None = None
     # The tick in force when a target move was set, which becomes the leg's `tick_i`.
     move_tick: float = 0.0
+
+    def __post_init__(self) -> None:
+        # `traded_through` divides by a leg's `tick_i`, so a target move without its tick is refused here.
+        if self.move is not None and not 0.0 < self.move_tick < math.inf:
+            raise ValueError("a target move needs the tick in force when it was set")
 
 
 @dataclass(frozen=True)

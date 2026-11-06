@@ -12,6 +12,11 @@ interval other than 8 hours (F2), a settlement held twice (F4), and a price off 
 is reported: F3 and F5 fail and are reviewed, a missing settlement stays a `DATA_GAP` under C17, K3 is not a
 failure, and K5 decides nothing, which is the coverage check's job.
 
+**A span's flag.** `false` when any checked file fails it. `true` only when every month of the span has a
+checked file and none fails. Otherwise `null`, because a pass over part of the span is not a pass over the
+span. Each flag carries `months_checked`, out of the span's 48. A stopped file's result is kept, so F1, F2,
+F4 or K1 failing over the span stops every run of stage one until that month is fetched again and passes.
+
 **The ticks.** K2 to K4 test the tick table in `configs/engine.toml` against the files. The grids are powers
 of ten, as both symbols' ticks are, so a grid is a count of decimal places.
 """
@@ -42,6 +47,7 @@ FUNDING_KIND = "fundingRate"
 CANDLE_KIND = "klines"
 # The first span, which is the only one these checks are written for (venue facts, section 3).
 FIRST_SPAN = (dt.date(2020, 1, 1), dt.date(2023, 12, 1))
+SPAN_MONTHS = tuple(month_starts(*FIRST_SPAN))
 EXPECTED_INTERVAL_HOURS = 8
 # FAQ S7: "a 15-second deviation in the actual funding fee transaction time".
 MAX_OFFSET_MS = 15_000
@@ -79,6 +85,13 @@ def _grid_slots(month: dt.date) -> range:
     """Every 00:00, 08:00 and 16:00 UTC settlement in a month, in ms."""
     start = day_start_us(month) // 1000
     return range(start, _month_end_ms(month), _SETTLE_MS)
+
+
+def span_flag(failed: bool, months_checked: int) -> bool | None:
+    """`False` on any failure found. `True` only when every month of the span was checked, and else `None`."""
+    if failed:
+        return False
+    return True if months_checked == len(SPAN_MONTHS) else None
 
 
 # ---- funding, F1 to F5 ------------------------------------------------------------------------------------
@@ -133,9 +146,12 @@ def funding_stops(facts: Mapping[str, Any]) -> list[str]:
 
 
 def funding_span(facts: Mapping[dt.date, Mapping[str, Any] | None]) -> dict[str, Any]:
-    """F1 to F5 for one symbol over the first span. A month with no file has all its settlements missing."""
-    months = list(month_starts(*FIRST_SPAN))
-    held = {month: facts.get(month) for month in months}
+    """F1 to F5 for one symbol over the first span. A month with no file has all its settlements missing.
+
+    F1 counts every month with a checked file. F2 to F5 count only those whose header is F1's, since nothing
+    else of a file with another header was read.
+    """
+    held = {month: facts.get(month) for month in SPAN_MONTHS}
     present = [item for item in held.values() if item is not None]
     readable = [item for item in present if item.get("header_ok")]
     missing = {slot for item in readable for slot in item["missing"]}
@@ -143,31 +159,54 @@ def funding_span(facts: Mapping[dt.date, Mapping[str, Any] | None]) -> dict[str,
     unreadable = [month for month, item in held.items() if item is not None and not item.get("header_ok")]
     missing |= {_ms_iso(slot) for month in unreadable for slot in _grid_slots(month)}
     duplicates = sum(item["duplicates"] for item in readable)
-    # A settlement whose row sits in a neighbouring month's file fills that month's gap, or is held twice.
+    span_slots = {_ms_iso(slot) for month in SPAN_MONTHS for slot in _grid_slots(month)}
+    # A settlement whose row sits in a neighbouring month's file fills that month's gap, or is held twice. One
+    # outside the span, such as 2024-01-01 00:00 stamped early in the 2023-12 file, is listed and decides
+    # nothing, since no file of the span could hold it twice.
     seen_outside: set[str] = set()
+    outside_span: list[str] = []
     for item in readable:
         for slot in item["outside_month"]:
+            if slot not in span_slots:
+                outside_span.append(slot)
+                continue
             if slot in missing and slot not in seen_outside:
                 missing.discard(slot)
             else:
                 duplicates += 1
             seen_outside.add(slot)
-    expected = sum(len(_grid_slots(month)) for month in months)
+    expected = len(span_slots)
     interval_rows = [row for item in readable for row in item["interval_not_8"]]
     off_grid = sorted(slot for item in readable for slot in item["off_grid"])
     max_offset = max((item["max_offset_ms"] for item in readable), default=0)
+    checked, read = len(present), len(readable)
     return {
-        "F1": {"pass": not unreadable, "files_with_another_header": len(unreadable)},
-        "F2": {"pass": not interval_rows, "rows": interval_rows},
-        "F3": {"pass": max_offset <= MAX_OFFSET_MS, "max_offset_ms": max_offset},
+        "F1": {
+            "pass": span_flag(bool(unreadable), checked),
+            "files_with_another_header": len(unreadable),
+            "months_checked": checked,
+        },
+        "F2": {"pass": span_flag(bool(interval_rows), read), "rows": interval_rows, "months_checked": read},
+        "F3": {
+            "pass": span_flag(max_offset > MAX_OFFSET_MS, read),
+            "max_offset_ms": max_offset,
+            "months_checked": read,
+        },
         "F4": {
-            "pass": duplicates == 0,
+            "pass": span_flag(duplicates > 0, read),
             "expected": expected,
             "missing": len(missing),
             "duplicates": duplicates,
-            "files": len(present),
+            "files": checked,
+            "outside_span": sorted(outside_span),
+            "months_checked": read,
         },
-        "F5": {"pass": not off_grid, "other_gaps": len(off_grid), "at": off_grid},
+        "F5": {
+            "pass": span_flag(bool(off_grid), read),
+            "other_gaps": len(off_grid),
+            "at": off_grid,
+            "months_checked": read,
+        },
     }
 
 
@@ -234,15 +273,21 @@ def candle_stops(facts: Mapping[str, Any]) -> list[str]:
 
 
 def candle_span(facts: Mapping[dt.date, Mapping[str, Any] | None], ticks: TickTable | None) -> dict[str, Any]:
-    """K1 to K5 for one symbol over the first span."""
-    months = list(month_starts(*FIRST_SPAN))
+    """K1 to K5 for one symbol over the first span.
+
+    K2 to K4 count only months whose file was checked with a tick table. A month checked without one was not
+    tested against the ticks.
+    """
+    months = SPAN_MONTHS
     present = {month: item for month in months if (item := facts.get(month)) is not None}
     expected = sum((_month_end_ms(month) - day_start_us(month) // 1000) // _MINUTE_MS for month in months)
     absent = [month for month in months if month not in present]
+    off_fine = sum(item["minutes_off_0_01"] for item in present.values())
     result: dict[str, Any] = {
         "K1": {
-            "pass": not any(item["minutes_off_0_01"] for item in present.values()),
-            "minutes": sum(item["minutes_off_0_01"] for item in present.values()),
+            "pass": span_flag(off_fine > 0, len(present)),
+            "minutes": off_fine,
+            "months_checked": len(present),
         },
         "K5": {
             "expected": expected,
@@ -257,20 +302,22 @@ def candle_span(facts: Mapping[dt.date, Mapping[str, Any] | None], ticks: TickTa
         return result
     # K2 on a symbol whose tick later becomes coarser, K4 on one with a single tick. Both ask that every month
     # at 0.01 shows a price off the 0.1 grid, or a 0.01 tick is not shown for it.
-    at_fine = [month for month, item in present.items() if item["minutes_at_0_01"]]
-    shown = [month for month in at_fine if present[month]["minutes_at_0_01_off_0_1"]]
+    ticked = {month: item for month, item in present.items() if "minutes_at_0_01" in item}
+    at_fine = [month for month, item in ticked.items() if item["minutes_at_0_01"]]
+    shown = [month for month in at_fine if ticked[month]["minutes_at_0_01_off_0_1"]]
     name = "K2" if any(tick > min(ticks.ticks) for tick in ticks.ticks) else "K4"
     result[name] = {
-        "pass": len(shown) == len(at_fine),
+        "pass": span_flag(len(shown) < len(at_fine), len(ticked)),
         "months_at_0_01": len(at_fine),
         "months_showing_0_01": len(shown),
+        "months_checked": len(ticked),
     }
     if any(_tick_places(tick) == _COARSE_PLACES for tick in ticks.ticks):
-        firsts = [item["first_at_0_1_off_0_1"] for item in present.values() if item["first_at_0_1_off_0_1"]]
-        lasts = [item["last_at_0_1_off_0_1"] for item in present.values() if item["last_at_0_1_off_0_1"]]
+        firsts = [item["first_at_0_1_off_0_1"] for item in ticked.values() if item["first_at_0_1_off_0_1"]]
+        lasts = [item["last_at_0_1_off_0_1"] for item in ticked.values() if item["last_at_0_1_off_0_1"]]
         result["K3"] = {
             "reported_not_failed": True,
-            "minutes": sum(item["minutes_at_0_1_off_0_1"] for item in present.values()),
+            "minutes": sum(item["minutes_at_0_1_off_0_1"] for item in ticked.values()),
             "first": min(firsts) if firsts else None,
             "last": max(lasts) if lasts else None,
         }

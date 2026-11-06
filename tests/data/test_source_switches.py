@@ -5,8 +5,10 @@ No test here reaches a network. The client runs against a handler that records w
 
 from __future__ import annotations
 
+import datetime as dt
 import http.client
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -20,7 +22,7 @@ from typing import Any
 
 import pytest
 
-from helpers import REPO_ROOT, base_config
+from helpers import REPO_ROOT, base_config, make_context, with_binance_enabled
 from hft_crypto.config import (
     ARCHIVE_ONLY_SOURCES,
     PROHIBITED_SOURCES,
@@ -39,6 +41,8 @@ from hft_crypto.data.fetch import (
     _CheckedRedirects,
     check_url,
 )
+from hft_crypto.data.ingest import HostRefusalStop, IngestOptions, run_ingest
+from hft_crypto.data.sources import archive_candidates
 
 SHIPPED = (REPO_ROOT / "configs" / "pipeline.toml").read_text(encoding="utf-8")
 BANNED_URL = "https://api.kraken.com/0/public/Trades"
@@ -773,6 +777,63 @@ def test_the_size_cap_holds_on_both_paths_and_is_not_retried(tmp_path: Path) -> 
         fetcher.download(GOOD, tmp_path / "out", 10)
     assert len(network.seen) == 2
     assert small.value.reason == large.value.reason == "size_limit"
+
+
+class _Answering(_Network):
+    """Answers every request with one HTTP status, and records it."""
+
+    def __init__(self, code: int) -> None:
+        super().__init__({})
+        self.code = code
+
+    def _serve(self, request: urllib.request.Request) -> _Response:
+        self.seen.append(request.full_url)
+        raise urllib.error.HTTPError(request.full_url, self.code, "no", http.client.HTTPMessage(), None)
+
+    https_open = _serve
+
+
+@pytest.mark.parametrize(("code", "stops"), [(429, True), (403, True), (451, True), (503, False)])
+def test_rc2_03_a_refusal_ends_stage_one_at_its_first_request(tmp_path: Path, code: int, stops: bool) -> None:
+    """Coverage record section 4.2. 24 monthly tasks, BTCUSDT's candles and funding for 2023, through a real
+    client whose host answers everything with `code`. A 429, 403 or 451 makes one request, records its task as
+    failed, and ends the run with that word as its stop reason. A 503 is no refusal: each task takes its three
+    attempts, and the run goes on to the next."""
+    config = replace(with_binance_enabled(base_config()), symbols=("BTCUSDT",))
+    network = _Answering(code)
+    waits: list[float] = []
+    fetcher = HttpFetcher(
+        replace(config.fetch, attempts=3), allowed_hosts=config.enabled_hosts(), sleep=waits.append
+    )
+    fetcher._opener = offline_opener(network)
+    ctx = make_context(tmp_path / "r", now=dt.datetime(2026, 11, 5, 10, tzinfo=dt.UTC), config=config)
+    options = IngestOptions(
+        dataset_ids=("binance.klines", "binance.fundingRate"),
+        start=dt.date(2023, 1, 1),
+        end=dt.date(2023, 12, 31),
+    )
+    stopped = "none"
+    try:
+        run_ingest(ctx, fetcher, options)
+    except HostRefusalStop as refusal:
+        stopped = refusal.code
+    [run] = ctx.catalog._db.execute("SELECT status, summary FROM runs").fetchall()
+    summary = json.loads(run["summary"])
+    first = archive_candidates(config, config.dataset("binance.klines"), "BTCUSDT", dt.date(2023, 12, 1))[0]
+    tasks = ctx.catalog._db.execute("SELECT task_key, state, last_error FROM tasks").fetchall()
+    if stops:
+        assert network.seen == [first.url]
+        assert waits == []
+        assert (stopped, run["status"], summary["stop_reason"]) == (f"http_{code}", "failed", f"http_{code}")
+        assert (summary["planned"], summary["failed"]) == (24, 1)
+        assert [(row["task_key"], row["state"]) for row in tasks] == [
+            ("archive:binance.klines:BTCUSDT:2023-12", "failed")
+        ]
+        assert f"HTTP {code}" in tasks[0]["last_error"]
+    else:
+        assert len(network.seen) == 24 * 3
+        assert (stopped, run["status"], summary["stop_reason"]) == ("none", "partial", "none")
+        assert (summary["planned"], summary["failed"], len(tasks)) == (24, 24, 24)
 
 
 @pytest.mark.parametrize("declared", ["5", "not a number"])

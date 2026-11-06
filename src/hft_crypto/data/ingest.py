@@ -46,7 +46,14 @@ from hft_crypto.data.derive import (
     needs_derive,
     reopen_day,
 )
-from hft_crypto.data.fetch import Fetcher, FetchError, NotPublishedError
+from hft_crypto.data.fetch import (
+    REASON_HTTP_403,
+    REASON_HTTP_429,
+    REASON_HTTP_451,
+    Fetcher,
+    FetchError,
+    NotPublishedError,
+)
 from hft_crypto.data.guard import PathGuardError
 from hft_crypto.data.parsers import (
     CuratedResult,
@@ -69,7 +76,10 @@ from hft_crypto.data.sources import (
 from hft_crypto.data.venue_checks import (
     CANDLE_KIND,
     FUNDING_KIND,
+    STOP_F1_HEADER,
+    STOP_F2_INTERVAL,
     STOP_F4_DUPLICATE,
+    STOP_K1_OFF_GRID,
     VenueCheckStop,
     candle_span,
     file_facts,
@@ -93,6 +103,26 @@ _SIDECAR_LIMIT = 4096
 UNSTARTED_ALERT_RUNS = 3
 _LONG_NUMBER = re.compile(r"\d[\d.,:_-]*")
 _PATH_LIKE = re.compile(r"[A-Za-z]:[\\/]\S*|(?<![\w.])/\S+")
+# Section 4.2 of docs/reviews/data/binance_vision_coverage_2026-11-05.md: stop on a 403 or a 429 rather than
+# retry around it, and so rather than go on to the next file. A 451 is the host's refusal too.
+HOST_REFUSALS = frozenset({REASON_HTTP_403, REASON_HTTP_429, REASON_HTTP_451})
+NO_STOP = "none"
+# Venue facts section 3's stops, held over the span: a kept result that fails one of them stops every run
+# until its month is fetched again and passes. K3 only reports, and F3 and F5 are reviewed.
+SPAN_STOPS = (
+    ("F1", STOP_F1_HEADER),
+    ("F2", STOP_F2_INTERVAL),
+    ("F4", STOP_F4_DUPLICATE),
+    ("K1", STOP_K1_OFF_GRID),
+)
+
+
+class HostRefusalStop(Exception):
+    """The host refused a request. The task is recorded as failed and the run ends. `code` is a fixed word."""
+
+    def __init__(self, code: str, task_key: str) -> None:
+        super().__init__(f"{code}: {task_key}")
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -166,6 +196,8 @@ class IngestSummary:
     errors: list[str] = field(default_factory=list)
     # Venue facts section 3, by symbol: pass or fail, counts, the largest offset and times, and nothing else.
     venue_checks: dict[str, Any] = field(default_factory=dict)
+    # Why the run ended early: a host's refusal word, or a venue check's code. `none` when it did not.
+    stop_reason: str = NO_STOP
 
 
 class SourceDisabledError(ConfigError):
@@ -457,6 +489,35 @@ def _venue_checked(task: Task) -> bool:
     )
 
 
+def _register_raw(
+    ctx: JobContext,
+    task: Task,
+    raw: Path,
+    source_url: str,
+    *,
+    check_status: str,
+    check_detail: dict[str, Any],
+) -> None:
+    spec = task.spec
+    ctx.register_output(
+        raw,
+        dataset_id=f"raw.{spec.venue}.{spec.kind}.{task.symbol}",
+        kind=spec.kind,
+        zone="raw/archive",
+        partition_key=task.partition_key,
+        date_start=task.partition.isoformat(),
+        date_end=partition_last_day(spec, task.partition).isoformat(),
+        rows=None,
+        check_status=check_status,
+        check_detail=check_detail,
+        source_url=source_url,
+        tier=spec.tier,
+        venue=spec.venue,
+        symbol=task.symbol,
+        terms_note=ctx.config.source(spec.venue).terms_note,
+    )
+
+
 def _check_after_fetch(
     ctx: JobContext,
     task: Task,
@@ -466,7 +527,11 @@ def _check_after_fetch(
     ticks: dict[str, TickTable] | None,
 ) -> None:
     """Venue facts section 3, on one file after its checksum and before anything parses it. Its result joins
-    the file's manifest entry. A stop quarantines the file and ends the run, and is never retried around."""
+    the file's manifest entry. A stop quarantines the file and ends the run, and is never retried around.
+
+    A stopped file's result is kept on its manifest entry, marked quarantined, so the span fails on it until a
+    later fetch of that month passes and replaces the entry.
+    """
     if raw_checks.get("reused") or not _venue_checked(task):
         return
     table = None if ticks is None else ticks.get(task.symbol)
@@ -474,9 +539,11 @@ def _check_after_fetch(
     stops = file_stops(task.spec.kind, facts)
     if stops:
         code = ",".join(stops)
-        _quarantine_file(
-            ctx, raw, ctx.relative(raw), task=task, reason=f"venue check: {code}", source_url=source_url
-        )
+        raw_rel = ctx.relative(raw)
+        detail = {**raw_checks, "venue_checks": facts, "venue_stop": code}
+        _register_raw(ctx, task, raw, source_url, check_status="fail", check_detail=detail)
+        _quarantine_file(ctx, raw, raw_rel, task=task, reason=f"venue check: {code}", source_url=source_url)
+        ctx.catalog.set_file_status(raw_rel, "quarantined", ctx.now_iso())
         _set_failed(ctx, task, f"venue check: {code}")
         raise VenueCheckStop(code, task.key)
     raw_checks["venue_checks"] = facts
@@ -520,6 +587,8 @@ def run_archive_task(
     except FetchError as exc:
         _set_failed(ctx, task, f"download: {exc}")
         summary.errors.append(f"{task.key}: {exc}")
+        if exc.reason in HOST_REFUSALS:
+            raise HostRefusalStop(exc.reason, task.key) from exc
         return STATE_FAILED
 
     raw_rel = ctx.relative(raw)
@@ -530,23 +599,7 @@ def run_archive_task(
         else partition_text
     )
     if not raw_checks.get("reused"):
-        ctx.register_output(
-            raw,
-            dataset_id=f"raw.{spec.venue}.{spec.kind}.{task.symbol}",
-            kind=spec.kind,
-            zone="raw/archive",
-            partition_key=task.partition_key,
-            date_start=partition_text,
-            date_end=date_end,
-            rows=None,
-            check_status="pass",
-            check_detail=raw_checks,
-            source_url=source.url,
-            tier=spec.tier,
-            venue=spec.venue,
-            symbol=task.symbol,
-            terms_note=ctx.config.source(spec.venue).terms_note,
-        )
+        _register_raw(ctx, task, raw, source.url, check_status="pass", check_detail=raw_checks)
     try:
         result = _book_result(raw, task) if spec.kind == "orderbook" else _parse(ctx, task, raw)
         _refuse_future_stamps(ctx, result)
@@ -892,8 +945,9 @@ def _run_tasks(
             continue
         try:
             state = run_archive_task(ctx, fetcher, task, summary, ticks=options.ticks)
-        except VenueCheckStop:
+        except (VenueCheckStop, HostRefusalStop):
             # Venue facts section 3: F1, F2, F4's duplicates and K1 stop the run, and nothing goes round them.
+            # Coverage record section 4.2: so does a host's 403, 429 or 451, before another file is asked for.
             summary.failed += 1
             raise
         except Exception as exc:
@@ -937,8 +991,10 @@ def _run_tasks(
 
 
 def _venue_span(ctx: JobContext, options: IngestOptions, summary: IngestSummary) -> None:
-    """Venue facts section 3 over the first span, from each file's own result in the manifest. Only files that
-    were checked count, and a month with none counts as missing. A settlement held by two files stops the run.
+    """Venue facts section 3 over the first span, from each file's own result in the manifest, a stopped
+    file's included. Only files that were checked count, a month with none counts as missing, and a flag
+    passes only when every month was checked. F1, F2, F4 or K1 failing over the span stops the run, on every
+    run until the month that fails is fetched again and passes. A flag that is `null` stops nothing.
     """
     found: dict[str, Any] = {}
     for kind in (FUNDING_KIND, CANDLE_KIND):
@@ -960,9 +1016,17 @@ def _venue_span(ctx: JobContext, options: IngestOptions, summary: IngestSummary)
         return
     summary.venue_checks = found
     ctx.catalog.set_meta("venue_checks", json.dumps(found, sort_keys=True))
-    held_twice = [symbol for symbol, result in found.items() if "F4" in result and not result["F4"]["pass"]]
-    if held_twice:
-        raise VenueCheckStop(STOP_F4_DUPLICATE, ",".join(held_twice))
+    # `pass` is None while months are unchecked, and only a failure found stops.
+    failing = {
+        code: [
+            symbol for symbol, result in found.items() if check in result and result[check]["pass"] is False
+        ]
+        for check, code in SPAN_STOPS
+    }
+    codes = [code for code, symbols in failing.items() if symbols]
+    if codes:
+        symbols = sorted({symbol for code in codes for symbol in failing[code]})
+        raise VenueCheckStop(",".join(codes), ",".join(symbols))
 
 
 def run_ingest(
@@ -1009,6 +1073,8 @@ def run_ingest(
         _run_tasks(ctx, fetcher, options, summary, deadline=deadline, clock=clock)
     except Exception as exc:
         summary.status = "failed"
+        if isinstance(exc, VenueCheckStop | HostRefusalStop):
+            summary.stop_reason = exc.code
         summary.errors.append(f"{type(exc).__name__}: {exc}")
         ctx.catalog.finish_run(ctx.run_id, now=ctx.now_iso(), status="failed", summary=_persisted(summary))
         raise
