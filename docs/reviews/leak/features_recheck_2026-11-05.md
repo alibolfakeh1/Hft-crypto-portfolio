@@ -6,6 +6,39 @@ Target: `GATE_SPEC.md`, `STRATEGY_FEATURE_MATRIX.md`, `FEATURE_TRIAGE.md` and `D
 
 **Scope.** The research source is open again, and the primary route in `D-22` no longer stands. Everything tied to the named source is marked `PENDING SOURCE`. It was not audited in depth, and section 7 says what must be rechecked. Text that still names the earlier source is a correction pending, not a leak.
 
+## Ruling on the H5 conditions at `481f6a1`, 2026-11-06
+
+**`PASS WITH CONDITIONS`.** I read `481f6a1`'s diffs of the matrix (7.6, the new 7.7, the symbol rule and the single-strategy formula), of index section 4, and of the change record. I checked each against the rows that a run's output already holds. Nothing ran. The H5 ruling below stands as written.
+
+| Item | Verdict | Why |
+|---|---|---|
+| B: the single-strategy `N` may only rise | `PASS` | It is in the text, and the form stays as written. Read 7.6's first condition, "every class line at once", as every result under the rule in question, for this `N` and for 7.7. Whether to count lines still due is open until the first flow verdict. Under this rule it can only be decided upward |
+| The only-rise rule's three conditions | `PASS` | All three are in 7.6. A verdict keeps its `N` and date, and a later report prints its own beside it |
+| The `.R` twin | `PASS` | It is recorded as "not evaluated", never as passed |
+| C, flow half (matrix 7.6) | `PASS WITH CONDITIONS` | The set follows the result's own `N`, and a stream is left out only for a reason fixed now: it has no stream of its own, its output is sealed, or its Sharpe ratio is undefined, and the number left out is printed. None of these depends on an outcome. Narrower than my example, but I accept it. A trial with no return stream has no Sharpe ratio to give without a new read. Conditions C1 and C2 below. Also, lines still due count in `N_class`, and like the index, 7.6 should say they are left out of the spread |
+| C, candle half (index section 4) | `PASS WITH CONDITIONS` | The same principle over 7.7's `N`. It names lines not yet run, and controls are in neither. Conditions C1 and C2 |
+| 7.7: `N` for a candle-only `V0` result | `PASS WITH CONDITIONS` | The whole count is right. One strategy's grid would leave out the search beside it. 122 recomputes as 104 + 16 + 2. A stage's own declared lines counting from its first verdict means reading one strategy early gains nothing. **Condition E:** stage 1 gives no verdict in the gate sense. Matrix 3.1 decides on out-of-sample blocks only, and the guard holds at 2023-12-31 through all of stage 1 (fold plan section 9). So "the first verdict on stage 1" should read "the first figure printed on stage 1, which is in-sample description (fold plan section 5)", and keep `N_V0` at 122 |
+| D, the text part | `PASS` | The index's "multiplies" sentence is now a pointer to fold plan section 6 and matrix 7.6 and 7.7, so the frozen texts no longer disagree. The rest of section 4 is unchanged. It is wording, and cites no result |
+
+**C1. Name the Sharpe ratio each symbol run gives.** "As its own run recorded it" is not one figure. A run records Sharpe ratios on more than one basis:
+
+- for each line and symbol, for both symbols together, by side, and for S08 by branch, which is S08's unit of trial;
+- under `IDEAL-1M`, and under `IDEAL` if ruling 7 condition 2 holds;
+- for a test-block run, over a range that starts at `T_start`, while only the block itself is judged (fold plan section 6, R-03).
+
+Choosing among these after the first `V0` run has printed them would be a choice made on its Sharpe ratios. So name the figure now, for both halves. For example: the `sharpe` field of the line's strategy-asset row, net at 1x cost, from daily equity returns, under the headline mode and scenario, over the range that is judged. Owners: `feature-integrator` for flow, `strategy-architect` for candles.
+
+**C2. After the C-5 commit, a change to the spread rule may not lower the bar.** The only-rise rule protects `N`. A different set of trials can move the spread either way, so the spread rule needs its own guard. A change made after the Sharpe ratios are shown could pick a smaller spread for every result at once. So any later change computes the deflated Sharpe ratio's benchmark under both rules, and uses the higher, for every result at once. A recorded verdict keeps its own. Same owners.
+
+**C-5 part 5 is not closed by A and D's count alone.** It closes once these are in the C-5 commit:
+
+- A and D's count, with `project-manager`;
+- C1 and C2, which are a sentence each;
+- E;
+- the 7.6 wording on lines still due.
+
+**The first `V0` run: no change to my verdict at `d888254`.** 7.7 raises `N` for candle results, which errs high, and stage 1 gives no gate verdict. C changes nothing either, because the C-5 commit comes before the first run. If C1 and C2 were not in it, which figure enters the spread, and any later change to the set, could follow the first run's Sharpe ratios.
+
 ## Ruling on H5's pooled `N`, matrix section 7.6 at `80ec7b8`, 2026-11-06
 
 **`PASS WITH CONDITIONS`. Section 7.6 closes H5 condition 1, and with the conditions below it closes C-5 part 5.** I read `80ec7b8`'s diff of `STRATEGY_FEATURE_MATRIX.md` (section 7.6 and the four edits), section 3 of the matrix, sections 5, 6, 9, 10 and 11 of the fold plan, and index section 4. Nothing ran, and no market data was read. The sections below stand as written.
