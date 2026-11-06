@@ -1,6 +1,6 @@
 # Strategy feature matrix
 
-Status: revised after [the leak audit of 2026-11-04](../reviews/leak/features_2026-11-04.md), and awaiting re-audit. No verdict is claimed here. Date: 2026-11-05. Owner: `feature-integrator`.
+Status: revised after [the leak audit of 2026-11-04](../reviews/leak/features_2026-11-04.md), and awaiting re-audit. No verdict is claimed here. Date: 2026-11-05. Owner: `feature-integrator`. Section 7.6, pooled `N` for class tests (H5), is new and awaits `leak-auditor`.
 
 For each strategy, this document names the small set of features to test first, the hypothesis, the expected sign, what result would reject it, and its live-eligible (`.L`) and research-only (`.R`) forms.
 
@@ -316,7 +316,7 @@ Book rows, funding reports and the second-venue row of the earlier draft are rem
 
 ## 6. Class-level questions
 
-These pool setups from several strategies, so each can answer what no single strategy can. Each one is a separate logged family, with its lines in section 7. **They answer "does this help this kind of setup", not "does this help S04".** Setups from BTC/USD and ETH/USD overlap, and strategies are correlated, so these figures are optimistic. They use the design frequencies at their midpoints, S10 at 4h, and the same 5-year assumption as section 4.
+These pool setups from several strategies, so each can answer what no single strategy can. Each one is a separate logged family, with its lines in section 7 and its `N` in [section 7.6](#76-pooled-n-for-class-tests-h5). **They answer "does this help this kind of setup", not "does this help S04".** Setups from BTC/USD and ETH/USD overlap, and strategies are correlated, so these figures are optimistic. They use the design frequencies at their midpoints, S10 at 4h, and the same 5-year assumption as section 4.
 
 | ID | Question | Strategies | `n` | Detectable | Prediction |
 |---|---|---|---|---|---|
@@ -336,9 +336,9 @@ These pool setups from several strategies, so each can answer what no single str
 
 This replaces the earlier total of 64. **The total was too low.** This is a bottom-up list of every run these documents ask for, one line per grid setting.
 
-**Symbol rule, stated here and only here.** A line pools BTC/USD and ETH/USD, and it is one decision. For the deflated Sharpe ratio it counts as **two**, because index section 4 says each symbol multiplies the count, and that is the conservative reading. Splits by symbol or side are reports, and add nothing further. The registry keeps lines and symbol runs, so either count can be read. `project-manager` is asked to confirm that the index means this.
+**Symbol rule, stated here and only here.** A line pools BTC/USD and ETH/USD, and it is one decision. For the deflated Sharpe ratio it counts as **two**, because index section 4 says each symbol multiplies the count, and that is the conservative reading. Splits by symbol or side are reports, and add nothing further. The registry keeps lines and symbol runs, so either count can be read. `project-manager` confirmed this in [section 6 of the fold plan](../decisions/FOLD_PLAN_2026-11-05.md#6-rulings), and replaced the index's "each flow variant multiplies" with these lines on one frozen configuration.
 
-**`N` for a flow result** is `2 * (the strategy's V0 grid + every flow line run so far)`. Selection in `V0` carries into every row that runs on it, so it is not separate. At the end of the first pass:
+**`N` for a flow result** is `2 * (the strategy's V0 grid + every flow line run so far)`. Selection in `V0` carries into every row that runs on it, so it is not separate. This is for a row of one strategy. A line that pools strategies uses [section 7.6](#76-pooled-n-for-class-tests-h5). At the end of the first pass:
 
 | Strategy | `V0` grid | Flow lines | `N` |
 |---|---|---|---|
@@ -412,3 +412,52 @@ The audit counted about 110 on the old plan, before its venue, quintile and wave
 | **Flow total** | | **124** | |
 
 **Why this is a lot.** 124 flow lines on samples this small will produce false positives. Family-wise correction will push most single-strategy results to `INCONCLUSIVE`, which agrees with the prediction in section 4.
+
+### 7.6 Pooled `N` for class tests (H5)
+
+This answers condition 1 of H5 in [the feature re-audit](../reviews/leak/features_recheck_2026-11-05.md), which is part 5 of [the C-5 checklist](../decisions/FOLD_PLAN_2026-11-05.md#11-the-c-5-checklist). The formula at the top of this section names one strategy's `V0` grid, and a class test pools several, so it needs its own rule.
+
+**Fixed here, before any outcome on market data.** No strategy has read market data (`D-42`), and stage 1 runs no flow line (fold plan section 11, part 5). It is written now and not after stage 1, because the re-audit makes it due before the first counted line, which is stage 1's first `V0` run, and because a rule written after sight of candle outcomes could be shaped by them.
+
+**What counts as one trial.** A class line: one class, one kind, one grid setting, run on the configuration frozen for each block. Family H in 7.1 is these lines, 15 in all.
+
+- **Two per line, for the symbols.** A line pools both symbols and counts two symbol runs, as section 6 of the fold plan rules. Family H is 30 symbol runs. The registry holds each class line with its class, kind, setting and member strategies.
+- **Not one per member strategy or per member's gate.** A line applies one recipe and gives one `D`, so it is one decision. A split by strategy, symbol or side is a report. Proposing one member's gate from such a split is a new line, `EXPLORATORY` on every block already read (section 3.1).
+- **Controls add nothing.** The C15 repeat on pooled placebo setups, the random veto, shifted flow and reversed sign belong to the line's own verdict (section 7.4). Seeds, cost multiples and delay scenarios are reports.
+- **No `.R` twin in the first pass.** Family H holds none for the `.L` classes. R5's cross-kind clause binds only where `.L` under `C-LATE` is not positive, so its absence cannot help a class line to `SUPPORTED`. R5's `C-BAD` clause still applies. A twin run later is its own line, because a decision reads both kinds (fold plan section 6), and it is registered before the `.L` line is read.
+- The pooled `VE.T.L` in family G is counted the same way.
+
+**`N` for a class result.** The deflated Sharpe ratio of a class line uses the whole project's count, not only the pooled strategies' grids:
+
+```text
+N_class = symbol runs of every counted line and reading on market data, candle and flow,
+          both stages, as of the verdict
+        + symbol runs of every line in 7.1 still due (a line recorded as not run under D14 is not due)
+        + 2 for D-32, counted outside the registry
+```
+
+Why the whole count and not the sum of pooled grids:
+
+1. **A pool's edges can move with outcomes.** A strategy that fails the `V0` against C15 prerequisite may stay in the pool, labelled (section 3.2). "All live" in C-4 and C-5 changes if a strategy is retired under C18. S08's one grid feeds two classes. A count tied to membership could be argued after a result. The whole count cannot.
+2. **Candles are already counted whole.** `D-32` adds its never-selectable family to the stage's total, 106 and not 104, and stage 1's lines stay in `N` at stage 2 (fold plan sections 5 and 9).
+3. **Reading early gains nothing.** Lines that run regardless of results count from the start.
+4. **It costs little.** It is never below the per-pool figures in the re-audit, 280 to 344. Against those, the figure below raises the rough `sqrt(2 ln N)` for the expected best of `N` trials, the scale used in [section 13.2 of the data center recheck](../reviews/leak/data_center_recheck_2026-11-04.md), by about 3% to 5%.
+
+**Beside stage 1.** Stage 1 runs no class test. What it counts enters every `N_class` as it stands. A design count at the end of the first flow pass, not a result:
+
+| Item | Symbol runs |
+|---|---|
+| Stage 1 `V0` grid, 52 lines on candles | 104 |
+| `D-32` | 2 |
+| Stage 1 `V0` against C15 readings, 8. Each pools both symbols, so each counts two here. The printed count lists them as 8 readings | 16 |
+| Stage 2 `V0` grid, family A, 64 lines | 128 |
+| Flow, families B to K, 124 lines, or 116 if D14 fails. Family K's readings are new ones on bars from trades, because flow is compared only with `V0` on the same bars (fold plan section 9, item 4) | 248, or 232 |
+| **`N_class`** | **498, or 482** |
+
+Every later line, reading, rerun or shadow adds its symbol runs.
+
+**No reduction for overlap.** Lines share setups, so fewer than `N` trials are independent. No clustered or effective `N` is used, because that would be a fitted choice.
+
+**Recorded with the verdict.** Each class verdict records its `N` and its date. A later report on the same line prints the `N` of its own date, which can only be higher.
+
+**What stays fixed.** This rule enters the C-5 commit. Afterwards a change is a dated decision under the fold plan's rule, and may only raise `N`. It does not change the rejection rules in section 3. The deflated Sharpe ratio's other inputs, such as the spread of Sharpe ratios across trials, are not set here. The deflated Sharpe ratio is not built yet ([engine review](../reviews/code/engine_review_2026-11-05.md)), and those inputs are fixed in the same way before any flow outcome.
