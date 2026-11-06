@@ -29,12 +29,13 @@ from hft_crypto.data.context import JobContext
 from hft_crypto.data.coverage import (
     CHECK_ROOT_VARIABLE,
     FROZEN_LISTS,
+    MIN_REQUEST_GAP_S,
     declared_days,
     init_check_root,
     run_candle_check,
     run_coverage_check,
 )
-from hft_crypto.data.fetch import HttpFetcher
+from hft_crypto.data.fetch import HttpFetcher, PacedFetcher
 from hft_crypto.data.guard import PathGuardError
 from hft_crypto.data.health import build_health
 from hft_crypto.data.ingest import IngestOptions, run_ingest
@@ -223,7 +224,11 @@ def _cmd_ingest(args: argparse.Namespace, config: PipelineConfig, policy: Retent
         include_book=args.include_book,
         ticks=_market_ticks(args),
     )
-    fetcher = HttpFetcher(config.fetch, allowed_hosts=config.enabled_hosts())
+    # Coverage record, section 4.2, at the coverage check's own pace: each request, a zip or its sidecar,
+    # starts at least this long after the one before it ended (P-1 of the first-span fetch plan).
+    fetcher = PacedFetcher(
+        HttpFetcher(config.fetch, allowed_hosts=config.enabled_hosts()), min_gap_s=MIN_REQUEST_GAP_S
+    )
     summary = run_ingest(ctx, fetcher, options)
     _log_daily_lateness(ctx, args, summary.status)
     ctx.catalog.close()

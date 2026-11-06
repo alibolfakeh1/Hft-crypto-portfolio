@@ -7,6 +7,7 @@ every request and on every redirect.
 
 from __future__ import annotations
 
+import math
 import time
 import urllib.error
 import urllib.parse
@@ -194,6 +195,58 @@ class HttpFetcher:
             return body
 
         return self._attempt(url, action)
+
+
+class PacedFetcher:
+    """At least `min_gap_s` from the end of one request to the start of the next, for every request it passes.
+
+    Coverage record, section 4.2: one connection, at least 2 seconds between requests. A zip and its sidecar
+    are two requests. A request that failed was still a request, so the next one waits too. The client's own
+    retries stay inside one call here, spaced by its backoff: no gap is added before a retry, and a backoff
+    does not count towards the next gap, which runs from the moment the call returned or raised.
+    """
+
+    def __init__(
+        self,
+        inner: Fetcher,
+        *,
+        min_gap_s: float,
+        clock: Callable[[], float] = time.perf_counter,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        """min_gap_s has no default on purpose: the caller names the pace. The clock must be monotonic.
+        `perf_counter` is, and on Windows it resolves to 100 ns, where `monotonic` steps by about 16 ms."""
+        if not 0.0 < min_gap_s < math.inf:
+            raise ValueError("min_gap_s must be a positive, finite number of seconds")
+        self._inner = inner
+        self._min_gap_s = min_gap_s
+        self._clock = clock
+        self._sleep = sleep
+        self._last_end: float | None = None
+
+    @property
+    def inner(self) -> Fetcher:
+        return self._inner
+
+    @property
+    def min_gap_s(self) -> float:
+        return self._min_gap_s
+
+    def _paced[T](self, request: Callable[[], T]) -> T:
+        if self._last_end is not None:
+            # Again until the clock shows the whole gap, since a sleep can end a little early.
+            while (left := self._min_gap_s - (self._clock() - self._last_end)) > 0:
+                self._sleep(left)
+        try:
+            return request()
+        finally:
+            self._last_end = self._clock()
+
+    def download(self, url: str, dest: Path, max_bytes: int) -> int:
+        return self._paced(lambda: self._inner.download(url, dest, max_bytes))
+
+    def get_bytes(self, url: str, max_bytes: int) -> bytes:
+        return self._paced(lambda: self._inner.get_bytes(url, max_bytes))
 
 
 def _host(url: str) -> str:
