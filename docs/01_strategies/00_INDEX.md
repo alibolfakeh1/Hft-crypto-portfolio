@@ -100,11 +100,31 @@ Grids are pre-declared in each document and total **64 candidate configurations*
 
 S08's 4 configurations each run once and give two branches, which are read separately, so S08 counts 8. A run of all ten is therefore 60 runs for these 64 lines, and the count stays 64.
 
-Each symbol and each flow variant multiplies this count, and all of it goes to the trial registry. The
+How symbols, flow lines and pooled class tests enter the trial count is set by
+[section 6 of the fold plan](../decisions/FOLD_PLAN_2026-11-05.md#6-rulings) and
+sections [7.6](../02_features/STRATEGY_FEATURE_MATRIX.md#76-pooled-n-for-class-tests-h5) and
+[7.7](../02_features/STRATEGY_FEATURE_MATRIX.md#77-n-for-a-candle-only-v0-result) of the strategy feature matrix,
+not here, and all of it goes to the trial registry. The
 stop and target parameters are deliberately **not** in the grids. They are frozen, because tuning them
 is the fastest way to overfit an exit.
 
-The hourly-cycle requirement did not raise this count. S08 and S09 now use 1h defaults, because a
+**The spread of Sharpe ratios across trials, for a candle-only result.** Fixed on 2026-11-05, before any `V0` run shows a
+Sharpe ratio, from the documents and from no result. The deflated Sharpe ratio of a candle-only result takes the spread over
+the trials counted in that result's own `N`, as
+[section 7.7 of the matrix](../02_features/STRATEGY_FEATURE_MATRIX.md#77-n-for-a-candle-only-v0-result) states it. Each symbol run gives one Sharpe ratio, the one its own run recorded by the
+verdict date, with no new read. A trial with no return stream of its own adds to `N` and not to the spread: the `V0` against
+C15 readings, which re-read a line's trades, and `D-32`, whose output stays sealed. A line in `N` that has not run by the
+verdict date, or whose Sharpe ratio is undefined, such as one with no trade, is left out of the spread, and the number left
+out is printed beside the result. Stage 1's lines are in the set wherever they are in `N`, at stage 2 as well. `V0S`, placebo
+draws and other controls are not trials
+([matrix section 7.4](../02_features/STRATEGY_FEATURE_MATRIX.md#74-what-is-not-a-trial)), so they are in neither.
+After the C-5 commit, a change to this rule applies to every candle result at once, and a recorded verdict keeps its set and
+its `N`.
+**Reason:** the spread must describe the same search that `N` counts, as section 7.6 of the matrix rules for flow results, and
+a trial with no stream of its own, or a sealed one, has no Sharpe ratio to give without a new read. The deflated Sharpe ratio
+is not built yet ([engine review](../reviews/code/engine_review_2026-11-05.md)).
+
+The hourly-cycle requirement did not raise the 64-line `V0` grid. S08 and S09 now use 1h defaults, because a
 timeframe that can never run live is a poor use of trials. S08's 30m runs still count as trials, although
 they cannot be selected. The delay scenarios in [C17](#c17-hourly-live-cycle) are stress reports on a chosen
 configuration. They are logged, but they are not used to pick parameters beyond the one selection scenario

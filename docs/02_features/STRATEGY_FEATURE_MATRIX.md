@@ -1,6 +1,6 @@
 # Strategy feature matrix
 
-Status: revised after [the leak audit of 2026-11-04](../reviews/leak/features_2026-11-04.md), and awaiting re-audit. No verdict is claimed here. Date: 2026-11-05. Owner: `feature-integrator`. Section 7.6, pooled `N` for class tests (H5), is new and awaits `leak-auditor`.
+Status: revised after [the leak audit of 2026-11-04](../reviews/leak/features_2026-11-04.md), and awaiting re-audit. No verdict is claimed here. Date: 2026-11-05. Owner: `feature-integrator`. Section 7.6, pooled `N` for class tests (H5), was ruled `PASS WITH CONDITIONS` by `leak-auditor` at `80ec7b8`, and the conditions owned by this document are now in its text and in the single-strategy formula.
 
 For each strategy, this document names the small set of features to test first, the hypothesis, the expected sign, what result would reject it, and its live-eligible (`.L`) and research-only (`.R`) forms.
 
@@ -336,9 +336,9 @@ These pool setups from several strategies, so each can answer what no single str
 
 This replaces the earlier total of 64. **The total was too low.** This is a bottom-up list of every run these documents ask for, one line per grid setting.
 
-**Symbol rule, stated here and only here.** A line pools BTC/USD and ETH/USD, and it is one decision. For the deflated Sharpe ratio it counts as **two**, because index section 4 says each symbol multiplies the count, and that is the conservative reading. Splits by symbol or side are reports, and add nothing further. The registry keeps lines and symbol runs, so either count can be read. `project-manager` confirmed this in [section 6 of the fold plan](../decisions/FOLD_PLAN_2026-11-05.md#6-rulings), and replaced the index's "each flow variant multiplies" with these lines on one frozen configuration.
+**Symbol rule, stated here and only here.** A line pools BTC/USD and ETH/USD, and it is one decision. For the deflated Sharpe ratio it counts as **two**, because [section 6 of the fold plan](../decisions/FOLD_PLAN_2026-11-05.md#6-rulings) rules that "a line pooled over two symbols counts twice". Splits by symbol or side are reports, and add nothing further. The registry keeps lines and symbol runs, so either count can be read. The same ruling replaced the index's "each flow variant multiplies" with these lines on one frozen configuration.
 
-**`N` for a flow result** is `2 * (the strategy's V0 grid + every flow line run so far)`. Selection in `V0` carries into every row that runs on it, so it is not separate. This is for a row of one strategy. A line that pools strategies uses [section 7.6](#76-pooled-n-for-class-tests-h5). At the end of the first pass:
+**`N` for a flow result** is `2 * (the strategy's V0 grid + every flow line run so far)`. Selection in `V0` carries into every row that runs on it, so it is not separate. This is for a row of one strategy. A line that pools strategies uses [section 7.6](#76-pooled-n-for-class-tests-h5). **After the C-5 commit, this `N` may also only rise,** under the conditions in 7.6. Its form stays as written. Whether it should also count lines still due, or take the whole count, as 7.6 and 7.7 do, is open until before the first flow verdict. A candle-only `V0` result uses [section 7.7](#77-n-for-a-candle-only-v0-result). At the end of the first pass:
 
 | Strategy | `V0` grid | Flow lines | `N` |
 |---|---|---|---|
@@ -424,7 +424,7 @@ This answers condition 1 of H5 in [the feature re-audit](../reviews/leak/feature
 - **Two per line, for the symbols.** A line pools both symbols and counts two symbol runs, as section 6 of the fold plan rules. Family H is 30 symbol runs. The registry holds each class line with its class, kind, setting and member strategies.
 - **Not one per member strategy or per member's gate.** A line applies one recipe and gives one `D`, so it is one decision. A split by strategy, symbol or side is a report. Proposing one member's gate from such a split is a new line, `EXPLORATORY` on every block already read (section 3.1).
 - **Controls add nothing.** The C15 repeat on pooled placebo setups, the random veto, shifted flow and reversed sign belong to the line's own verdict (section 7.4). Seeds, cost multiples and delay scenarios are reports.
-- **No `.R` twin in the first pass.** Family H holds none for the `.L` classes. R5's cross-kind clause binds only where `.L` under `C-LATE` is not positive, so its absence cannot help a class line to `SUPPORTED`. R5's `C-BAD` clause still applies. A twin run later is its own line, because a decision reads both kinds (fold plan section 6), and it is registered before the `.L` line is read.
+- **No `.R` twin in the first pass.** Family H holds none for the `.L` classes. R5's cross-kind clause binds only where `.L` under `C-LATE` is not positive, so its absence cannot help a class line to `SUPPORTED`. R5's `C-BAD` clause still applies. **A class verdict with no twin records R5's cross-kind clause as "not evaluated", never as passed.** A twin run later is its own line, because a decision reads both kinds (fold plan section 6), and it is registered before the `.L` line is read.
 - The pooled `VE.T.L` in family G is counted the same way.
 
 **`N` for a class result.** The deflated Sharpe ratio of a class line uses the whole project's count, not only the pooled strategies' grids:
@@ -439,7 +439,7 @@ N_class = symbol runs of every counted line and reading on market data, candle a
 Why the whole count and not the sum of pooled grids:
 
 1. **A pool's edges can move with outcomes.** A strategy that fails the `V0` against C15 prerequisite may stay in the pool, labelled (section 3.2). "All live" in C-4 and C-5 changes if a strategy is retired under C18. S08's one grid feeds two classes. A count tied to membership could be argued after a result. The whole count cannot.
-2. **Candles are already counted whole.** `D-32` adds its never-selectable family to the stage's total, 106 and not 104, and stage 1's lines stay in `N` at stage 2 (fold plan sections 5 and 9).
+2. **Candles are already counted whole.** `D-32` adds its never-selectable family to the stage's total, 106 and not 104, and stage 1's lines stay in `N` at stage 2 (fold plan sections 5 and 9). Section 7.7 states the candle rule.
 3. **Reading early gains nothing.** Lines that run regardless of results count from the start.
 4. **It costs little.** It is never below the per-pool figures in the re-audit, 280 to 344. Against those, the figure below raises the rough `sqrt(2 ln N)` for the expected best of `N` trials, the scale used in [section 13.2 of the data center recheck](../reviews/leak/data_center_recheck_2026-11-04.md), by about 3% to 5%.
 
@@ -458,6 +458,46 @@ Every later line, reading, rerun or shadow adds its symbol runs.
 
 **No reduction for overlap.** Lines share setups, so fewer than `N` trials are independent. No clustered or effective `N` is used, because that would be a fitted choice.
 
-**Recorded with the verdict.** Each class verdict records its `N` and its date. A later report on the same line prints the `N` of its own date, which can only be higher.
+**Recorded with the verdict.** Each class verdict records its `N` and its date, and keeps them. A later report on the same line prints the `N` of its own date beside the recorded one. The later figure can only be higher.
 
-**What stays fixed.** This rule enters the C-5 commit. Afterwards a change is a dated decision under the fold plan's rule, and may only raise `N`. It does not change the rejection rules in section 3. The deflated Sharpe ratio's other inputs, such as the spread of Sharpe ratios across trials, are not set here. The deflated Sharpe ratio is not built yet ([engine review](../reviews/code/engine_review_2026-11-05.md)), and those inputs are fixed in the same way before any flow outcome.
+**What stays fixed.** This rule enters the C-5 commit. Afterwards a change is a dated decision under the fold plan's rule, and may only raise `N`, on these conditions:
+
+- A change applies to the rule for every class line at once, never to one line or one verdict.
+- A recorded verdict keeps its `N` and its date.
+- A line dropped after the C-5 commit for any reason other than D14 stays in `N`.
+
+It does not change the rejection rules in section 3.
+
+**The spread of Sharpe ratios across trials.** Fixed now, before any `V0` run shows a Sharpe ratio. For a flow result, the spread is taken over the trials counted in that result's own `N`, by the formula at the top of this section or by `N_class`. Each symbol run gives one Sharpe ratio, as its own run recorded it by the verdict date, with no new read. Some trials in that `N` have no return stream of their own. They add to `N` and not to the spread: the `V0` against C15 readings, check D11, the screen and the quintile tables, which re-read a line's trades or read no strategy, and `D-32`, whose output stays sealed. A stream with an undefined Sharpe ratio, such as one with no trade, is left out of the spread in the same way, and the number left out is printed. Stage 1's candle lines are in the set wherever they are in `N`. **Reason:** the spread must describe the same search that `N` counts, and a trial with no stream of its own, or a sealed one, has no Sharpe ratio to give without a new read.
+
+The deflated Sharpe ratio's skew, kurtosis and sample length come from the result's own returns, and are fixed before any flow outcome. The deflated Sharpe ratio is not built yet ([engine review](../reviews/code/engine_review_2026-11-05.md)).
+
+### 7.7 `N` for a candle-only `V0` result
+
+Stated here, because the symbol rule above is stated only here. **Fixed before any `V0` verdict, from the documents and no result.** [Index section 4](../01_strategies/00_INDEX.md#4-trial-budget) takes the spread of Sharpe ratios for a candle-only result over this `N`.
+
+**The rule is 7.6's.** The deflated Sharpe ratio of a candle-only result uses the whole project's count, not only that strategy's grid:
+
+```text
+N_V0 = symbol runs of every counted line and reading on market data, candle and flow,
+       both stages, as of the verdict
+     + symbol runs of the lines and readings its own stage declares that have not run yet
+     + 2 for D-32, counted outside the registry
+```
+
+- **Whole, not one strategy's grid.** A candle result is read among all the strategies run beside it, and `D-32` already adds its never-selectable family to the stage's total, 106 and not 104. Stage 1's lines stay in `N` at stage 2 (fold plan sections 5 and 9). One strategy's grid would leave out the rest of that search.
+- **A stage's own lines count from its first verdict.** Stage 1 declares its 52 grid lines and 8 `V0` against C15 readings (fold plan section 5). Stage 2 declares family A in 7.1 and its `V0` against C15 readings in family K (fold plan section 9, item 3). A stage runs its whole declared grid, so reading one strategy early gains nothing.
+- **Units.** A line or reading that pools both symbols counts two (section 6 of the fold plan). Controls are not trials (7.4), and generated runs count none.
+
+**The figure at the first verdict on stage 1.** A count of declared lines, not a result:
+
+| Item | Symbol runs |
+|---|---|
+| Stage 1 `V0` grid, 52 lines on candles | 104 |
+| Stage 1 `V0` against C15 readings, 8. Each pools both symbols, so each counts two | 16 |
+| `D-32` | 2 |
+| **`N_V0`** | **122** |
+
+The count printed beside a run today shows 106 and the 8 readings apart. Condition D of the ruling on H5 asks that it show the readings as 16 symbol runs. Every later line, reading or rerun, and stage 2, adds to `N_V0`.
+
+**Changes.** After the C-5 commit it follows 7.6's only-rise rule and its three conditions. A recorded verdict keeps its `N` and its date, and a later report prints the `N` of its own date beside it.
