@@ -454,7 +454,10 @@ def test_a_target_move_without_the_tick_it_was_set_at_is_refused() -> None:
     move carries. A move built without one, or with a tick that is not a positive number, never reaches a leg.
     A stop update carries no tick."""
     move = TargetMove("T1", 101.1, "TEST_MOVE")
-    bad = [{"move": move}, *({"move": move, "move_tick": tick} for tick in (0.0, -0.1, np.nan, np.inf))]
+    bad: list[dict[str, object]] = [
+        {"move": move},
+        *({"move": move, "move_tick": tick} for tick in (0.0, -0.1, np.nan, np.inf)),
+    ]
     assert [_refused(**fields) for fields in bad] == [True] * 5
     assert not _refused(move=move, move_tick=0.1)
     assert not _refused(stop=90.0, stop_reason="TEST_TRAIL")
@@ -516,7 +519,7 @@ def test_s08_bins_a_profile_with_the_tick_in_force_at_its_end() -> None:
     end = DAY0
     strategy = S08VolumeProfileValueArea({"timeframe_minutes": 60, "profile_days": 1})
     strategy._complete.add(end)
-    strategy._placed = lambda area, _bar: area  # type: ignore[method-assign]
+    strategy._placed = lambda area, bar: area  # type: ignore[method-assign]
     market = SimpleNamespace(
         bar=None,
         tick=BTC.at(CHANGE + HOUR),

@@ -748,6 +748,7 @@ def test_a_checksum_mismatch_stops_the_run_and_the_file_is_never_parsed(
     """Leak recheck 17.6: a transfer error is transient, so it is a stop and the rerun rule, not a failed
     quarter."""
     from hft_crypto.data import coverage
+    from hft_crypto.data.parsers import parse_klines
     from hft_crypto.data.sources import monthly_candle_file
 
     fetcher = _publish(one_quarter)
@@ -757,7 +758,7 @@ def test_a_checksum_mismatch_stops_the_run_and_the_file_is_never_parsed(
     else:
         fetcher.files[target.url] = fetcher.files[target.url] + b"x"
     parsed: list[dt.date] = []
-    real = coverage.parse_klines
+    real = parse_klines
 
     def counting(raw: Path, symbol: str, month: dt.date, *args: Any, **kwargs: Any) -> Any:
         parsed.append(month)

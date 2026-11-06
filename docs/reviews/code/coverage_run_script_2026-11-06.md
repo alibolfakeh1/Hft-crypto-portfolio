@@ -389,3 +389,61 @@ The full suite was not run at the run commit. With the source enabled, I chose n
   - The script file was not changed, and its hash still reads `48c6d571...990c0`.
   - This review file is the only file I wrote in the repository, and it is not committed.
   - Running the tests in the main working tree used its existing `.venv`, and `-p no:cacheprovider` kept a cache from being written there. `git status` shows only what was there before, plus this file.
+
+## Recheck: the test type fixes
+
+2026-11-06. HEAD `d5c4147`, plus uncommitted changes to three files under `tests/`. Their blobs are `fd5c9c3`, `a65d819` and `ca53c37`, and HEAD's are `b7bf03c`, `59d0d97` and `176e72c`. Nothing under `src/` changed.
+
+**Verdict: PASS.** The four `mypy` errors in section 7 are gone. Each change is type-only. The three files give the same 154 passing tests as at HEAD.
+
+| Error at HEAD (reproduced) | Change | Why the test is unchanged |
+|---|---|---|
+| `test_dated_tick.py:458` `[arg-type]`: an argument after `**` must be a mapping, not `object` | Annotation `bad: list[dict[str, object]]` on the same list | Annotation only. The five dicts have the same repr as at HEAD. The test still asserts five refusals and two acceptances |
+| `test_dated_tick.py:519` `[assignment]`: the lambda's `_bar` against `_placed(self, area, bar)` | Parameter renamed to `bar` | `s08_volume_profile_value_area.py:180` calls `self._placed(area, market.bar)` by position, so the name is never used, and the body returns `area` either way. The `# type: ignore[method-assign]` is still needed, because strict mode would report an unused one |
+| `test_date_guard.py:760` `[attr-defined]`: `coverage` does not export `parse_klines` | `real = parse_klines`, imported inside the test from `hft_crypto.data.parsers` | `coverage.py:64-69` imports that same name. The probe below shows they are the same object at run time. The patch on `coverage.parse_klines` is unchanged |
+| `test_recheck_fixes.py:178` `[comparison-overlap]` | Right side wrapped in `cast(object, ...)`. `cast` was already imported | `typing.cast` returns its argument, so `cast(object, t) is t` is `True`. The equality gave the same result before and after on four left sides: exact, off by 1e-12, `q0` of 10.5, and an exit of 110.01 |
+
+**The `test_date_guard` test still proves that a mismatched file is never parsed.** A probe plugin ran alongside the test in both cases (`zip altered` and `sidecar unreadable`):
+
+- Before the test body, `coverage.parse_klines is parsers.parse_klines` is `True`, so no fixture had patched it.
+- After the body, the function on `coverage.parse_klines` is `counting`, the `real` in its closure is `parsers.parse_klines`, and `parsed` is `[2024-01-01]`.
+- Mutant: `_fetch_one` keeps its verdict, but on a mismatch it first counts the file through `coverage._count_candles`. Both cases then fail on `assert parsed == [dt.date(2024, 1, 1)]` with "Left contains one more item: datetime.date(2024, 2, 1)". The stop assertions before it still pass, so this is the assertion that catches a parse.
+
+**Findings.** None.
+
+**Commands, and what they printed.** I did not reuse the developer's environment. I built my own at a short path with `uv sync --frozen --offline --python 3.12`, from the cache and with no host contacted. It has mypy 2.4.1, ruff 0.17.3 and pytest 9.2.0, the versions in `uv.lock`.
+
+```text
+$ mypy                         (HEAD: an export of src, tests and pyproject.toml)
+tests\engine\test_dated_tick.py:458: error: Argument after ** must be a mapping, not "object"  [arg-type]
+tests\engine\test_dated_tick.py:519: error: Incompatible types in assignment (... "_bar: Bar" ... "bar: Bar" ...)  [assignment]
+tests\data\test_date_guard.py:760: error: Module "hft_crypto.data.coverage" does not explicitly export attribute "parse_klines"  [attr-defined]
+tests\engine\test_recheck_fixes.py:178: error: Non-overlapping equality check (...)  [comparison-overlap]
+Found 4 errors in 3 files (checked 119 source files)
+$ mypy                         (the working tree, with the cache outside it)
+Success: no issues found in 119 source files
+$ ruff check --no-cache src tests
+All checks passed!
+$ ruff check --no-cache .   and   ruff format --no-cache --check .      (as CI runs them)
+All checks passed!   /   177 files already formatted
+$ pytest -p no:cacheprovider -rA <the three files>       (working tree)
+154 passed
+$ pytest -p no:cacheprovider -rA <the three files>       (a local clone at d5c4147)
+154 passed            -> the two runs have the same 154 PASSED node ids
+$ pytest -p no:cacheprovider -p <probe> <test_date_guard.py> -k checksum_mismatch_stops      (mutant on)
+2 failed, 90 deselected
+```
+
+A first "before" run, in a `git archive` export, failed one test: `test_a_check_root_must_be_new_and_empty_and_apart_from_data_root` (DID NOT RAISE). That test needs a path inside a repository, and an export has no `.git`. It passes in the clone. Not a finding.
+
+**Not checked.**
+
+- The full suite. That is the C-5 step.
+- CI's Python 3.14 leg.
+- `mypy` from the main working tree's own `.venv`, which still has the path-length error from section 7. I ran my short-path environment's `mypy` over the main tree's files instead.
+
+**Left running, and left on disk.**
+
+- **Processes.** None of mine is running. Three Python processes started on 2026-11-05, before this recheck, are still running: an end-to-end run from an earlier review, and one interpreter reading from standard input. They are not mine, and I left them.
+- **Scratch.** I removed my environment, the export, the clone and the `mypy` caches.
+- **The repository.** This section is my only change. The three test files' blobs are unchanged, and no cache or `__pycache__` was written.

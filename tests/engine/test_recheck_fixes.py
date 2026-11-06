@@ -175,7 +175,7 @@ def test_a_funding_charge_reaches_net_through_the_booked_trade(
 ) -> None:
     stream, _ = _round_trip(side, rate)
     trade = stream.trades[0]
-    assert (trade.q0, trade.fill, trade.legs[-1].price) == (pytest.approx(10.0), 100.0, 110.0)
+    assert (trade.q0, trade.fill, trade.legs[-1].price) == cast(object, (pytest.approx(10.0), 100.0, 110.0))
     events, booked = trade.book()
     assert (booked.gross, booked.slippage, booked.fees, booked.funding) == (gross, 0, 0, funding)
     assert booked.gross - booked.net == funding
